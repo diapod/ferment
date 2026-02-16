@@ -1,17 +1,7 @@
 {
-
  :ferment.runtime/default
- {:config
-  {:ferment.env/ferment.profile               #ref :ferment.env/ferment.profile
-   :ferment.env/ferment.llm.mode              #ref :ferment.env/ferment.llm.mode
-   :ferment.model/profile                     #ref :ferment.model/profile
-   :ferment.model/coding                      #ref :ferment.model/coding
-   :ferment.model/meta                        #ref :ferment.model/meta
-   :ferment.model/solver                      #ref :ferment.model/solver
-   :ferment.model/voice                       #ref :ferment.model/voice}
-
-  :models   #ref :ferment.model/runtime
+ {:models   #ref :ferment/models
   :resolver #ref :ferment.resolver/default
   :protocol #ref :ferment.protocol/default}
 
-}
+ }

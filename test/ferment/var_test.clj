@@ -74,56 +74,46 @@
               entry))))))
 
 (deftest runtime-config-contains-core-runtime-branch
-  (testing "Runtime branch ma refs do resolvera/protokołu i mapę core bez zależności od modelowych kluczy env."
+  (testing "Runtime branch ma refs do resolvera/protokołu oraz agregat modeli."
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/runtime.edn")
-          runtime (get cfg :ferment.runtime/default)
-          envcfg (:config runtime)]
+          runtime (get cfg :ferment.runtime/default)]
       (is (map? runtime))
       (is (= :ferment.resolver/default (:resolver runtime)))
       (is (= :ferment.protocol/default (:protocol runtime)))
-      (is (= :ferment.model/solver
-             (get envcfg :ferment.model/solver)))
-      (is (= :ferment.model/voice
-             (get envcfg :ferment.model/voice)))
-      (is (= :ferment.model/runtime
-             (:models runtime)))
-      (is (nil? (get envcfg :ferment.env/ferment.model.solver)))
-      (is (nil? (get envcfg :ferment.env/ferment.model.voice))))))
+      (is (= :ferment/models
+             (:models runtime))))))
 
 (deftest models-config-defines-selector-values-in-edn
   (testing "Selektory modeli są utrzymywane w models.edn."
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/models.edn")]
-      (is (= "default" (get cfg :ferment.model/profile)))
+      (is (= "default" (get cfg :ferment.model.defaults/profile)))
       (is (= "qwen2.5-coder:7b"
-             (get-in cfg [:ferment.model/solver :default])))
+             (get-in cfg [:ferment.model.id/solver :id/default])))
       (is (= "qwen2.5-coder:1.5b"
-             (get-in cfg [:ferment.model/solver :mini])))
+             (get-in cfg [:ferment.model.id/solver :id/mini])))
       (is (= "SpeakLeash/bielik-1.5b-instruct"
-             (get-in cfg [:ferment.model/voice :default])))
+             (get-in cfg [:ferment.model.id/voice :id/default])))
       (is (= {"HF_HOME" :ferment.env/hf.home
               "HF_HUB_CACHE" :ferment.env/hf.hub.cache}
-             (get cfg :ferment.model.solver/env)))
-      (is (= {"HF_HOME" :ferment.env/hf.home
-              "HF_HUB_CACHE" :ferment.env/hf.hub.cache}
-             (get cfg :ferment.model.voice/env))))))
+             (get-in cfg [:ferment.model.defaults/runtime :env])))
+      (is (= :ferment.model.defaults/runtime
+             (get-in cfg [:ferment.model.runtime/solver :defaults]))))))
 
 (deftest model-runtime-config-wires-session-and-workers
-  (testing "Gałąź runtime modeli ma session key, worker keys i agregat workers."
-    (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/model-runtime.edn")
-          session (get cfg :ferment.model/bot-session)
-          solver  (get cfg :ferment.model.solver/runtime)
-          voice   (get cfg :ferment.model.voice/runtime)
-          runtime (get cfg :ferment.model/runtime)]
+  (testing "models.edn zawiera runtime defaults, runtime gałęzie i agregat :ferment/models."
+    (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/models.edn")
+          session (get cfg :ferment.model.defaults/bot-session)
+          defaults (get cfg :ferment.model.defaults/runtime)
+          solver-rt  (get cfg :ferment.model.runtime/solver)
+          voice-rt   (get cfg :ferment.model.runtime/voice)
+          models (get cfg :ferment/models)]
       (is (map? session))
       (is (= "ferment-model-runtime" (:sid session)))
-      (is (= :ferment.model/bot-session (:session solver)))
-      (is (= :ferment.model/bot-session (:session voice)))
-      (is (= :ferment.model.solver/env (:env solver)))
-      (is (= :ferment.model.voice/env (:env voice)))
-      (is (= :ferment.model.solver/runtime
-             (get-in runtime [:workers :solver])))
-      (is (= :ferment.model.voice/runtime
-             (get-in runtime [:workers :voice]))))))
+      (is (= :ferment.model.defaults/bot-session (:session defaults)))
+      (is (= :ferment.model.defaults/runtime (:defaults solver-rt)))
+      (is (= :ferment.model.defaults/runtime (:defaults voice-rt)))
+      (is (= :ferment.model/solver (get models :ferment.model/solver)))
+      (is (= :ferment.model/voice  (get models :ferment.model/voice))))))
 
 (deftest core-config-references-runtime-branches
   (testing "Core branch ma refs do runtime/resolver/protocol."
@@ -137,7 +127,7 @@
 (deftest core-service-initializer-builds-callable-map
   (testing "Core service init zwraca funkcje operujące na runtime z configu."
     (let [called-with (atom nil)
-          runtime {:config {:ferment.model/solver "solver-mini"}}]
+          runtime {:models {:ferment.model/solver {:id "solver-mini"}}}]
       (with-redefs [core/ollama-generate!
                     (fn [m]
                       (reset! called-with m)
@@ -191,22 +181,22 @@
   (testing "model/init-model-key wybiera model zgodnie z profilem."
     (is (= "solver-mini"
            (model/init-model-key
-            :ferment.model/solver
-            {:profile "mini" :default "solver-default" :mini "solver-mini"})))
+            :ferment.model.id/solver
+            {:profile "mini" :id/default "solver-default" :id/mini "solver-mini"})))
     (is (= "voice-default"
            (model/init-model-key
-            :ferment.model/voice
-            {:profile "default" :default "voice-default" :mini "voice-mini"})))))
+            :ferment.model.id/voice
+            {:profile "default" :id/default "voice-default" :id/mini "voice-mini"})))))
 
 (deftest model-selector-runtime-functions-prefer-model-branch
   (testing "solver-id/voice-id czytają wartości z gałęzi :ferment.model/*."
-    (let [runtime {:config {:ferment.model/solver "solver-from-model-branch"
-                            :ferment.model/voice  "voice-from-model-branch"
-                            :ferment.model/coding "coding-from-model-branch"}}]
+    (let [runtime {:models {:ferment.model/solver {:id "solver-from-model-branch"}
+                            :ferment.model/voice  {:id "voice-from-model-branch"}
+                            :ferment.model/coding {:id "coding-from-model-branch"}}}]
       (is (= "solver-from-model-branch" (model/solver-id runtime)))
       (is (= "voice-from-model-branch" (model/voice-id runtime)))
       (is (= "coding-from-model-branch"
-             (model/solver-id {:config {:ferment.model/coding "coding-from-model-branch"}}))))))
+             (model/solver-id {:models {:ferment.model/coding {:id "coding-from-model-branch"}}}))))))
 
 (deftest model-runtime-worker-lifecycle-uses-bot-start-stop
   (testing "Worker runtime używa bot/start i bot/stop przez wrappery model.clj."
@@ -222,16 +212,16 @@
                       (reset! stopped worker)
                       true)]
         (let [state (model/init-runtime-worker
-                     :ferment.model.solver/runtime
+                     :ferment.model.runtime/solver
                      {:session session
                       :enabled? true
                       :name "solver runtime test"})]
           (is (= session (:session @started)))
-          (is (= :ferment.model.solver/runtime
+          (is (= :ferment.model.runtime/solver
                  (get-in @started [:cfg :id])))
           (is (= :mock-worker (:worker-id (:worker state))))
           (is (true? (:enabled? state)))
-          (is (nil? (model/stop-runtime-worker :ferment.model.solver/runtime state)))
+          (is (nil? (model/stop-runtime-worker :ferment.model.runtime/solver state)))
           (is (= {:worker-id :mock-worker} @stopped)))))))
 
 (deftest model-runtime-aggregate-builds-workers-map

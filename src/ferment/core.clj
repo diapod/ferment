@@ -65,7 +65,7 @@
   "Run a process, return {:exit int :out string :err string}."
   [& args]
   (let [^java.util.List command (mapv str args)
-        pb (doto (ProcessBuilder. command)
+        pb (doto (ProcessBuilder. ^java.util.List command)
              (.redirectErrorStream false))
         p  (.start pb)
         out (slurp (.getInputStream p))
@@ -160,7 +160,7 @@
   [runtime cap-id intent]
   (or (case cap-id
         :llm/code  (model/solver-id runtime)
-        :llm/meta  (model/runtimev runtime :ferment.model/meta)
+        :llm/meta  (model/meta-id runtime)
         :llm/voice (model/voice-id runtime)
         :llm/mock  "mock/model"
         nil)

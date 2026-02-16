@@ -26,13 +26,19 @@
     (map? runtime) runtime
     :else nil))
 
-(defn runtimev
-  "Reads keyword value from runtime config and normalizes blank strings to nil."
+(defn runtime-value
+  "Reads raw value from normalized runtime config."
   [runtime k]
-  (some-> (get (runtime-config runtime) k)
-          str
-          str/trim
-          not-empty))
+  (get (runtime-config runtime) k))
+
+(defn runtimev
+  "Reads scalar value from runtime config and normalizes it to non-blank string."
+  [runtime k]
+  (let [v (runtime-value runtime k)]
+    (cond
+      (nil? v) nil
+      (keyword? v) (some-> v name str/trim not-empty)
+      :else (some-> v str str/trim not-empty))))
 
 (defn preconfigure-model
   "Pre-configuration hook for model selector keys."
@@ -48,16 +54,16 @@
 
   Accepts either a plain string (already selected model id) or a map with keys:
   - :profile (string/keyword),
-  - :default (string),
-  - :mini (string, optional),
-  - :fallback (string, optional)."
+  - :id/default (string),
+  - :id/mini (string, optional),
+  - :id/fallback (string, optional)."
   [_k config]
   (if-not (map? config)
     config
     (let [profile  (or (normalize-profile (:profile config)) "default")
-          default' (some-> (:default config) str str/trim not-empty)
-          mini'    (some-> (:mini config) str str/trim not-empty)
-          fallback (some-> (:fallback config) str str/trim not-empty)]
+          default' (some-> (or (:id/default config) (:default config)) str str/trim not-empty)
+          mini'    (some-> (or (:id/mini config) (:mini config)) str str/trim not-empty)
+          fallback (some-> (or (:id/fallback config) (:fallback config)) str str/trim not-empty)]
       (or (case profile
             "mini" mini'
             nil)
@@ -107,9 +113,26 @@
   (when worker
     (apply bot/command worker command args)))
 
+(defn- merge-runtime-defaults
+  [cfg]
+  (let [defaults      (if (map? (:defaults cfg)) (:defaults cfg) {})
+        cfg'          (dissoc cfg :defaults)
+        merged        (merge defaults cfg')
+        merged-env    (when (or (map? (:env defaults))
+                                (map? (:env cfg')))
+                        (merge (or (:env defaults) {})
+                               (or (:env cfg') {})))
+        merged-session (if (and (map? (:session defaults))
+                                (map? (:session cfg')))
+                         (merge (:session defaults) (:session cfg'))
+                         (:session merged))]
+    (cond-> (assoc merged :session merged-session)
+      (some? merged-env) (assoc :env merged-env))))
+
 (defn- normalize-runtime-worker-config
   [k config]
-  (let [cfg      (if (map? config) config {})
+  (let [cfg      (-> (if (map? config) config {})
+                     merge-runtime-defaults)
         wid      (or (:id cfg) k)
         name'    (or (:name cfg) (str (name wid) " runtime"))
         session' (or (:session cfg) {:sid "ferment-model-runtime"})]
@@ -124,7 +147,12 @@
 (defn preconfigure-runtime-worker
   "Pre-configuration hook for model runtime worker keys."
   [k config]
-  (normalize-runtime-worker-config k config))
+  (let [cfg (if (map? config) config {})]
+    (normalize-runtime-worker-config
+     k
+     (if (contains? cfg :defaults)
+       cfg
+       (assoc cfg :defaults (system/ref :ferment.model.defaults/runtime))))))
 
 (defn start-command-process!
   "Starts a local process for worker runtime when `:command` is present in config.
@@ -137,7 +165,7 @@
   [worker-config _session]
   (when-some [cmd (seq (map str (:command worker-config)))]
     (let [^java.util.List command (mapv str cmd)
-          pb (ProcessBuilder. command)
+          pb (ProcessBuilder. ^java.util.List command)
           _  (if (:inherit-io? worker-config)
                (.inheritIO pb)
                (doto pb
@@ -283,14 +311,24 @@
 (defn preconfigure-model-runtime
   "Pre-configuration hook for model runtime aggregate key."
   [_k config]
-  config)
+  (let [cfg (if (map? config) config {})]
+    (if (contains? cfg :models)
+      cfg
+      (assoc cfg :models (system/ref :ferment/models)))))
 
 (defn init-model-runtime
   "Initializes model runtime aggregate state."
   [_k config]
-  (let [workers (or (:workers config)
-                    (select-keys config [:solver :voice :meta]))]
-    (assoc config :workers workers)))
+  (let [models (or (:models config) {})
+        workers-from-models
+        (into {}
+              (keep (fn [[model-k model-config]]
+                      (let [runtime' (when (map? model-config) (:runtime model-config))]
+                        (when runtime'
+                          [(keyword (name model-k)) runtime']))))
+              models)
+        workers (or (:workers config) workers-from-models)]
+    (assoc config :models models :workers workers)))
 
 (defn stop-model-runtime
   "Stop hook for model runtime aggregate key."
@@ -300,7 +338,12 @@
 (defn runtime-worker-state
   "Returns runtime worker state by id from model runtime aggregate."
   [runtime worker-id]
-  (some-> runtime :workers (get worker-id)))
+  (let [workers (:workers runtime)
+        wid    (if (keyword? worker-id) worker-id (keyword (str worker-id)))
+        alias  (keyword (name wid))]
+    (or (get workers worker-id)
+        (get workers wid)
+        (get workers alias))))
 
 (defn runtime-worker
   "Returns worker handle by id from model runtime aggregate."
@@ -328,43 +371,118 @@
   [runtime worker-id]
   (runtime-command! runtime worker-id :run))
 
+(defn preconfigure-model-entry
+  "Pre-configuration hook for grouped model entries."
+  [_k config]
+  (if (map? config) config {:id config}))
+
+(defn init-model-entry
+  "Initializes grouped model entry (`:id` + optional `:runtime`)."
+  [_k config]
+  (let [cfg (if (map? config) config {:id config})
+        id' (some-> (:id cfg) str str/trim not-empty)]
+    (cond-> cfg
+      id' (assoc :id id'))))
+
+(defn stop-model-entry
+  "Stop hook for grouped model entry."
+  [_k _state]
+  nil)
+
+(defn preconfigure-models
+  "Pre-configuration hook for aggregate `:ferment/models` map."
+  [_k config]
+  (or config {}))
+
+(defn init-models
+  "Initializes aggregate `:ferment/models` map."
+  [_k config]
+  config)
+
+(defn stop-models
+  "Stop hook for aggregate `:ferment/models` map."
+  [_k _state]
+  nil)
+
+(defn model-entry
+  "Returns grouped model entry from runtime `:models` map."
+  [runtime model-k]
+  (let [cfg    (runtime-config runtime)
+        models (:models cfg)
+        shortk (keyword (name model-k))]
+    (or (when (map? models)
+          (or (get models model-k)
+              (get models shortk)))
+        (let [legacy (get cfg model-k)]
+          (when (map? legacy) legacy)))))
+
+(defn model-id
+  "Returns model identifier for grouped model key."
+  [runtime model-k default-id]
+  (or (some-> (model-entry runtime model-k) :id str str/trim not-empty)
+      (runtimev runtime model-k)
+      default-id))
+
 (defn profile
   "Returns effective model profile (`default`, `mini`, ...)."
   [runtime]
-  (-> (or (runtimev runtime :ferment.model/profile)
-          "default")
-      str/lower-case))
+  (or (normalize-profile (runtime-value runtime :ferment.model.defaults/profile))
+      "default"))
 
 (defn solver-id
   "Resolves solver model identifier from runtime config."
   [runtime]
-  (or (runtimev runtime :ferment.model/solver)
-      (runtimev runtime :ferment.model/coding)
+  (or (model-id runtime :ferment.model/solver nil)
+      (model-id runtime :ferment.model/coding nil)
       "qwen2.5-coder:7b"))
 
 (defn voice-id
   "Resolves voice model identifier from runtime config."
   [runtime]
-  (or (runtimev runtime :ferment.model/voice)
+  (or (model-id runtime :ferment.model/voice nil)
       "SpeakLeash/bielik-1.5b-instruct"))
 
-(derive ::profile :ferment.system/value)
-(derive ::solver  ::selector)
-(derive ::voice   ::selector)
-(derive :ferment.model/coding ::selector)
-(derive :ferment.model/meta ::selector)
-(derive ::runtime-env :ferment.system/value)
+(defn meta-id
+  "Resolves meta/router model identifier from runtime config."
+  [runtime]
+  (or (model-id runtime :ferment.model/meta nil)
+      "mlx-community/SmolLM3-3B-8bit"))
+
+(derive ::defaults-profile :ferment.system/value)
+(derive ::runtime-defaults :ferment.system/value)
 (derive ::bot-session :ferment.system/value)
-(derive :ferment.model.solver/runtime ::runtime-worker)
-(derive :ferment.model.voice/runtime  ::runtime-worker)
-(derive :ferment.model.solver/env ::runtime-env)
-(derive :ferment.model.voice/env  ::runtime-env)
-(derive :ferment.model.meta/env   ::runtime-env)
-(derive ::runtime        ::runtime-service)
+(derive :ferment.model.defaults/profile ::defaults-profile)
+(derive :ferment.model.defaults/runtime ::runtime-defaults)
+(derive :ferment.model.defaults/bot-session ::bot-session)
+
+(derive :ferment.model.id/solver ::selector)
+(derive :ferment.model.id/voice  ::selector)
+(derive :ferment.model.id/coding ::selector)
+(derive :ferment.model.id/meta   ::selector)
+
+(derive ::model-entry :ferment.system/value)
+(derive :ferment.model/solver ::model-entry)
+(derive :ferment.model/voice  ::model-entry)
+(derive :ferment.model/coding ::model-entry)
+(derive :ferment.model/meta   ::model-entry)
+
+(derive :ferment.model.runtime/solver ::runtime-worker)
+(derive :ferment.model.runtime/voice  ::runtime-worker)
+(derive :ferment.model.runtime/coding ::runtime-worker)
+(derive :ferment.model.runtime/meta   ::runtime-worker)
+
+(derive ::models-aggregate :ferment.system/value)
+(derive :ferment/models ::models-aggregate)
+
+(derive ::runtime ::runtime-service)
 
 (system/add-expand ::selector [k config] {k (preconfigure-model k config)})
 (system/add-init   ::selector [k config]    (init-model-key k config))
 (system/add-halt!  ::selector [k state]     (stop-model k state))
+
+(system/add-expand ::model-entry [k config] {k (preconfigure-model-entry k config)})
+(system/add-init   ::model-entry [k config]    (init-model-entry k config))
+(system/add-halt!  ::model-entry [k state]     (stop-model-entry k state))
 
 (system/add-expand ::bot-session [k config] {k (preconfigure-bot-session k config)})
 (system/add-init   ::bot-session [k config]    (init-bot-session k config))
@@ -373,6 +491,10 @@
 (system/add-expand ::runtime-worker [k config] {k (preconfigure-runtime-worker k config)})
 (system/add-init   ::runtime-worker [k config]    (init-runtime-worker k config))
 (system/add-halt!  ::runtime-worker [k state]     (stop-runtime-worker k state))
+
+(system/add-expand ::models-aggregate [k config] {k (preconfigure-models k config)})
+(system/add-init   ::models-aggregate [k config]    (init-models k config))
+(system/add-halt!  ::models-aggregate [k state]     (stop-models k state))
 
 (system/add-expand ::runtime-service [k config] {k (preconfigure-model-runtime k config)})
 (system/add-init   ::runtime-service [k config]    (init-model-runtime k config))

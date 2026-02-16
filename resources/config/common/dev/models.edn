@@ -1,5 +1,5 @@
 {
 
- :ferment.model/profile "mini"
+ :ferment.model.defaults/profile "mini"
 
 }

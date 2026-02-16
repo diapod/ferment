@@ -31,3 +31,4 @@ doc/10_introduction.md
 AGENTS.md
 CLAUDE.md
 /bin/__pycache__
+/resources/config/local

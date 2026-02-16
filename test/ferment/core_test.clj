@@ -38,23 +38,23 @@
 (deftest solver-can-read-model-selection-from-runtime-config
   (testing "solver! accepts runtime config map and uses :ferment.model/solver."
     (let [called-with (atom nil)
-          cfg {:ferment.model/solver "solver-selected"}]
+          runtime {:models {:ferment.model/solver {:id "solver-selected"}}}]
       (with-redefs [core/ollama-generate!
                     (fn [m]
                       (reset! called-with m)
                       {:response "{\"intent\":\"ok\"}"})]
-        (is (= "{\"intent\":\"ok\"}" (core/solver! "napisz patch" {:config cfg})))
+        (is (= "{\"intent\":\"ok\"}" (core/solver! "napisz patch" runtime)))
         (is (= "solver-selected" (:model @called-with)))))))
 
 (deftest solver-prefers-ferment-model-key-when-present
   (testing "solver! falls back to :ferment.model/coding when :ferment.model/solver is missing."
     (let [called-with (atom nil)
-          cfg {:ferment.model/coding "coding-from-model-branch"}]
+          runtime {:models {:ferment.model/coding {:id "coding-from-model-branch"}}}]
       (with-redefs [core/ollama-generate!
                     (fn [m]
                       (reset! called-with m)
                       {:response "{\"intent\":\"ok\"}"})]
-        (is (= "{\"intent\":\"ok\"}" (core/solver! "napisz patch" {:config cfg})))
+        (is (= "{\"intent\":\"ok\"}" (core/solver! "napisz patch" runtime)))
         (is (= "coding-from-model-branch" (:model @called-with)))))))
 
 (deftest invoke-capability-can-return-plan-with-injected-slots
