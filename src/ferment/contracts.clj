@@ -59,14 +59,86 @@
 (s/def :ferment.contracts/result-type result-types)
 (s/def :ferment.contracts/result map?)
 
+(defn- keyword-coll?
+  [v]
+  (or (set? v)
+      (and (sequential? v)
+           (not (map? v))))
+  )
+
+(defn- validate-done-shape
+  [done]
+  (cond
+    (nil? done) {:ok? true}
+    (not (map? done))
+    {:ok? false :reason :done/not-map}
+    (and (contains? done :must)
+         (not (keyword-coll? (:must done))))
+    {:ok? false :reason :done/must-not-keyword-coll}
+    (and (contains? done :must)
+         (not (every? keyword? (:must done))))
+    {:ok? false :reason :done/must-not-keywords}
+    (and (contains? done :should)
+         (not (keyword-coll? (:should done))))
+    {:ok? false :reason :done/should-not-keyword-coll}
+    (and (contains? done :should)
+         (not (every? keyword? (:should done))))
+    {:ok? false :reason :done/should-not-keywords}
+    (and (contains? done :score-min)
+         (not (number? (:score-min done))))
+    {:ok? false :reason :done/score-min-not-number}
+    :else {:ok? true}))
+
+(defn- validate-effects-shape
+  [effects]
+  (cond
+    (nil? effects) {:ok? true}
+    (not (map? effects))
+    {:ok? false :reason :effects/not-map}
+    (and (contains? effects :allowed)
+         (not (keyword-coll? (:allowed effects))))
+    {:ok? false :reason :effects/allowed-not-keyword-coll}
+    (and (contains? effects :allowed)
+         (not (every? keyword? (:allowed effects))))
+    {:ok? false :reason :effects/allowed-not-keywords}
+    :else {:ok? true}))
+
+(defn- validate-intent-vs-protocol
+  [request protocol]
+  (let [intent (get-in request [:task :intent])
+        intents (get protocol :intents)]
+    (if (and (map? intents) (keyword? intent))
+      (if (contains? intents intent)
+        {:ok? true}
+        {:ok? false :reason :intent/not-supported :intent intent})
+      {:ok? true})))
+
 (defn validate-request
   "Validates request envelope against protocol v0 request contract."
-  [request]
-  (if (s/valid? :ferment.contracts/request request)
-    {:ok? true}
-    {:ok? false
-     :error :invalid-request
-     :explain (s/explain-data :ferment.contracts/request request)}))
+  ([request]
+   (validate-request nil request))
+  ([protocol request]
+   (if-not (s/valid? :ferment.contracts/request request)
+     {:ok? false
+      :error :invalid-request
+      :explain (s/explain-data :ferment.contracts/request request)}
+     (let [intent-check (validate-intent-vs-protocol request protocol)]
+       (if-not (:ok? intent-check)
+         {:ok? false
+          :error :invalid-request
+          :reason (:reason intent-check)
+          :intent (:intent intent-check)}
+         (let [done-check (validate-done-shape (:done request))]
+           (if-not (:ok? done-check)
+             {:ok? false
+              :error :invalid-request
+              :reason (:reason done-check)}
+             (let [effects-check (validate-effects-shape (:effects request))]
+               (if-not (:ok? effects-check)
+                 {:ok? false
+                  :error :invalid-request
+                  :reason (:reason effects-check)}
+                 {:ok? true})))))))))
 
 (defn result-type-of
   "Returns normalized result type for canonical envelopes."
@@ -151,20 +223,32 @@
   "Validates result envelope and semantic branch shape.
 
   Canonical envelope only: `{:result {...}}` or `{:error {...}}`."
-  [result]
-  (cond
-    (not (map? result))
-    {:ok? false
-     :error :invalid-result
-     :reason :not-a-map}
+  ([result]
+   (validate-result nil result))
+  ([protocol result]
+   (cond
+     (not (map? result))
+     {:ok? false
+      :error :invalid-result
+      :reason :not-a-map}
 
-    (not (canonical-result-shape-valid? result))
-    {:ok? false
-     :error :invalid-result
-     :reason :invalid-envelope-shape}
+     (not (canonical-result-shape-valid? result))
+     {:ok? false
+      :error :invalid-result
+      :reason :invalid-envelope-shape}
 
-    :else
-    {:ok? true}))
+     (contains? result :result)
+     (let [allowed-types (set (or (:result/types protocol) result-types))
+           rtype (get-in result [:result :type])]
+       (if (contains? allowed-types rtype)
+         {:ok? true}
+         {:ok? false
+          :error :invalid-result
+          :reason :result/type-not-allowed
+          :result/type rtype}))
+
+     :else
+     {:ok? true})))
 
 (defn invoke-with-contract
   "Runs `invoke-fn` under protocol validation with bounded retries.
@@ -175,15 +259,15 @@
   - `{:ok? false :error ... :attempts n ...}`."
   ([invoke-fn request]
    (invoke-with-contract invoke-fn request {}))
-  ([invoke-fn request {:keys [max-attempts]
+  ([invoke-fn request {:keys [max-attempts protocol]
                        :or   {max-attempts 3}}]
-   (let [request-check (validate-request request)
+   (let [request-check (validate-request protocol request)
          max-attempts  (long (max 1 max-attempts))]
      (if-not (:ok? request-check)
        request-check
        (loop [attempt 1]
          (let [result (invoke-fn request attempt)
-               check  (validate-result result)]
+               check  (validate-result protocol result)]
            (if (:ok? check)
              {:ok? true
               :attempt attempt

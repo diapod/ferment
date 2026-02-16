@@ -32,3 +32,4 @@ AGENTS.md
 CLAUDE.md
 /bin/__pycache__
 /resources/config/local
+/dev/resources/ferment/models/HF

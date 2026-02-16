@@ -13,6 +13,8 @@
                                                :out-schema :res/context-summary}
                            :text/respond      {:in-schema :req/text
                                                :out-schema :res/text}
+                           :problem/solve     {:in-schema :req/problem
+                                               :out-schema :res/problem}
                            :code/generate     {:in-schema :req/code
                                                :out-schema :res/code}
                            :code/patch        {:in-schema :req/code
@@ -24,6 +26,7 @@
                            :eval/grade        {:in-schema :req/eval
                                                :out-schema :res/eval}}
   :roles                  {:router {:allowed [:route :checks :budget]}
+                           :solver {:allowed [:analysis :value :notes]}
                            :coder  {:allowed [:patch :tests :notes]}
                            :voice  {:allowed [:text :summary]}}
   :done/default           {:must      #{:schema-valid}

@@ -4,6 +4,9 @@
  :ferment.caps.registry/llm-voice
  {:cap/id        :llm/voice
   :cap/kind      :llm
+  :cap/intents   #{:text/respond}
+  :cap/can-produce #{:value}
+  :cap/effects-allowed #{:none}
   :io/in-schema  :req/text
   :io/out-schema :res/text
   :dispatch/tag  :voice}
@@ -11,13 +14,29 @@
  :ferment.caps.registry/llm-code
  {:cap/id        :llm/code
   :cap/kind      :llm
+  :cap/intents   #{:code/generate :code/patch :code/explain :code/review}
+  :cap/can-produce #{:value :plan}
+  :cap/effects-allowed #{:none}
   :io/in-schema  :req/code
   :io/out-schema :res/patch+tests
   :dispatch/tag  :code}
 
+ :ferment.caps.registry/llm-solver
+ {:cap/id        :llm/solver
+  :cap/kind      :llm
+  :cap/intents   #{:problem/solve}
+  :cap/can-produce #{:value :plan}
+  :cap/effects-allowed #{:none}
+  :io/in-schema  :req/problem
+  :io/out-schema :res/problem
+  :dispatch/tag  :solver}
+
  :ferment.caps.registry/llm-meta
  {:cap/id        :llm/meta
   :cap/kind      :llm
+  :cap/intents   #{:route/decide :context/summarize :eval/grade}
+  :cap/can-produce #{:value :plan}
+  :cap/effects-allowed #{:none}
   :io/in-schema  :req/meta
   :io/out-schema :res/meta
   :dispatch/tag  :meta}
@@ -25,6 +44,12 @@
  :ferment.caps.registry/llm-mock
  {:cap/id        :llm/mock
   :cap/kind      :mock
+  :cap/intents   #{:route/decide :context/summarize :text/respond
+                   :problem/solve
+                   :code/generate :code/patch :code/explain :code/review
+                   :eval/grade}
+  :cap/can-produce #{:value :plan}
+  :cap/effects-allowed #{:none}
   :io/in-schema  :req/any
   :io/out-schema :res/any
   :dispatch/tag  :mock}
@@ -33,6 +58,7 @@
  :ferment.caps/registry
  [#ref :ferment.caps.registry/llm-voice
   #ref :ferment.caps.registry/llm-code
+  #ref :ferment.caps.registry/llm-solver
   #ref :ferment.caps.registry/llm-meta
   #ref :ferment.caps.registry/llm-mock]
 
@@ -41,6 +67,7 @@
  {:intent->cap {:route/decide      :llm/meta
                 :context/summarize :llm/meta
                 :text/respond      :llm/voice
+                :problem/solve     :llm/solver
                 :code/generate     :llm/code
                 :code/patch        :llm/code
                 :code/explain      :llm/code
@@ -50,7 +77,7 @@
   :switch-on   #{:schema/invalid :format/drift :eval/low-score}
   :retry       {:same-cap-max 1
                 :fallback-max 1}
-  :fallback    [:llm/code :llm/meta :llm/mock]
+  :fallback    [:llm/solver :llm/code :llm/meta :llm/mock]
   :checks      [:schema-valid :tests-pass]}
 
  ;; Runtime/profile policy knobs

@@ -146,3 +146,51 @@
       (is (:ok? run))
       (is (= [:llm/voice-a :llm/voice-b] @calls))
       (is (= {:text "voice-b"} (:emitted run))))))
+
+(deftest execute-plan-filters-candidates-by-capability-intent
+  (testing "Routing odrzuca candidate, który nie deklaruje wsparcia dla intencji."
+    (let [calls (atom [])
+          run   (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :route/decide
+                                  :dispatch {:candidates [:llm/voice :llm/meta]}
+                                  :as :answer}
+                                 {:op :emit :input {:slot/id [:answer :out]}}]}
+                  :resolver {:caps/by-id
+                             {:llm/voice {:cap/id :llm/voice
+                                          :cap/intents #{:text/respond}
+                                          :cap/can-produce #{:value}
+                                          :cap/effects-allowed #{:none}}
+                              :llm/meta {:cap/id :llm/meta
+                                         :cap/intents #{:route/decide}
+                                         :cap/can-produce #{:value :plan}
+                                         :cap/effects-allowed #{:none}}}}
+                  :invoke-call
+                  (fn [call-node _env]
+                    (swap! calls conj (:cap/id call-node))
+                    {:result {:type :value
+                              :out {:text (name (:cap/id call-node))}}})})]
+      (is (:ok? run))
+      (is (= [:llm/meta] @calls))
+      (is (= {:text "meta"} (:emitted run))))))
+
+(deftest execute-plan-rejects-capability-when-effects-not-allowed
+  (testing "Routing odrzuca capability, gdy node wymaga efektów spoza `:cap/effects-allowed`."
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"Unable to resolve capability candidates"
+         (workflow/execute-plan
+          {:plan {:nodes [{:op :call
+                           :intent :code/patch
+                           :effects {:allowed #{:fs/write}}
+                           :dispatch {:candidates [:llm/code]}
+                           :as :answer}]}
+           :resolver {:caps/by-id
+                      {:llm/code {:cap/id :llm/code
+                                  :cap/intents #{:code/patch}
+                                  :cap/can-produce #{:value :plan}
+                                  :cap/effects-allowed #{:none}}}}
+           :invoke-call
+           (fn [_ _]
+             {:result {:type :value
+                       :out {:text "should-not-run"}}})})))))

@@ -1,0 +1,4 @@
+{:ferment.http/default {:host   "127.0.0.1"
+                        :port   12002
+                        :models #ref :ferment/models}
+ }

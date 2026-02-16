@@ -8,6 +8,48 @@
 
   (:require [ferment.system :as system]))
 
+(def ^:private default-can-produce
+  #{:value})
+
+(def ^:private default-effects-allowed
+  #{:none})
+
+(defn- keyword-set
+  [v]
+  (cond
+    (set? v) (into #{} (filter keyword?) v)
+    (sequential? v) (into #{} (filter keyword?) v)
+    (keyword? v) #{v}
+    :else #{}))
+
+(defn normalize-capability-metadata
+  "Normalizes capability metadata fields to sets of keywords."
+  [cap-config]
+  (let [intents (keyword-set (:cap/intents cap-config))
+        can-produce (let [v (keyword-set (:cap/can-produce cap-config))]
+                      (if (seq v) v default-can-produce))
+        effects (let [v (keyword-set (:cap/effects-allowed cap-config))]
+                  (if (seq v) v default-effects-allowed))]
+    (assoc cap-config
+           :cap/intents intents
+           :cap/can-produce can-produce
+           :cap/effects-allowed effects)))
+
+(defn- ensure-required-capability-metadata!
+  [cap-key cap-config]
+  (let [missing (cond-> []
+                  (not (contains? cap-config :cap/intents))
+                  (conj :cap/intents)
+                  (not (contains? cap-config :cap/can-produce))
+                  (conj :cap/can-produce))]
+    (when (seq missing)
+      (throw (ex-info "Capability metadata is incomplete."
+                      {:cap/key cap-key
+                       :error :capability/invalid-metadata
+                       :missing missing
+                       :required [:cap/intents :cap/can-produce]
+                       :config cap-config})))))
+
 (defn preconfigure-caps
   "Pre-configuration hook for generic `:ferment.caps/...` branch keys.
 
@@ -39,8 +81,12 @@
   "Initialization hook for a single capability entry.
 
   Useful when one capability needs custom parsing before runtime usage."
-  [_cap-key cap-config]
-  cap-config)
+  [cap-key cap-config]
+  (if (map? cap-config)
+    (do
+      (ensure-required-capability-metadata! cap-key cap-config)
+      (normalize-capability-metadata cap-config))
+    cap-config))
 
 (defn stop-capability-value
   "Stop hook for a single capability entry."

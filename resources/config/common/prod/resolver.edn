@@ -3,6 +3,7 @@
  :ferment.resolver/default
  {:caps     [#ref :ferment.caps.registry/llm-voice
              #ref :ferment.caps.registry/llm-code
+             #ref :ferment.caps.registry/llm-solver
              #ref :ferment.caps.registry/llm-meta
              #ref :ferment.caps.registry/llm-mock]
   :protocol #ref :ferment.protocol/default

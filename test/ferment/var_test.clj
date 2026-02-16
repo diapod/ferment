@@ -18,9 +18,12 @@
             [orchestra.spec.test             :as              st]
             [ferment.caps                    :as            caps]
             [ferment.core                    :as            core]
+            [ferment.http                    :as           fhttp]
             [ferment.model                   :as           model]
             [ferment.system                  :as          system]
             [ferment.resolver                :as        resolver]
+            [io.randomseed.utils.bot         :as             bot]
+            [io.randomseed.utils.bus         :as             bus]
             [ferment                       :refer         :all]
             [expound.alpha                   :as         expound]))
 
@@ -32,15 +35,22 @@
                    (slurp path)))
 
 (deftest capabilities-config-is-flattened
-  (testing "Każde capability jest osobnym kluczem i agregat nadal istnieje."
+  (testing "Każde capability jest osobnym kluczem, ma metadata kontraktu i agregat nadal istnieje."
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/capabilities.edn")
           cap-keys #{:ferment.caps.registry/llm-voice
                      :ferment.caps.registry/llm-code
+                     :ferment.caps.registry/llm-solver
                      :ferment.caps.registry/llm-meta
                      :ferment.caps.registry/llm-mock}
           refs (get cfg :ferment.caps/registry)]
       (is (every? #(contains? cfg %) cap-keys))
-      (is (= 4 (count refs)))
+      (is (every? (fn [k]
+                    (let [cap (get cfg k)]
+                      (and (contains? cap :cap/intents)
+                           (contains? cap :cap/can-produce)
+                           (contains? cap :cap/effects-allowed))))
+                  cap-keys))
+      (is (= 5 (count refs)))
       (is (= cap-keys (set refs))))))
 
 (deftest resolver-config-references-flat-capabilities
@@ -54,6 +64,7 @@
       (is (map? default))
       (is (= #{:ferment.caps.registry/llm-voice
                :ferment.caps.registry/llm-code
+               :ferment.caps.registry/llm-solver
                :ferment.caps.registry/llm-meta
                :ferment.caps.registry/llm-mock}
              (set (:caps default))))
@@ -61,17 +72,41 @@
       (is (= {:cap/id :llm/code :x 2}
              (get-in initialized [:caps/by-id :llm/code]))))))
 
-(deftest caps-entry-hooks-are-pass-through-by-default
-  (testing "Domyślne hooki caps entry nie modyfikują wartości."
-    (let [entry {:cap/id :llm/meta :dispatch/tag :meta}]
+(deftest caps-entry-hooks-normalize-capability-metadata
+  (testing "Hooki entry normalizują metadata kontraktu capabilities."
+    (let [entry {:cap/id :llm/meta
+                 :dispatch/tag :meta
+                 :cap/intents [:route/decide]
+                 :cap/can-produce :plan}
+          initialized (caps/init-capability-value
+                       :ferment.caps.registry/llm-meta
+                       entry)]
       (is (= entry
              (caps/preconfigure-capability-value
               :ferment.caps.registry/llm-meta
               entry)))
-      (is (= entry
-             (caps/init-capability-value
-              :ferment.caps.registry/llm-meta
-              entry))))))
+      (is (= #{:route/decide} (:cap/intents initialized)))
+      (is (= #{:plan} (:cap/can-produce initialized)))
+      (is (= #{:none} (:cap/effects-allowed initialized))))))
+
+(deftest caps-entry-hooks-fail-fast-on-missing-required-metadata
+  (testing "Init capability fail-fastuje, gdy brakuje wymaganych kluczy metadata."
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"Capability metadata is incomplete."
+         (caps/init-capability-value
+          :ferment.caps.registry/llm-meta
+          {:cap/id :llm/meta
+           :dispatch/tag :meta
+           :cap/intents #{:route/decide}})))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"Capability metadata is incomplete."
+         (caps/init-capability-value
+          :ferment.caps.registry/llm-meta
+          {:cap/id :llm/meta
+           :dispatch/tag :meta
+           :cap/can-produce #{:plan}})))))
 
 (deftest runtime-config-contains-core-runtime-branch
   (testing "Runtime branch ma refs do resolvera/protokołu oraz agregat modeli."
@@ -83,18 +118,49 @@
       (is (= :ferment/models
              (:models runtime))))))
 
+(deftest http-config-references-models-aggregate
+  (testing "Gałąź HTTP ma klucz :ferment.http/default i referencję do :ferment/models."
+    (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/http.edn")
+          http (get cfg :ferment.http/default)]
+      (is (map? http))
+      (is (= "127.0.0.1" (:host http)))
+      (is (= 12002 (:port http)))
+      (is (= :ferment/models (:models http))))))
+
+(deftest http-route-builder-collects-enabled-runtime-endpoints
+  (testing "Endpointy HTTP są budowane tylko dla runtime z :http {:enabled? true ...}."
+    (let [worker-a {:worker-id :a}
+          worker-b {:worker-id :b}
+          routes (fhttp/model-http-routes
+                  {:ferment.model/solver {:runtime {:id :ferment.model.runtime/solver
+                                                    :worker worker-a
+                                                    :config {:http {:enabled? true
+                                                                    :endpoint "solver/responses"}}}}
+                   :ferment.model/meta   {:runtime {:id :ferment.model.runtime/meta
+                                                    :worker worker-b
+                                                    :config {:http {:enabled? true
+                                                                    :endpoint "/meta/responses"}}}}
+                   :ferment.model/voice  {:runtime {:id :ferment.model.runtime/voice
+                                                    :worker worker-b
+                                                    :config {:http {:enabled? false
+                                                                    :endpoint "voice/responses"}}}}})]
+      (is (= #{"/solver/responses" "/meta/responses"} (set (keys routes))))
+      (is (= :ferment.model/solver (get-in routes ["/solver/responses" :model])))
+      (is (= :ferment.model.runtime/meta (get-in routes ["/meta/responses" :worker-id]))))))
+
 (deftest models-config-defines-selector-values-in-edn
   (testing "Selektory modeli są utrzymywane w models.edn."
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/models.edn")]
       (is (= "default" (get cfg :ferment.model.defaults/profile)))
-      (is (= "qwen2.5-coder:7b"
+      (is (= "mlx-community/Qwen2.5-7B-Instruct-4bit"
              (get-in cfg [:ferment.model.id/solver :id/default])))
-      (is (= "qwen2.5-coder:1.5b"
+      (is (= "mlx-community/SmolLM3-3B-8bit"
              (get-in cfg [:ferment.model.id/solver :id/mini])))
       (is (= "SpeakLeash/bielik-1.5b-instruct"
              (get-in cfg [:ferment.model.id/voice :id/default])))
       (is (= {"HF_HOME" :ferment.env/hf.home
-              "HF_HUB_CACHE" :ferment.env/hf.hub.cache}
+              "HF_HUB_CACHE" :ferment.env/hf.hub.cache
+              "PATH" "${HOME}/.pyenv/shims:${PATH}"}
              (get-in cfg [:ferment.model.defaults/runtime :env])))
       (is (= :ferment.model.defaults/runtime
              (get-in cfg [:ferment.model.runtime/solver :defaults]))))))
@@ -196,6 +262,8 @@
       (is (= "solver-from-model-branch" (model/solver-id runtime)))
       (is (= "voice-from-model-branch" (model/voice-id runtime)))
       (is (= "coding-from-model-branch"
+             (model/coding-id {:models {:ferment.model/coding {:id "coding-from-model-branch"}}})))
+      (is (= "mlx-community/Qwen2.5-7B-Instruct-4bit"
              (model/solver-id {:models {:ferment.model/coding {:id "coding-from-model-branch"}}}))))))
 
 (deftest model-runtime-worker-lifecycle-uses-bot-start-stop
@@ -223,6 +291,121 @@
           (is (true? (:enabled? state)))
           (is (nil? (model/stop-runtime-worker :ferment.model.runtime/solver state)))
           (is (= {:worker-id :mock-worker} @stopped)))))))
+
+(deftest model-runtime-worker-default-invoke-function-uses-command
+  (testing "Worker z :command dostaje domyślny invoke-fn i odpowiada przez runtime-request-handler."
+    (let [called (atom nil)]
+      (with-redefs [model/invoke-command!
+                    (fn [worker-config payload]
+                      (reset! called {:cfg worker-config :payload payload})
+                      {:text "meta-ok"})]
+        (let [cfg (model/preconfigure-runtime-worker
+                   :ferment.model.runtime/meta
+                   {:command ["mlx_lm.chat" "--model" "meta-model"]})
+              response (model/runtime-request-handler
+                        {:stage :RUNNING}
+                        {:id :ferment.model.runtime/meta}
+                        {:body :invoke
+                         :args [{:prompt "hej"}]}
+                        [cfg])]
+          (is (fn? (:invoke-fn cfg)))
+          (is (= {:ok? true
+                  :result {:text "meta-ok"}}
+                 response))
+          (is (= {:prompt "hej"} (:payload @called))))))))
+
+(deftest model-runtime-request-quit-writes-command-to-process-stdin
+  (testing "Komenda :quit zapisuje :cmd/quit do stdin procesu z kończącym znakiem nowej linii."
+    (let [sink (java.io.ByteArrayOutputStream.)
+          process (proxy [Process] []
+                    (getOutputStream [] sink)
+                    (getInputStream [] (java.io.ByteArrayInputStream. (byte-array 0)))
+                    (getErrorStream [] (java.io.ByteArrayInputStream. (byte-array 0)))
+                    (waitFor [] 0)
+                    (exitValue [] 0)
+                    (destroy [] nil)
+                    (destroyForcibly [] this)
+                    (isAlive [] true))
+          response (model/runtime-request-handler
+                    {:runtime/state {:process process}}
+                    {:id :ferment.model.runtime/meta}
+                    {:body :quit}
+                    {:id :ferment.model.runtime/meta
+                     :name "meta model runtime"
+                     :cmd/quit "q"})]
+      (is (= true (:ok? response)))
+      (is (= "q\n" (.toString sink "UTF-8"))))))
+
+(deftest model-runtime-request-runtime-returns-safe-snapshot
+  (testing "Komenda :runtime zwraca snapshot operatorski bez surowych/sekretnych pól."
+    (let [response (model/runtime-request-handler
+                    {:stage :RUNNING
+                     :started-at "2026-02-16T15:00:00Z"
+                     :runtime/error {:error :runtime-start-failed
+                                     :class "java.io.IOException"
+                                     :message "boom"
+                                     :stacktrace "..."}
+                     :runtime/state {:type :process
+                                     :pid 1234
+                                     :command ["mlx_lm.chat" "--model" "m"]
+                                     :secret/token "hidden"}}
+                    {:id :ferment.model.runtime/meta}
+                    {:body :runtime}
+                    {:id :ferment.model.runtime/meta
+                     :name "meta model runtime"})]
+      (is (= :ferment.model.runtime/meta (:worker/id response)))
+      (is (= "meta model runtime" (:worker/name response)))
+      (is (= :RUNNING (:stage response)))
+      (is (= {:error :runtime-start-failed
+              :class "java.io.IOException"
+              :message "boom"}
+             (:runtime/error response)))
+      (is (= {:type :process
+              :pid 1234
+              :command ["mlx_lm.chat" "--model" "m"]}
+             (:runtime/state response)))
+      (is (not (contains? (:runtime/state response) :secret/token))))))
+
+(deftest model-runtime-worker-run-sends-bot-responses
+  (testing "runtime-worker-run! odsyła odpowiedź z Outcome na kanał bus."
+    (let [sent (atom nil)]
+      (with-redefs [model/start-command-process! (fn [_ _] nil)
+                    bus/wait-for-request (fn [_] {:request :config})
+                    bot/handle-request
+                    (fn [_ _ _ wrk _ _]
+                      {:response {:body {:ok true}
+                                  :request {:id "req-1"}}
+                       :data :QUIT
+                       :wrk wrk})
+                    bus/send-response
+                    (fn [_wrk response]
+                      (reset! sent response)
+                      response)]
+        (is (nil? (model/runtime-worker-run! {:id :worker}
+                                             {:sid "sid"}
+                                             {:name "test"})))
+        (is (= {:body {:ok true}
+                :request {:id "req-1"}}
+               @sent))))))
+
+(deftest stop-runtime-worker-sends-quit-before-stop
+  (testing "stop-runtime-worker wysyła :quit przed zatrzymaniem workera, gdy :cmd/quit jest ustawione."
+    (let [calls (atom [])]
+      (with-redefs [model/command-bot-worker!
+                    (fn [worker cmd & _]
+                      (swap! calls conj [:command worker cmd])
+                      :ok)
+                    model/stop-bot-worker!
+                    (fn [worker]
+                      (swap! calls conj [:stop worker])
+                      true)]
+        (is (nil? (model/stop-runtime-worker
+                   :ferment.model.runtime/meta
+                   {:worker :mock-worker
+                    :config {:cmd/quit "q"}})))
+        (is (= [[:command :mock-worker :quit]
+                [:stop :mock-worker]]
+               @calls))))))
 
 (deftest model-runtime-aggregate-builds-workers-map
   (testing "Agregat runtime zachowuje workers map i helpery odczytu działają."

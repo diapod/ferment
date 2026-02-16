@@ -7,12 +7,14 @@
     ferment.model
 
   (:require [clojure.string :as str]
+            [clojure.java.io :as io]
             [ferment.system :as system]
             [io.randomseed.utils.bot :as bot]
             [io.randomseed.utils.bus :as bus])
 
   (:import (java.io File)
            (java.lang ProcessBuilder ProcessBuilder$Redirect)
+           (java.nio.charset StandardCharsets)
            (java.time Instant)
            (java.util.concurrent TimeUnit)))
 
@@ -115,8 +117,15 @@
 
 (defn- merge-runtime-defaults
   [cfg]
-  (let [defaults      (if (map? (:defaults cfg)) (:defaults cfg) {})
-        cfg'          (dissoc cfg :defaults)
+  (let [defaults-v     (:defaults cfg)
+        unresolved-ref? (system/ref? defaults-v)
+        defaults       (if (and (map? defaults-v)
+                                (not unresolved-ref?))
+                         defaults-v
+                         {})
+        cfg'           (if unresolved-ref?
+                         cfg
+                         (dissoc cfg :defaults))
         merged        (merge defaults cfg')
         merged-env    (when (or (map? (:env defaults))
                                 (map? (:env cfg')))
@@ -129,19 +138,140 @@
     (cond-> (assoc merged :session merged-session)
       (some? merged-env) (assoc :env merged-env))))
 
+(def ^:private env-var-pattern
+  #"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+(defn- expand-env-template
+  [^String s ^java.util.Map base-env]
+  (str/replace
+   (or s "")
+   env-var-pattern
+   (fn [[_ braced plain]]
+     (let [k (or braced plain)]
+       (or (some-> (.get base-env k) str)
+           (some-> (System/getenv k) str)
+           (when (= "HOME" k) (System/getProperty "user.home"))
+           "")))))
+
+(defn- apply-process-env!
+  [^ProcessBuilder pb env-map]
+  (when (map? env-map)
+    (let [^java.util.Map base-env (.environment pb)]
+      (doseq [[ek ev] env-map]
+        (let [k (str ek)
+              v (expand-env-template (str (or ev "")) base-env)]
+          (.put base-env k v))))))
+
+(defn- effective-env-map
+  [env-map]
+  (let [^java.util.Map effective (java.util.HashMap. ^java.util.Map (System/getenv))]
+    (when (map? env-map)
+      (doseq [[ek ev] env-map]
+        (let [k (str ek)
+              v (expand-env-template (str (or ev "")) effective)]
+          (.put effective k v))))
+    effective))
+
+(defn- resolve-executable-on-path
+  [exe path-str]
+  (let [sep-rx (re-pattern
+                (java.util.regex.Pattern/quote
+                 (or (System/getProperty "path.separator") ":")))]
+    (some (fn [dir]
+            (let [d (some-> dir str str/trim not-empty)
+                  f (when d (io/file d exe))]
+              (when (and f (.isFile f) (.canExecute f))
+                (.getPath f))))
+          (str/split (or path-str "") sep-rx))))
+
+(defn- resolve-command-executable
+  [command env-map]
+  (let [cmd (vec (map str command))
+        exe (first cmd)]
+    (if (or (str/blank? exe)
+            (str/includes? exe "/"))
+      cmd
+      (let [^java.util.Map env* (effective-env-map env-map)
+            path-str (some-> (.get env* "PATH") str)
+            resolved (resolve-executable-on-path exe path-str)]
+        (if resolved
+          (assoc cmd 0 resolved)
+          cmd)))))
+
+(defn- invoke-prompt
+  [payload]
+  (let [prompt (cond
+                 (string? payload) payload
+                 (string? (:prompt payload)) (:prompt payload)
+                 (string? (get-in payload [:input :prompt])) (get-in payload [:input :prompt])
+                 (map? payload) (pr-str payload)
+                 (nil? payload) ""
+                 :else (str payload))
+        system (some-> (cond
+                         (string? (:system payload)) (:system payload)
+                         (string? (get-in payload [:input :system])) (get-in payload [:input :system])
+                         :else nil)
+                       str/trim
+                       not-empty)]
+    (if system
+      (str "SYSTEM:\n" system "\n\nUSER:\n" prompt "\n\nASSISTANT:\n")
+      prompt)))
+
+(defn invoke-command!
+  "Invokes model command in one-shot mode for bot `:invoke` request."
+  [worker-config payload]
+  (let [prompt      (invoke-prompt payload)
+        command0    (vec (map str (:command worker-config)))
+        prompt-via  (or (:prompt-via worker-config) :arg)
+        prompt-arg  (or (:prompt-arg worker-config) "--prompt")
+        command     (if (= :arg prompt-via)
+                      (into command0 [prompt-arg prompt])
+                      command0)
+        command'    (resolve-command-executable command (:env worker-config))
+        ^java.util.List cmd-list (mapv str command')
+        pb          (ProcessBuilder. ^java.util.List cmd-list)
+        _           (when-some [workdir (:workdir worker-config)]
+                      (.directory pb (File. (str workdir))))
+        _           (apply-process-env! pb (:env worker-config))
+        process     (.start pb)
+        _           (when (= :stdin prompt-via)
+                      (let [^String in-str (str prompt)]
+                        (with-open [^java.io.Writer w (io/writer (.getOutputStream process))]
+                          (.write w in-str))))
+        out         (slurp (.getInputStream process))
+        err         (slurp (.getErrorStream process))
+        exit        (.waitFor process)
+        out'        (some-> out str str/trim not-empty)
+        err'        (some-> err str str/trim not-empty)
+        text        (or out' err' "")]
+    (when-not (zero? exit)
+      (throw (ex-info "Model invoke command failed."
+                      {:exit exit
+                       :command command'
+                       :stdout out
+                       :stderr err})))
+    {:text text
+     :command command'
+     :exit exit}))
+
 (defn- normalize-runtime-worker-config
   [k config]
   (let [cfg      (-> (if (map? config) config {})
                      merge-runtime-defaults)
         wid      (or (:id cfg) k)
         name'    (or (:name cfg) (str (name wid) " runtime"))
-        session' (or (:session cfg) {:sid "ferment-model-runtime"})]
+        session' (or (:session cfg) {:sid "ferment-model-runtime"})
+        invoke-fn' (or (:invoke-fn cfg)
+                       (when (seq (:command cfg))
+                         (fn [payload _session worker-config]
+                           (invoke-command! worker-config payload))))]
     (-> cfg
         (assoc :id wid
                :bot (or (:bot cfg) wid)
                :name (str name')
                :session session'
-               :enabled? (not= false (:enabled? cfg)))
+               :enabled? (not= false (:enabled? cfg))
+               :invoke-fn invoke-fn')
         (update :ns #(or % 'ferment.model)))))
 
 (defn preconfigure-runtime-worker
@@ -154,6 +284,35 @@
        cfg
        (assoc cfg :defaults (system/ref :ferment.model.defaults/runtime))))))
 
+(def ^:private io-streams
+  #{:in :out :err})
+
+(defn- normalize-io-selection
+  [inherit-io]
+  (cond
+    (true? inherit-io) io-streams
+    (false? inherit-io) #{}
+    (keyword? inherit-io) (if (contains? io-streams inherit-io) #{inherit-io} #{})
+    (set? inherit-io) (into #{} (filter io-streams) inherit-io)
+    (sequential? inherit-io) (into #{} (filter io-streams) inherit-io)
+    :else #{}))
+
+(defn- configure-process-io!
+  [^ProcessBuilder pb inherit-io]
+  (let [selection (normalize-io-selection inherit-io)]
+    (if (= selection io-streams)
+      (.inheritIO pb)
+      (doto pb
+        (.redirectInput  (if (contains? selection :in)
+                           ProcessBuilder$Redirect/INHERIT
+                           ProcessBuilder$Redirect/PIPE))
+        (.redirectOutput (if (contains? selection :out)
+                           ProcessBuilder$Redirect/INHERIT
+                           ProcessBuilder$Redirect/DISCARD))
+        (.redirectError  (if (contains? selection :err)
+                           ProcessBuilder$Redirect/INHERIT
+                           ProcessBuilder$Redirect/DISCARD))))))
+
 (defn start-command-process!
   "Starts a local process for worker runtime when `:command` is present in config.
 
@@ -161,22 +320,17 @@
   - :command (vector of executable and args)
   - :workdir (optional path)
   - :env (optional map of env overrides)
-  - :inherit-io? (optional, default false)"
+  - :inherit-io? (optional; `true` or one of `:in`, `:out`, `:err`,
+    or collection/set of these keywords)"
   [worker-config _session]
-  (when-some [cmd (seq (map str (:command worker-config)))]
-    (let [^java.util.List command (mapv str cmd)
+  (when-some [cmd0 (seq (map str (:command worker-config)))]
+    (let [cmd     (resolve-command-executable (vec cmd0) (:env worker-config))
+          ^java.util.List command (mapv str cmd)
           pb (ProcessBuilder. ^java.util.List command)
-          _  (if (:inherit-io? worker-config)
-               (.inheritIO pb)
-               (doto pb
-                 (.redirectOutput ProcessBuilder$Redirect/DISCARD)
-                 (.redirectError  ProcessBuilder$Redirect/DISCARD)))
+          _  (configure-process-io! pb (:inherit-io? worker-config))
           _  (when-some [workdir (:workdir worker-config)]
                (.directory pb (File. (str workdir))))
-          _  (when-some [env-map (:env worker-config)]
-               (let [^java.util.Map env (.environment pb)]
-                 (doseq [[ek ev] env-map]
-                   (.put env (str ek) (str ev)))))
+          _  (apply-process-env! pb (:env worker-config))
           process (.start pb)]
       {:type    :process
        :pid     (.pid process)
@@ -192,15 +346,112 @@
       (.destroyForcibly process)))
   nil)
 
+(defn- quit-command
+  [worker-config]
+  (when-some [cmd (some-> (:cmd/quit worker-config) str str/trim not-empty)]
+    (if (str/ends-with? cmd "\n")
+      cmd
+      (str cmd "\n"))))
+
+(defn- send-quit-command!
+  [session worker-config]
+  (if-some [cmd (quit-command worker-config)]
+    (if-some [^Process process (get-in session [:runtime/state :process])]
+      (try
+        (let [^java.io.OutputStream out (.getOutputStream process)
+              bytes (.getBytes cmd StandardCharsets/UTF_8)]
+          (.write out bytes)
+          (.flush out)
+          {:ok? true
+           :sent cmd})
+        (catch Throwable t
+          {:ok? false
+           :error :quit-write-failed
+           :message (.getMessage t)}))
+      {:ok? false
+       :error :runtime-process-missing})
+    {:ok? false
+     :error :quit-not-configured}))
+
+(defn- warn-quit-stop!
+  [message details]
+  (binding [*out* *err*]
+    (println (str "WARN ferment.model - "
+                  message
+                  " "
+                  (pr-str details)))))
+
+(def ^:private runtime-state-public-keys
+  #{:type
+    :kind
+    :pid
+    :command
+    :host
+    :port
+    :url
+    :transport
+    :model
+    :profile
+    :state
+    :ready?
+    :started-at
+    :stopped-at
+    :uptime-ms
+    :health})
+
+(defn- public-runtime-error
+  [runtime-error]
+  (cond
+    (map? runtime-error)
+    (let [err (select-keys runtime-error [:error :type :class :message :details])]
+      (when (seq err) err))
+
+    (some? runtime-error) {:message (str runtime-error)}
+    :else nil))
+
+(defn- process-snapshot
+  [^Process process]
+  (let [alive? (.isAlive process)
+        exit-code (when-not alive?
+                    (try
+                      (.exitValue process)
+                      (catch IllegalThreadStateException _ nil)))]
+    (cond-> {:process/alive? alive?}
+      (some? exit-code) (assoc :process/exit exit-code))))
+
+(defn- runtime-state-snapshot
+  [runtime-state]
+  (let [state        (if (map? runtime-state) runtime-state {})
+        process      (:process state)
+        public-state (select-keys state runtime-state-public-keys)]
+    (if (instance? Process process)
+      (merge public-state (process-snapshot ^Process process))
+      public-state)))
+
+(defn- runtime-snapshot
+  [session wrk worker-config]
+  {:worker/id      (or (:id worker-config) (bus/worker-id wrk))
+   :worker/name    (:name worker-config)
+   :worker/running (some? wrk)
+   :stage          (:stage session)
+   :started-at     (:started-at session)
+   :runtime/error  (public-runtime-error (:runtime/error session))
+   :runtime/state  (runtime-state-snapshot (:runtime/state session))})
+
 (defn runtime-request-handler
   "Default request handler for model runtime workers.
 
   Supports:
   - :status
-  - :runtime
+  - :runtime (safe runtime snapshot for operators)
+  - :quit (writes configured `:cmd/quit` + newline to runtime process stdin)
   - :invoke (if `:invoke-fn` is configured)"
   [session wrk req worker-config]
-  (let [command   (:body req)
+  (let [worker-config (if (and (sequential? worker-config)
+                               (not (map? worker-config)))
+                        (first worker-config)
+                        worker-config)
+        command   (:body req)
         req-args  (:args req)
         invoke-fn (:invoke-fn worker-config)]
     (case command
@@ -209,8 +460,9 @@
                :worker/running (some? wrk)
                :stage          (:stage session)
                :started-at     (:started-at session)
-               :runtime/error  (:runtime/error session)}
-      :runtime (:runtime/state session)
+               :runtime/error  (public-runtime-error (:runtime/error session))}
+      :runtime (runtime-snapshot session wrk worker-config)
+      :quit (send-quit-command! session worker-config)
       :invoke (if (fn? invoke-fn)
                 (let [payload (first req-args)]
                   (try
@@ -265,6 +517,8 @@
                          wrk
                          request
                          worker-config)
+                _ (when-some [response (:response outcome)]
+                    (bus/send-response wrk response))
                 data (:data outcome)]
             (cond
               (= :QUIT data) nil
@@ -305,7 +559,23 @@
 (defn stop-runtime-worker
   "Stops a model runtime worker."
   [_k state]
-  (stop-bot-worker! (:worker state))
+  (let [worker (:worker state)
+        cfg    (:config state)]
+    (when (and worker (some? (:cmd/quit cfg)))
+      (try
+        (let [quit-response (command-bot-worker! worker :quit)]
+          (when (and (map? quit-response)
+                     (= false (:ok? quit-response)))
+            (warn-quit-stop! "Failed to send model quit command before stop."
+                             {:worker (:id state)
+                              :cmd/quit (:cmd/quit cfg)
+                              :quit-response quit-response})))
+        (catch Throwable t
+          (warn-quit-stop! "Exception while sending model quit command before stop."
+                           {:worker (:id state)
+                            :cmd/quit (:cmd/quit cfg)
+                            :error (.getMessage t)}))))
+    (stop-bot-worker! worker))
   nil)
 
 (defn preconfigure-model-runtime
@@ -433,8 +703,13 @@
   "Resolves solver model identifier from runtime config."
   [runtime]
   (or (model-id runtime :ferment.model/solver nil)
-      (model-id runtime :ferment.model/coding nil)
-      "qwen2.5-coder:7b"))
+      "mlx-community/Qwen2.5-7B-Instruct-4bit"))
+
+(defn coding-id
+  "Resolves coding model identifier from runtime config."
+  [runtime]
+  (or (model-id runtime :ferment.model/coding nil)
+      "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"))
 
 (defn voice-id
   "Resolves voice model identifier from runtime config."

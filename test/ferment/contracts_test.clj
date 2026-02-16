@@ -46,6 +46,38 @@
       (is (:ok? (contracts/validate-request ok-request)))
       (is (false? (:ok? (contracts/validate-request bad-request)))))))
 
+(deftest request-validation-is-protocol-aware
+  (testing "Walidacja requestu odrzuca nieobsługiwany intent i niepoprawne shape'y done/effects."
+    (let [protocol {:intents {:text/respond {:in-schema :req/text}}
+                    :result/types [:value]}
+          bad-intent {:proto 1
+                      :trace {:id "trace-intent"}
+                      :task {:intent :code/patch}
+                      :input {:prompt "x"}}
+          bad-done {:proto 1
+                    :trace {:id "trace-done"}
+                    :task {:intent :text/respond}
+                    :input {:prompt "x"}
+                    :done {:must ["schema-valid"]}}
+          bad-effects {:proto 1
+                       :trace {:id "trace-effects"}
+                       :task {:intent :text/respond}
+                       :input {:prompt "x"}
+                       :effects {:allowed ["fs/write"]}}]
+      (is (= {:ok? false
+              :error :invalid-request
+              :reason :intent/not-supported
+              :intent :code/patch}
+             (contracts/validate-request protocol bad-intent)))
+      (is (= {:ok? false
+              :error :invalid-request
+              :reason :done/must-not-keywords}
+             (contracts/validate-request protocol bad-done)))
+      (is (= {:ok? false
+              :error :invalid-request
+              :reason :effects/allowed-not-keywords}
+             (contracts/validate-request protocol bad-effects))))))
+
 (deftest invoke-with-contract-retries-until-valid-result
   (testing "Invoker retries invalid result and accepts first valid one."
     (let [request {:proto 1
@@ -93,6 +125,16 @@
                                                    :out {:text "ok"}}})))
     (is (:ok? (contracts/validate-result {:result {:type :plan
                                                    :plan {:steps []}}})))))
+
+(deftest result-validation-is-protocol-aware
+  (testing "Walidacja resultu respektuje :result/types z protokołu."
+    (let [protocol {:result/types [:value :plan]}]
+      (is (:ok? (contracts/validate-result protocol
+                                           {:result {:type :value
+                                                     :out {:text "ok"}}})))
+      (is (false? (:ok? (contracts/validate-result protocol
+                                                   {:result {:type :stream
+                                                             :stream {:chunks []}}})))))))
 
 (deftest plan-materialization-injects-slot-bindings
   (testing "Plan placeholders can be injected from model-provided bindings (HOF-like output)."

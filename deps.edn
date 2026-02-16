@@ -27,7 +27,7 @@
            io.randomseed/smangler               {:mvn/version "1.0.4"}        ;; fast string trimming
            io.randomseed/bankster               {:mvn/version "2.2.4"}        ;; currency and money
            io.randomseed/phone-number           {:mvn/version "8.13.6-3"}     ;; phone number validation
-           io.randomseed/utils                  {:mvn/version "2.0.4"}        ;; random utilities
+           io.randomseed/utils                  {:mvn/version "2.0.5"}        ;; random utilities
            crypto-equality/crypto-equality      {:mvn/version "1.0.0"}        ;; avoiding timing attacks when comparing
            com.lambdaworks/scrypt               {:mvn/version "1.4.0"}        ;; password encryption
            iso-country-codes/iso-country-codes  {:git/url "https://github.com/randomseed-io/iso-country-codes.git"

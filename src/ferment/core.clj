@@ -1,14 +1,14 @@
 (ns ferment.core
 
   (:require [clojure.java.io :as io]
-            [clojure.data.json :as json]
             [clojure.string :as str]
             [ferment.contracts :as contracts]
             [ferment.model :as model]
             [ferment.workflow :as workflow]
             [ferment.system :as system])
 
-  (:import (java.lang ProcessBuilder)))
+  (:import (java.io File)
+           (java.lang ProcessBuilder)))
 
 (defn- getenv
   ([k] (System/getenv k))
@@ -31,6 +31,17 @@
     (and (map? runtime) (map? (:config runtime))) (:config runtime)
     (map? runtime) runtime
     :else nil))
+
+(defn- runtime-protocol
+  [runtime]
+  (some-> (runtime-config runtime) :protocol))
+
+(defn- protocol-default
+  [protocol k fallback]
+  (let [v (get protocol k ::missing)]
+    (if (identical? ::missing v) fallback v)))
+
+(declare input->prompt)
 
 (defn- configv
   ([runtime env-name]
@@ -61,75 +72,150 @@
          (subs (str/replace (or prompt "") #"\s+" " ")
                0 (min 120 (count (or prompt "")))))))
 
+(def ^:private env-var-pattern
+  #"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+(defn- expand-env-template
+  [^String s ^java.util.Map pb-env]
+  (str/replace
+   (or s "")
+   env-var-pattern
+   (fn [[_ braced plain]]
+     (let [k (or braced plain)]
+       (or (some-> (.get pb-env k) str)
+           (some-> (System/getenv k) str)
+           (when (= "HOME" k) (System/getProperty "user.home"))
+           "")))))
+
 (defn sh!
   "Run a process, return {:exit int :out string :err string}."
-  [& args]
-  (let [^java.util.List command (mapv str args)
+  [command & {:keys [workdir env stdin]
+              :or {env {}}}]
+  (let [^java.util.List command (mapv str command)
         pb (doto (ProcessBuilder. ^java.util.List command)
              (.redirectErrorStream false))
+        _  (when workdir
+             (.directory pb (File. (str workdir))))
+        _  (when (seq env)
+             (let [^java.util.Map pb-env (.environment pb)]
+               (doseq [[k v] env]
+                 (.put pb-env
+                       (str k)
+                       (expand-env-template (str (or v "")) pb-env)))))
         p  (.start pb)
+        _  (when (string? stdin)
+             (let [^String in-str stdin]
+               (with-open [^java.io.Writer w (io/writer (.getOutputStream p))]
+                 (.write w in-str))))
         out (slurp (.getInputStream p))
         err (slurp (.getErrorStream p))
         ec  (.waitFor p)]
     {:exit ec :out out :err err}))
 
-(defn ollama-chat!
-  "Calls Ollama CLI. Expects model pulled already.
-   Returns assistant text (best-effort)."
-  [{:keys [model system user temperature]}]
-  ;; Ollama CLI supports: `ollama run MODEL` with prompt via stdin.
-  ;; We pack system+user into one prompt (quick & dirty).
-  (let [prompt (str (when system (str "SYSTEM:\n" system "\n\n"))
-                    "USER:\n" user "\n\nASSISTANT:\n")
-        res (-> (apply sh! (concat ["ollama" "run" model]
-                                   (when temperature ["--temperature" (str temperature)])))
-                (update :out str))
-        ;; If CLI doesn't read stdin in your setup, swap to HTTP API (below).
-        ]
-    ;; NOTE: Ollama CLI reads from stdin only in interactive mode; for reliability,
-    ;; prefer the HTTP API. Keeping this minimal here.
-    (:out res)))
+(defn- cap-id->model-key
+  [cap-id intent]
+  (or (case cap-id
+        :llm/code :ferment.model/coding
+        :llm/solver :ferment.model/solver
+        :llm/meta :ferment.model/meta
+        :llm/voice :ferment.model/voice
+        nil)
+      (if (= :text/respond intent)
+        :ferment.model/voice
+        (if (#{:code/generate :code/patch :code/explain :code/review} intent)
+          :ferment.model/coding
+          :ferment.model/solver))))
 
-;; --- reliable: Ollama HTTP API via curl (still minimal) ----------------------
+(defn- model-runtime-cfg
+  [runtime cap-id intent]
+  (let [model-k (cap-id->model-key cap-id intent)]
+    (some-> (model/model-entry runtime model-k)
+            :runtime)))
+
+(defn- compose-prompt
+  [system prompt]
+  (if (and (string? system) (not (str/blank? system)))
+    (str "SYSTEM:\n" system "\n\nUSER:\n" (or prompt "") "\n\nASSISTANT:\n")
+    (or prompt "")))
+
+(defn- extract-generated-text
+  [{:keys [out err]}]
+  (let [out' (some-> out str str/trim not-empty)
+        err' (some-> err str str/trim not-empty)]
+    (or out' err' "")))
+
+(defn- run-model-command!
+  [{:keys [command prompt env workdir prompt-via prompt-arg]}]
+  (let [cmd0        (vec (map str command))
+        prompt-via' (or prompt-via :arg)
+        prompt-arg' (or prompt-arg "--prompt")
+        cmd         (if (= :arg prompt-via')
+                      (into cmd0 [prompt-arg' prompt])
+                      cmd0)
+        res         (sh! cmd
+                         :workdir workdir
+                         :env env
+                         :stdin (when (= :stdin prompt-via') prompt))
+        text        (extract-generated-text res)]
+    (when-not (zero? (:exit res))
+      (throw (ex-info "Model command failed"
+                      {:exit (:exit res)
+                       :command cmd
+                       :stderr (:err res)
+                       :stdout (:out res)})))
+    {:response text
+     :raw (assoc res :command cmd)}))
 
 (defn ollama-generate!
-  "Reliable non-interactive call using Ollama HTTP API (localhost:11434).
-   Returns {:response \"...\" :raw ...}."
-  [{:keys [model prompt system temperature mode]}]
+  "Model generator (HF/MLX command backend, mock-aware).
+
+  Name kept for backward compatibility in tests."
+  [{:keys [runtime cap-id intent model prompt system mode]}]
   (if (= :mock mode)
-    {:response (mock-llm-response {:prompt (if system (str "SYSTEM:\n" system "\n\n" prompt) prompt)})
+    {:response (mock-llm-response {:prompt (compose-prompt system prompt)})
      :raw {:mode :mock}}
-    (let [payload (cond-> {:model model
-                         :prompt (if system (str "SYSTEM:\n" system "\n\n" prompt) prompt)
-                         :stream false}
-                  temperature (assoc :temperature temperature))
-          tmp (java.io.File/createTempFile "ollama" ".json")]
-      (spit tmp (json/write-str payload))
-      (let [{:keys [exit out err]} (sh! "curl" "-s" "http://localhost:11434/api/generate"
-                                        "-H" "Content-Type: application/json"
-                                        "--data-binary" (str "@" (.getAbsolutePath tmp)))]
-        (when-not (zero? exit)
-          (throw (ex-info "Ollama call failed" {:exit exit :err err})))
-        (let [m (json/read-str out :key-fn keyword)]
-          {:response (:response m)
-           :raw m})))))
+    (let [runtime-cfg (model-runtime-cfg runtime cap-id intent)
+          command     (or (seq (:command runtime-cfg))
+                          ["mlx_lm.chat" "--model" (str model)])
+          env         (or (:env runtime-cfg) {})
+          workdir     (:workdir runtime-cfg)
+          prompt-via  (or (:prompt-via runtime-cfg) :arg)
+          prompt-arg  (or (:prompt-arg runtime-cfg) "--prompt")]
+      (run-model-command! {:command command
+                           :prompt (compose-prompt system prompt)
+                           :env env
+                           :workdir workdir
+                           :prompt-via prompt-via
+                           :prompt-arg prompt-arg}))))
 
 (defn looks-like-coding? [s]
   (boolean (re-find #"(stacktrace|Exception|NullPointer|compile|deps\.edn|defn|ns\s|\bClojure\b|patch|diff|regex|SQL|HTTP|API)" s)))
 
 (defn- build-request
-  [runtime {:keys [role intent cap-id input]}]
-  (let [request-id (str (java.util.UUID/randomUUID))]
-    {:proto      1
-     :trace      {:id request-id}
-     :role       role
-     :request/id request-id
-     :session/id (str "session/" (llm-profile runtime))
-     :cap/id     cap-id
-     :context    {:profile (keyword (llm-profile runtime))
-                  :mode    (llm-mode runtime)}
-     :task       {:intent intent}
-     :input      input}))
+  [runtime {:keys [role intent cap-id input context constraints done budget effects protocol]}]
+  (let [request-id (str (java.util.UUID/randomUUID))
+        protocol'  (or protocol (runtime-protocol runtime) {})
+        context'   (merge {:profile (keyword (llm-profile runtime))
+                           :mode    (llm-mode runtime)}
+                          (if (map? context) context {}))
+        constraints' (or constraints (protocol-default protocol' :constraints/default nil))
+        done'        (or done (protocol-default protocol' :done/default nil))
+        budget'      (or budget (protocol-default protocol' :budget/default nil))
+        effects'     (or effects (protocol-default protocol' :effects/default nil))
+        input'       (if (map? input) input {:prompt (input->prompt input)})]
+    (cond-> {:proto      1
+             :trace      {:id request-id}
+             :role       role
+             :request/id request-id
+             :session/id (str "session/" (llm-profile runtime))
+             :cap/id     cap-id
+             :context    context'
+             :task       {:intent intent}
+             :input      input'}
+      (map? constraints') (assoc :constraints constraints')
+      (map? done')        (assoc :done done')
+      (map? budget')      (assoc :budget budget')
+      (map? effects')     (assoc :effects effects'))))
 
 (defn- default-result-parser
   [text {:keys [request mode]}]
@@ -142,6 +228,7 @@
 (defn- intent->role
   [intent]
   (case intent
+    :problem/solve :solver
     (:code/generate :code/patch :code/explain :code/review) :coder
     (:route/decide :context/summarize :eval/grade) :router
     :voice))
@@ -150,6 +237,7 @@
   [cap-id intent]
   (or (case cap-id
         :llm/code  :coder
+        :llm/solver :solver
         :llm/meta  :router
         :llm/voice :voice
         :llm/mock  :router
@@ -159,14 +247,17 @@
 (defn- capability-model-id
   [runtime cap-id intent]
   (or (case cap-id
-        :llm/code  (model/solver-id runtime)
+        :llm/code  (model/coding-id runtime)
+        :llm/solver (model/solver-id runtime)
         :llm/meta  (model/meta-id runtime)
         :llm/voice (model/voice-id runtime)
         :llm/mock  "mock/model"
         nil)
       (if (= :text/respond intent)
         (model/voice-id runtime)
-        (model/solver-id runtime))))
+        (if (#{:code/generate :code/patch :code/explain :code/review} intent)
+          (model/coding-id runtime)
+          (model/solver-id runtime)))))
 
 (defn- input->prompt
   [input]
@@ -182,16 +273,34 @@
 
   Returns validated result envelope (`:result` or `:error`), which may represent
   `:value`, `:plan` or `:stream` depending on the configured parser."
-  [runtime {:keys [role intent cap-id model system prompt temperature max-attempts result-parser]}]
+  [runtime {:keys [role intent cap-id model system prompt input temperature
+                   max-attempts result-parser context constraints done budget effects]}]
   (let [mode (llm-mode runtime)
+        protocol (runtime-protocol runtime)
+        input' (if (map? input)
+                 input
+                 {:prompt (or prompt "")})
+        prompt' (input->prompt input')
+        system' (or system
+                    (when (map? input')
+                      (:system input')))
         request (build-request runtime {:role role
                                         :intent intent
                                         :cap-id cap-id
-                                        :input {:prompt prompt}})
+                                        :input input'
+                                        :context context
+                                        :constraints constraints
+                                        :done done
+                                        :budget budget
+                                        :effects effects
+                                        :protocol protocol})
         invoke-fn (fn [_request _attempt]
                     (let [result (ollama-generate! {:model model
-                                                    :system system
-                                                    :prompt prompt
+                                                    :runtime runtime
+                                                    :cap-id cap-id
+                                                    :intent intent
+                                                    :system system'
+                                                    :prompt prompt'
                                                     :temperature temperature
                                                     :mode mode})
                           text (:response result)]
@@ -207,7 +316,10 @@
                         {:trace  (:trace request)
                          :result {:type :value}})))
         run (contracts/invoke-with-contract invoke-fn request
-                                            {:max-attempts (or max-attempts 3)})]
+                                            {:max-attempts (or max-attempts
+                                                               (protocol-default protocol :retry/max-attempts 3)
+                                                               3)
+                                             :protocol protocol})]
     (if (:ok? run)
       (:result run)
       (throw (ex-info "LLM invocation failed after retries" run)))))
@@ -236,7 +348,13 @@
                            :cap-id cap-id
                            :model model
                            :system system
+                           :input (:input call-node)
                            :prompt prompt
+                           :context (:context call-node)
+                           :constraints (:constraints call-node)
+                           :done (:done call-node)
+                           :budget (:budget call-node)
+                           :effects (:effects call-node)
                            :temperature temp
                            :max-attempts (:max-attempts call-node)
                            :result-parser (:result-parser call-node)}))))
@@ -297,22 +415,41 @@
                        :result result
                        :plan/materialized (contracts/materialize-plan-result result)})))))
 
-(defn solver!
-  "Returns a strict JSON object as string."
+(defn coder!
+  "Returns a strict JSON object as string for coding tasks."
   ([user-text]
-   (solver! user-text nil))
+   (coder! user-text nil))
   ([user-text runtime]
     (invoke-llm!
     runtime
     {:role :coder
      :intent :code/patch
      :cap-id :llm/code
-     :model (model/solver-id runtime)
+     :model (model/coding-id runtime)
      :system (str
-              "You are SOLVER. Do NOT write prose. Return ONLY valid JSON.\n"
+              "You are CODER. Do NOT write prose. Return ONLY valid JSON.\n"
               "Schema:\n"
               "{intent, summary, steps[], patch, tests[], open_questions[]}\n"
               "If no patch, use empty string. No markdown.")
+     :prompt user-text
+     :temperature 0})))
+
+(defn solver!
+  "Solves general (non-coding) problems and returns structured JSON string."
+  ([user-text]
+   (solver! user-text nil))
+  ([user-text runtime]
+   (invoke-llm!
+    runtime
+    {:role :solver
+     :intent :problem/solve
+     :cap-id :llm/solver
+     :model (model/solver-id runtime)
+     :system (str
+              "You are SOLVER. Solve general problems precisely and briefly.\n"
+              "Return ONLY valid JSON (no prose, no markdown).\n"
+              "Schema:\n"
+              "{intent, summary, answer, steps[], open_questions[]}")
      :prompt user-text
      :temperature 0})))
 
@@ -340,18 +477,10 @@
    (respond! user-text nil))
   ([user-text runtime]
    (if (looks-like-coding? user-text)
-     (let [sj (solver! user-text runtime)]
+     (let [sj (coder! user-text runtime)]
        (voice! sj user-text runtime))
-     ;; non-coding: od razu voice
-     (invoke-llm!
-     runtime
-     {:role :voice
-       :intent :text/respond
-       :cap-id :llm/voice
-       :model (model/voice-id runtime)
-       :system "Jesteś VOICE. Odpowiadasz po polsku, zwięźle i rzeczowo."
-       :prompt user-text
-       :temperature 0.6}))))
+     (let [sj (solver! user-text runtime)]
+       (voice! sj user-text runtime)))))
 
 (defn preconfigure-service
   "Pre-configuration hook for core service branch."
@@ -367,6 +496,7 @@
    :runtime  runtime
    :resolver resolver
    :protocol protocol
+   :coder!   (fn [user-text] (coder! user-text runtime))
    :solver!  (fn [user-text] (solver! user-text runtime))
    :voice!   (fn [solver-json user-text] (voice! solver-json user-text runtime))
    :respond! (fn [user-text] (respond! user-text runtime))})

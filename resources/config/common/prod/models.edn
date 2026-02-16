@@ -6,20 +6,26 @@
  {:sid "ferment-model-runtime"}
 
  :ferment.model.defaults/runtime
- {:session  #ref :ferment.model.defaults/bot-session
-  :enabled? true
-  :env      {"HF_HOME"      #ref :ferment.env/hf.home
-             "HF_HUB_CACHE" #ref :ferment.env/hf.hub.cache}}
+ {:session     #ref :ferment.model.defaults/bot-session
+  :enabled?    true
+  :inherit-io? false
+  :prompt-via  :stdin
+  :env         {"HF_HOME"      #ref :ferment.env/hf.home
+                "HF_HUB_CACHE" #ref :ferment.env/hf.hub.cache
+                "PATH"         "${HOME}/.pyenv/shims:${PATH}"}}
 
  :ferment.model.id/solver
  {:profile     #ref :ferment.model.defaults/profile
-  :id/default  "qwen2.5-coder:7b"
-  :id/mini     "qwen2.5-coder:1.5b"
-  :id/fallback "qwen2.5-coder:7b"}
+  :type        :MLX
+  :id/default  "mlx-community/Qwen2.5-7B-Instruct-4bit"
+  :id/mini     "mlx-community/SmolLM3-3B-8bit"
+  :id/fallback "mlx-community/Qwen2.5-7B-Instruct-4bit"}
 
  :ferment.model.runtime/solver
  {:defaults #ref :ferment.model.defaults/runtime
+  :cmd/quit "q"
   :command  ["mlx_lm.chat" "--model" #ref :ferment.model.id/solver]
+  :http     {:enabled? true :endpoint "solver/responses"}
   :name     "solver model runtime"}
 
  :ferment.model/solver
@@ -28,13 +34,16 @@
 
  :ferment.model.id/voice
  {:profile     #ref :ferment.model.defaults/profile
+  :type        :MLX
   :id/default  "SpeakLeash/bielik-1.5b-instruct"
   :id/mini     "SpeakLeash/bielik-1.5b-instruct"
   :id/fallback "speakleash/Bielik-11B-v3.0-Instruct-MLX-4bit"}
 
  :ferment.model.runtime/voice
  {:defaults #ref :ferment.model.defaults/runtime
+  :cmd/quit "q"
   :command  ["mlx_lm.chat" "--model" #ref :ferment.model.id/voice]
+  :http     {:enabled? true :endpoint "voice/responses"}
   :name     "voice model runtime"}
 
  :ferment.model/voice
@@ -43,13 +52,16 @@
 
  :ferment.model.id/coding
  {:profile     #ref :ferment.model.defaults/profile
+  :type        :MLX
   :id/default  "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"
   :id/mini     "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"
   :id/fallback "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"}
 
  :ferment.model.runtime/coding
  {:defaults #ref :ferment.model.defaults/runtime
+  :cmd/quit "q"
   :command  ["mlx_lm.chat" "--model" #ref :ferment.model.id/coding]
+  :http     {:enabled? true :endpoint "coding/responses"}
   :name     "coding model runtime"}
 
  :ferment.model/coding
@@ -58,14 +70,18 @@
 
  :ferment.model.id/meta
  {:profile     #ref :ferment.model.defaults/profile
+  :type        :MLX
   :id/default  "mlx-community/SmolLM3-3B-8bit"
   :id/mini     "mlx-community/SmolLM3-3B-8bit"
   :id/fallback "mlx-community/SmolLM3-3B-8bit"}
 
  :ferment.model.runtime/meta
- {:defaults #ref :ferment.model.defaults/runtime
-  :command  ["mlx_lm.chat" "--model" #ref :ferment.model.id/meta]
-  :name     "meta model runtime"}
+ {:defaults    #ref :ferment.model.defaults/runtime
+  :inherit-io? [:out :err]
+  :cmd/quit    "q"
+  :command     ["mlx_lm.chat" "--model" #ref :ferment.model.id/meta]
+  :http        {:enabled? true :endpoint "meta/responses"}
+  :name        "meta model runtime"}
 
  :ferment.model/meta
  {:id      #ref :ferment.model.id/meta
@@ -77,4 +93,4 @@
   :ferment.model/solver #ref :ferment.model/solver
   :ferment.model/voice  #ref :ferment.model/voice}
 
-}
+ }

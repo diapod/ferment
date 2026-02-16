@@ -13,6 +13,104 @@
   {:same-cap-max 0
    :fallback-max 0})
 
+(defn- keyword-set
+  [v]
+  (cond
+    (set? v) (into #{} (filter keyword?) v)
+    (sequential? v) (into #{} (filter keyword?) v)
+    (keyword? v) #{v}
+    :else #{}))
+
+(defn- requested-result-type
+  [node]
+  (or (:result/type node)
+      (get-in node [:expect :result/type])))
+
+(defn- requested-effects
+  [node]
+  (keyword-set (or (:effects/allowed node)
+                   (get-in node [:effects :allowed]))))
+
+(defn- cap-supports-intent?
+  [cap intent]
+  (let [intents (keyword-set (:cap/intents cap))]
+    (or (empty? intents)
+        (contains? intents intent))))
+
+(defn- cap-supports-result-type?
+  [cap result-type]
+  (if (keyword? result-type)
+    (let [types (keyword-set (:cap/can-produce cap))]
+      (or (empty? types)
+          (contains? types result-type)))
+    true))
+
+(defn- cap-allows-effects?
+  [cap req-effects]
+  (if (seq req-effects)
+    (let [allowed (keyword-set (:cap/effects-allowed cap))]
+      (or (empty? allowed)
+          (every? allowed req-effects)))
+    true))
+
+(defn- candidate-verdict
+  [resolver node cap-id]
+  (if-not (map? (:caps/by-id resolver))
+    {:ok? true
+     :cap/id cap-id}
+    (let [cap         (get-in resolver [:caps/by-id cap-id])
+          intent      (:intent node)
+          result-type (requested-result-type node)
+          req-effects (requested-effects node)]
+      (cond
+        (nil? cap)
+        {:ok? false
+         :cap/id cap-id
+         :reason :cap/not-found}
+
+        (not (cap-supports-intent? cap intent))
+        {:ok? false
+         :cap/id cap-id
+         :reason :intent/not-supported
+         :intent intent}
+
+        (not (cap-supports-result-type? cap result-type))
+        {:ok? false
+         :cap/id cap-id
+         :reason :result-type/not-supported
+         :result/type result-type}
+
+        (not (cap-allows-effects? cap req-effects))
+        {:ok? false
+         :cap/id cap-id
+         :reason :effects/not-allowed
+         :effects req-effects}
+
+        :else
+        {:ok? true
+         :cap/id cap-id}))))
+
+(defn- resolve-candidates
+  [resolver node]
+  (let [explicit (:cap/id node)
+        listed   (vec (or (get-in node [:dispatch :candidates]) []))
+        routed   (some-> (get-in resolver [:routing :intent->cap (:intent node)]) vector)
+        candidates
+        (vec
+         (cond
+           (keyword? explicit) [explicit]
+           (seq listed) listed
+           (seq routed) routed
+           :else []))]
+    (if (map? (:caps/by-id resolver))
+      (let [verdicts (mapv #(candidate-verdict resolver node %) candidates)
+            accepted (->> verdicts (filter :ok?) (mapv :cap/id))
+            rejected (->> verdicts
+                          (remove :ok?)
+                          (mapv #(dissoc % :ok?)))]
+        (with-meta accepted {:routing/rejected rejected}))
+      candidates)))
+
 (defn resolve-capability-id
   "Resolves capability id for a call node.
 
@@ -21,9 +119,7 @@
   2. first candidate from node `:dispatch`
   3. resolver routing by `:intent`"
   [resolver node]
-  (or (:cap/id node)
-      (first (get-in node [:dispatch :candidates]))
-      (get-in resolver [:routing :intent->cap (:intent node)])))
+  (first (resolve-candidates resolver node)))
 
 (defn call-failed?
   "Best-effort failure check for values stored in plan environment."
@@ -78,18 +174,6 @@
   (let [routing (set (or (get-in resolver [:routing :switch-on]) #{}))
         local   (set (or (get-in node [:dispatch :switch-on]) #{}))]
     (into routing local)))
-
-(defn- resolve-candidates
-  [resolver node]
-  (let [explicit (:cap/id node)
-        listed   (vec (or (get-in node [:dispatch :candidates]) []))
-        routed   (some-> (get-in resolver [:routing :intent->cap (:intent node)]) vector)]
-    (vec
-     (cond
-       (keyword? explicit) [explicit]
-       (seq listed) listed
-       (seq routed) routed
-       :else []))))
 
 (defn- default-schema-check
   [result]
@@ -226,11 +310,14 @@
                     retry-policy  (resolve-retry-policy resolver base-node)
                     switch-on     (resolve-switch-on resolver base-node)
                     candidates0   (resolve-candidates resolver base-node)
+                    rejected      (-> candidates0 meta :routing/rejected)
                     candidates    (vec (take (inc (:fallback-max retry-policy))
                                              candidates0))]
                 (when-not (seq candidates)
                   (throw (ex-info "Unable to resolve capability candidates for call node"
-                                  {:node node :resolver resolver})))
+                                  {:node node
+                                   :resolver resolver
+                                   :rejected-candidates rejected})))
                 (let [same-cap-attempts (inc (:same-cap-max retry-policy))
                       call-outcome
                       (loop [candidate-idx 0
@@ -304,7 +391,8 @@
                                      :outcome call-outcome
                                      :switch-on switch-on
                                      :retry-policy retry-policy
-                                     :candidates candidates})))))
+                                     :candidates candidates
+                                     :rejected-candidates rejected})))))
 
               :emit
               (let [output (materialize-emit-input (:input node) env)]
