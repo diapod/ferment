@@ -22,9 +22,22 @@ absolutize_path() {
 
 PROFILE="${FERMENT_PROFILE:-dev}"
 
+ENVVARS_FILE_PROD="${script_dir}/../resources/config/common/prod/locations.env"
+if [ -r "$ENVVARS_FILE_PROD" ]; then
+    . "$ENVVARS_FILE_PROD"
+fi
+
+if [ "${PROFILE}" != "prod" ]; then
+    ENVVARS_FILE="${script_dir}/../resources/config/common/${PROFILE}/locations.env"
+    if [ -r "$ENVVARS_FILE" ]; then
+        . "$ENVVARS_FILE"
+    fi
+fi
+
 ENVVARS_FILE_PROD="${script_dir}/../resources/config/local/prod/locations.env"
-[ -r "$ENVVARS_FILE_PROD" ] || { echo "[ferment] Missing env file for profile prod: $ENVVARS_FILE_PROD" >&2; exit 1; }
-. "$ENVVARS_FILE_PROD"
+if [ -r "$ENVVARS_FILE_PROD" ]; then
+    . "$ENVVARS_FILE_PROD"
+fi
 
 if [ "${PROFILE}" != "prod" ]; then
     ENVVARS_FILE="${script_dir}/../resources/config/local/${PROFILE}/locations.env"

@@ -1,0 +1,26 @@
+{:ferment.logging/unilog
+ {:level     :info
+  :appenders ^:replace [{:appender       :rolling-file
+                         :file           "${user.home}/.ferment/ferment.log"
+                         :encoder        :pattern-cool
+                         :pattern        "%p [%date{yyyy-MM-dd'T'HH:mm:ss, UTC},%date{SSS, UTC}Z] %t - %c %m%n"
+                         :rolling-policy {:type        :time-based
+                                          :max-history 7
+                                          :pattern     ".%d{yyyy-MM-dd}"}}
+                        {:appender       :rolling-file
+                         :file           "${user.home}/.ferment/ferment-json.log"
+                         :encoder        :json-log
+                         :rolling-policy {:type        :time-based
+                                          :max-history 7
+                                          :pattern     ".%d{yyyy-MM-dd}"}}
+                        {:appender :console-debug
+                         :encoder  :pattern
+                         :pattern
+                         "%highlight(%-5level) %gray([%d{HH:mm:ss, UTC}] %magenta([%-7thread])) %cyan(%-34c) %m%n"}]
+  :overrides {"org.apache.http"                   :info
+              "com.zaxxer.hikari.*"               :info
+              ;;              "org.mariadb.jdbc.client.*"                   :info
+              ;;              "org.mariadb.jdbc.client.impl.StandardClient" :info
+              "com.zaxxer.hikari.pool.HikariPool" :info
+              "org.xnio.nio"                      :info}}}
+
