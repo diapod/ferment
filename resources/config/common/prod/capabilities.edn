@@ -1,0 +1,62 @@
+{
+
+ ;; Capabilities as separate top-level keys (flattened registry branch)
+ :ferment.caps.registry/llm-voice
+ {:cap/id        :llm/voice
+  :cap/kind      :llm
+  :io/in-schema  :req/text
+  :io/out-schema :res/text
+  :dispatch/tag  :voice}
+
+ :ferment.caps.registry/llm-code
+ {:cap/id        :llm/code
+  :cap/kind      :llm
+  :io/in-schema  :req/code
+  :io/out-schema :res/patch+tests
+  :dispatch/tag  :code}
+
+ :ferment.caps.registry/llm-meta
+ {:cap/id        :llm/meta
+  :cap/kind      :llm
+  :io/in-schema  :req/meta
+  :io/out-schema :res/meta
+  :dispatch/tag  :meta}
+
+ :ferment.caps.registry/llm-mock
+ {:cap/id        :llm/mock
+  :cap/kind      :mock
+  :io/in-schema  :req/any
+  :io/out-schema :res/any
+  :dispatch/tag  :mock}
+
+ ;; Optional aggregate list for consumers preferring a single entrypoint.
+ :ferment.caps/registry
+ [#ref :ferment.caps.registry/llm-voice
+  #ref :ferment.caps.registry/llm-code
+  #ref :ferment.caps.registry/llm-meta
+  #ref :ferment.caps.registry/llm-mock]
+
+ ;; Declarative intent routing
+ :ferment.caps/routing
+ {:intent->cap {:route/decide      :llm/meta
+                :context/summarize :llm/meta
+                :text/respond      :llm/voice
+                :code/generate     :llm/code
+                :code/patch        :llm/code
+                :code/explain      :llm/code
+                :code/review       :llm/code
+                :eval/grade        :llm/meta}
+  :policy      :quality-aware
+  :switch-on   #{:schema/invalid :format/drift :eval/low-score}
+  :retry       {:same-cap-max 1
+                :fallback-max 1}
+  :fallback    [:llm/code :llm/meta :llm/mock]
+  :checks      [:schema-valid :tests-pass]}
+
+ ;; Runtime/profile policy knobs
+ :ferment.caps/profiles
+ {:default {:llm/mode :live}
+  :test    {:llm/mode :mock}
+  :mini    {:llm/mode :live}}
+
+}

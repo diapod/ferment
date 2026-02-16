@@ -1,0 +1,41 @@
+{
+
+ :ferment.model/profile "default"
+
+ :ferment.model/solver
+ {:profile  #ref :ferment.model/profile
+  :default  "qwen2.5-coder:7b"
+  :mini     "qwen2.5-coder:1.5b"
+  :fallback "qwen2.5-coder:7b"}
+
+ :ferment.model/voice
+ {:profile  #ref :ferment.model/profile
+  :default  "SpeakLeash/bielik-1.5b-instruct"
+  :mini     "SpeakLeash/bielik-1.5b-instruct"
+  :fallback "speakleash/Bielik-11B-v3.0-Instruct-MLX-4bit"}
+
+ :ferment.model/coding
+ {:profile  #ref :ferment.model/profile
+  :default  "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"
+  :mini     "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"
+  :fallback "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"}
+
+ :ferment.model/meta
+ {:profile  #ref :ferment.model/profile
+  :default  "mlx-community/SmolLM3-3B-8bit"
+  :mini     "mlx-community/SmolLM3-3B-8bit"
+  :fallback "mlx-community/SmolLM3-3B-8bit"}
+
+ :ferment.model.solver/env
+ {"HF_HOME" #ref :ferment.env/hf.home
+  "HF_HUB_CACHE" #ref :ferment.env/hf.hub.cache}
+
+ :ferment.model.voice/env
+ {"HF_HOME" #ref :ferment.env/hf.home
+  "HF_HUB_CACHE" #ref :ferment.env/hf.hub.cache}
+
+ :ferment.model.meta/env
+ {"HF_HOME" #ref :ferment.env/hf.home
+  "HF_HUB_CACHE" #ref :ferment.env/hf.hub.cache}
+
+}

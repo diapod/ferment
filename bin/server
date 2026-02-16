@@ -1,0 +1,5 @@
+#!/bin/sh
+
+echo "[ferment] Starting server, please wait..."
+
+# clojure -A:server

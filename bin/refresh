@@ -1,0 +1,7 @@
+#!/bin/sh
+
+SCDIR=$(dirname ${0})
+
+echo "[ferment] Refreshing templates..."
+
+find ${SCDIR}/../resources/views ${SCDIR}/../resources/layouts -type f -exec touch {} \;

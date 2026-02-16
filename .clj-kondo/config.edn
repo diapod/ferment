@@ -1,0 +1,4 @@
+{:config-paths ["../dev/resources/clj-kondo"]
+ :hooks
+ {:macroexpand
+  {ferment.currency/with-attempt hooks.ferment/with-attempt}}}

@@ -1,0 +1,50 @@
+{
+
+ :ferment.protocol/default
+ {:proto/version          1
+  :meta-language          :edn
+  :transport/content-type :application/edn
+  :envelope/request       {:required [:proto :trace :task :input]
+                           :optional [:constraints :done :context :budget :effects]}
+  :envelope/response      {:required-one-of [:result :error]}
+  :intents                {:route/decide      {:in-schema :req/route
+                                               :out-schema :res/route}
+                           :context/summarize {:in-schema :req/context
+                                               :out-schema :res/context-summary}
+                           :text/respond      {:in-schema :req/text
+                                               :out-schema :res/text}
+                           :code/generate     {:in-schema :req/code
+                                               :out-schema :res/code}
+                           :code/patch        {:in-schema :req/code
+                                               :out-schema :res/patch+tests}
+                           :code/explain      {:in-schema :req/code
+                                               :out-schema :res/explanation}
+                           :code/review       {:in-schema :req/code
+                                               :out-schema :res/review}
+                           :eval/grade        {:in-schema :req/eval
+                                               :out-schema :res/eval}}
+  :roles                  {:router {:allowed [:route :checks :budget]}
+                           :coder  {:allowed [:patch :tests :notes]}
+                           :voice  {:allowed [:text :summary]}}
+  :done/default           {:must      #{:schema-valid}
+                           :should    #{:tests-pass :no-hallucinated-apis}
+                           :score-min 0.80}
+  :constraints/default    {:no-web true
+                           :language :pl
+                           :style :concise}
+  :budget/default         {:max-tokens 1200
+                           :temperature 0.0
+                           :max-roundtrips 3}
+  :effects/default        {:allowed #{:none}}
+  :error/catalog          {:schema/invalid      {:retryable? true}
+                           :format/drift        {:retryable? true}
+                           :timeout/soft        {:retryable? true}
+                           :eval/low-score      {:retryable? true}
+                           :policy/blocked      {:retryable? false}
+                           :timeout/hard        {:retryable? false}
+                           :input/invalid       {:retryable? false}
+                           :unsupported/intent  {:retryable? false}}
+  :result/types           [:value :plan :stream :error]
+  :retry/max-attempts     3}
+
+}

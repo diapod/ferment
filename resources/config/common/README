@@ -1,0 +1,5 @@
+This directory contains files that are shared between machines.
+
+Files from prod/  subdirectory are always loaded.
+Files from dev/   subdirectory are loaded when :dev environment is set.
+Files from admin/ subdirectory are loaded when :admin environment is set.

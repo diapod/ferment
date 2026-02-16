@@ -1,0 +1,5 @@
+#!/bin/sh
+
+echo "[ferment] Building JAR, please wait..."
+
+clojure -M:build

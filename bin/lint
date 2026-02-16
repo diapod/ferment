@@ -1,0 +1,5 @@
+#!/bin/sh
+
+echo "[ferment] Running Eastwood lint tool..."
+
+clojure -A:eastwood

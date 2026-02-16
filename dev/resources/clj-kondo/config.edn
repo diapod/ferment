@@ -1,0 +1,4 @@
+{:lint-as
+ {ferment.utils/defalias            clojure.core/def
+  ferment.utils/defalias-reg        clojure.core/defn
+  ferment.utils/auto-alias          clojure.core/identity}}

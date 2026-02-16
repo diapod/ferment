@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+case $0 in
+  */*) self=$0 ;;
+  *)   self=$(command -v -- "$0") || exit 1 ;;
+esac
+
+script_dir=$(
+  CDPATH= cd -- "$(dirname -- "$self")" 2>/dev/null && pwd -P
+) || exit 1
+project_root=$(
+  CDPATH= cd -- "${script_dir}/.." 2>/dev/null && pwd -P
+) || exit 1
+
+absolutize_path() {
+  case "$1" in
+    /*) printf "%s\n" "$1" ;;
+    *)  printf "%s/%s\n" "$project_root" "$1" ;;
+  esac
+}
+
+PROFILE="${FERMENT_PROFILE:-dev}"
+
+ENVVARS_FILE_PROD="${script_dir}/../resources/config/local/prod/locations.env"
+[ -r "$ENVVARS_FILE_PROD" ] || { echo "[ferment] Missing env file for profile prod: $ENVVARS_FILE_PROD" >&2; exit 1; }
+. "$ENVVARS_FILE_PROD"
+
+if [ "${PROFILE}" != "prod" ]; then
+  ENVVARS_FILE="${script_dir}/../resources/config/local/${PROFILE}/locations.env"
+  if [ -r "$ENVVARS_FILE" ]; then
+    . "$ENVVARS_FILE"
+  fi
+fi
+
+MODEL="${1:-}"
+[ -n "$MODEL" ] || { echo "Usage: $(basename "$0") <model-id> [mlx_lm.chat args...]" >&2; exit 2; }
+shift
+
+: "${HF_HOME:?HF_HOME is not set (expected from locations.env)}"
+: "${HF_HUB_CACHE:=${HF_HOME%/}/hub}"
+: "${OLLAMA_MODELS:?OLLAMA_MODELS is not set (expected from locations.env)}"
+
+HF_HOME=$(absolutize_path "${HF_HOME}")
+HF_HUB_CACHE=$(absolutize_path "${HF_HUB_CACHE}")
+OLLAMA_MODELS=$(absolutize_path "${OLLAMA_MODELS}")
+
+export HF_HOME
+export HF_HUB_CACHE
+export OLLAMA_MODELS
+
+mkdir -p -- "${HF_HOME}"
+mkdir -p -- "${HF_HUB_CACHE}"
+mkdir -p -- "${OLLAMA_MODELS}"
+
+echo "[ferment] Starting chat, please wait..."
+
+mlx_lm.chat --model "$MODEL" "$@"

@@ -1,0 +1,13 @@
+{
+
+ :ferment.resolver/default
+ {:caps     [#ref :ferment.caps.registry/llm-voice
+             #ref :ferment.caps.registry/llm-code
+             #ref :ferment.caps.registry/llm-meta
+             #ref :ferment.caps.registry/llm-mock]
+  :protocol #ref :ferment.protocol/default
+  :routing  #ref :ferment.caps/routing
+  :profiles #ref :ferment.caps/profiles
+  :policy   :quality-aware}
+
+}

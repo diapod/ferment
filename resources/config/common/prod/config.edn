@@ -1,0 +1,28 @@
+{
+
+ ;; System settings
+
+ :ferment.system/properties #ref :ferment.app/properties
+ :ferment.system/timezone   :UTC
+
+ ;; Application properties
+
+ :ferment.app/properties {:name        "ferment"
+                            :title       "Ferment Orchestrator"
+                            :profile     :prod
+                            :author      "Paweł Wilk"
+                            :description "The AI Orchestrator"
+                            :version     "1.0.0"
+                            :license     "Copyright by Paweł Wilk"}
+
+ ;; Application shortcuts
+
+ :ferment.app/logger       #ref :ferment.logging/unilog
+ :ferment.app/timezone     #ref :ferment.system/timezone
+ :ferment.app/init         #ref :ferment.logging/unilog
+
+ ;; Lazy map
+
+ :ferment.middleware.lazy-req/all {:enabled? true}
+
+}

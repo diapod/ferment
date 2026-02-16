@@ -1,0 +1,5 @@
+#!/bin/sh
+
+echo "[ferment] Building docs, please wait..."
+
+clojure -M:docs "${1}"

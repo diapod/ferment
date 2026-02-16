@@ -1,0 +1,152 @@
+{:paths   ["src" "resources"]
+ :deps    {cambium/cambium.core                 {:mvn/version "1.1.1"}        ;; client logging
+           cambium/cambium.logback.core         {:mvn/version "0.4.6"}        ;; client logging (Logback)
+           cambium/cambium.logback.json         {:mvn/version "0.4.6"}        ;; client logging (Logback with JSON)
+           cambium/cambium.codec-cheshire       {:mvn/version "1.0.0"}        ;; client logging (JSON conversion)
+           spootnik/unilog                      {:mvn/version "0.7.32"}       ;; logging control
+           logback-bundle/json-bundle           {:mvn/version "0.3.0"}        ;; logging in JSON format - dependencies pack
+           trptr/java-wrapper                   {:mvn/version "0.2.3"}        ;; locale detection and coercion
+           danlentz/clj-uuid                    {:mvn/version "0.2.0"}        ;; UUID support
+           tick/tick                            {:mvn/version "1.0"}          ;; time
+           camel-snake-kebab/camel-snake-kebab  {:mvn/version "0.4.3"}        ;; case conversions
+           io.randomseed/lazy-map               {:mvn/version "1.0.3"}        ;; lazy maps
+           metosin/jsonista                     {:mvn/version "0.3.13"}       ;; JSON parser
+           cheshire/cheshire                    {:mvn/version "6.1.0"}        ;; JSON parser for hato
+           hato/hato                            {:mvn/version "1.0.0"}        ;; HTTP client
+           clojurewerkz/balagan                 {:mvn/version "1.0.5"}        ;; advanced map transformations
+           org.clojure/java.classpath           {:mvn/version "1.1.1"}        ;; Java classpath tools
+           org.clojure/java.data                {:mvn/version "1.3.113"}      ;; Java data structures and conversions
+           org.clojure/core.memoize             {:mvn/version "1.1.266"}      ;; memoization
+           org.clojure/core.cache               {:mvn/version "1.1.234"}      ;; caching
+           org.clojure/core.async               {:mvn/version "1.8.741"}      ;; asynchronous operations
+           org.clojure/data.avl                 {:mvn/version "0.2.0"}        ;; sorted sets with splitting
+           clojure-interop/javax.security       {:mvn/version "1.0.5"}        ;; inter-op for javax.security
+           fipp/fipp                            {:mvn/version "0.6.29"}       ;; pretty printing
+           mvxcvi/puget                         {:mvn/version "1.3.4"}        ;; pretty printing
+           zprint/zprint                        {:mvn/version "1.3.0"}
+           io.randomseed/smangler               {:mvn/version "1.0.4"}        ;; fast string trimming
+           io.randomseed/bankster               {:mvn/version "2.2.4"}        ;; currency and money
+           io.randomseed/phone-number           {:mvn/version "8.13.6-3"}     ;; phone number validation
+           io.randomseed/utils                  {:mvn/version "2.0.4"}        ;; random utilities
+           crypto-equality/crypto-equality      {:mvn/version "1.0.0"}        ;; avoiding timing attacks when comparing
+           com.lambdaworks/scrypt               {:mvn/version "1.4.0"}        ;; password encryption
+           iso-country-codes/iso-country-codes  {:git/url "https://github.com/randomseed-io/iso-country-codes.git"
+                                                 :sha     "991336a419c3746979bc5a80e7a2447f081371be"}
+           commons-validator/commons-validator  {:mvn/version "1.10.1"}       ;; validators for e-mail, URL and date
+           meta-merge/meta-merge                {:mvn/version "1.0.0"}        ;; deep merging of maps
+           integrant/integrant                  {:mvn/version "1.0.1"}        ;; system management via multimethods
+           metosin/potpuri                      {:mvn/version "0.5.3"}        ;; common stuff
+           metosin/maailma                      {:mvn/version "1.1.0"}        ;; configuration reading (delivers data to integrant)
+           com.taoensso/nippy                   {:mvn/version "3.1.1"}        ;; data serialization
+           potemkin/potemkin                    {:mvn/version "0.4.8"}        ;; abstractions with performance in mind
+           mvxcvi/alphabase                     {:mvn/version "2.1.0"}        ;; custom base encodings
+           org.clojure/core.match               {:mvn/version "1.0.0"}}
+ :aliases {:dev       {:extra-deps  {org.clojure/tools.namespace   {:mvn/version "1.5.1"}
+                                     org.clojure/tools.deps        {:mvn/version "0.28.1569"}
+                                     org.clojure/spec.alpha        {:mvn/version "0.6.249"}
+                                     org.clojure/test.check        {:mvn/version "1.1.3"}
+                                     ns-tracker/ns-tracker         {:mvn/version "1.0.0"}
+                                     orchestra/orchestra           {:mvn/version "2021.01.01-1"}
+                                     expound/expound               {:mvn/version "0.9.0"}
+                                     lambdaisland/kaocha           {:mvn/version "1.91.1392"}
+                                     lambdaisland/kaocha-cloverage {:mvn/version "1.1.89"}
+                                     io.aviso/pretty               {:mvn/version "1.4.4"}
+                                     clj-commons/spyscope          {:mvn/version "0.1.48"}
+                                     fipp/fipp                     {:mvn/version "0.6.29"}
+                                     cljfmt/cljfmt                 {:mvn/version "0.9.2"}
+                                     ;;midje/midje                 {:mvn/version "1.9.9"}
+                                     ;;lambdaisland/kaocha-midje   {:mvn/version "0.0-5"}
+                                     zprint/zprint                 {:mvn/version "1.3.0"}
+                                     mvxcvi/puget                  {:mvn/version "1.3.4"}}
+                       :extra-paths ["dev/src" "test"]
+                       :jvm-opts    ["-Xmx1024m","-Dclojure.spec.compile-asserts=true","--enable-native-access=ALL-UNNAMED"]}
+           :server    {:extra-paths ["aliases/server"]
+                       :extra-deps  {io.aviso/pretty       {:mvn/version "1.4.4"}
+                                     clj-commons/spyscope  {:mvn/version "0.1.48"}
+                                     fipp/fipp             {:mvn/version "0.6.29"}
+                                     cljfmt/cljfmt         {:mvn/version "0.9.2"}
+                                     ns-tracker/ns-tracker {:mvn/version "1.0.0"}
+                                     zprint/zprint         {:mvn/version "1.3.0"}
+                                     mvxcvi/puget          {:mvn/version "1.3.4"}}
+                       :jvm-opts    ["-Xmx1024m"]}
+           :test      {:extra-paths ["test" "test/resources"]
+                       :extra-deps  {org.clojure/test.check        {:mvn/version "1.1.1"}
+                                     ns-tracker/ns-tracker         {:mvn/version "0.4.0"}
+                                     ;;midje/midje                 {:mvn/version "1.9.9"}
+                                     orchestra/orchestra           {:mvn/version "2021.01.01-1"}
+                                     expound/expound               {:mvn/version "0.8.7"}
+                                     lambdaisland/kaocha           {:mvn/version "1.0.732"}
+                                     ;;lambdaisland/kaocha-midje   {:mvn/version "0.0-5"}
+                                     lambdaisland/kaocha-cloverage {:mvn/version "1.0.75"}}
+                       :main-opts   ["-m" "kaocha.runner"]
+                       :jvm-opts    ["-Xmx512m","--enable-native-access=ALL-UNNAMED"]}
+           :test-full {:extra-paths ["test" "test/resources"]
+                       :extra-deps  {org.clojure/test.check        {:mvn/version "1.1.1"}
+                                     ns-tracker/ns-tracker         {:mvn/version "0.4.0"}
+                                     ;;midje/midje                 {:mvn/version "1.9.9"}
+                                     orchestra/orchestra           {:mvn/version "2021.01.01-1"}
+                                     expound/expound               {:mvn/version "0.8.7"}
+                                     lambdaisland/kaocha           {:mvn/version "1.0.732"}
+                                     ;;lambdaisland/kaocha-midje   {:mvn/version "0.0-5"}
+                                     lambdaisland/kaocha-cloverage {:mvn/version "1.0.75"}}
+                       :main-opts   ["-m" "kaocha.runner" "--config-file" "tests.edn"]
+                       :jvm-opts    ["-Xmx512m","--enable-native-access=ALL-UNNAMED"]}
+           :eastwood  {:main-opts  ["-m" "eastwood.lint" {:source-paths ["src"]}]
+                       :extra-deps {org.clojure/test.check      {:mvn/version "1.1.3"}
+                                    ;;midje/midje               {:mvn/version "1.9.9"}
+                                    orchestra/orchestra         {:mvn/version "2021.01.01-1"}
+                                    expound/expound             {:mvn/version "0.8.7"}
+                                    org.clojure/tools.namespace {:mvn/version "1.5.1"}
+                                    org.clojure/tools.deps      {:mvn/version "0.28.1569"}
+                                    org.clojure/spec.alpha      {:mvn/version "0.6.249"}
+                                    ns-tracker/ns-tracker       {:mvn/version "1.0.0"}
+                                    jonase/eastwood             {:mvn/version "1.4.3"}}}
+           :docs      {:extra-paths ["aliases/codox"]
+                       :extra-deps  {org.clojure/tools.deps {:mvn/version "0.28.1569"}
+                                     org.clojure/spec.alpha {:mvn/version "0.6.249"}
+                                     org.clojure/test.check {:mvn/version "1.1.1"}
+                                     orchestra/orchestra    {:mvn/version "2021.01.01-1"}
+                                     expound/expound        {:mvn/version "0.8.7"}
+                                     codox/codox            {:mvn/version "0.10.8"}
+                                     ns-tracker/ns-tracker  {:mvn/version "1.0.0"}}
+                       :main-opts   ["-m" "ferment.codox.main"]}
+           :dev-nrepl {:jvm-opts    ["-Dnrepl.load=true","--enable-native-access=ALL-UNNAMED"]
+                       :extra-paths ["aliases/nrepl"]
+                       :extra-deps  {cider/cider-nrepl         {:mvn/version "0.58.0"}
+                                     ;;refactor-nrepl          {:mvn/version "2.3.1"}
+                                     cider/piggieback          {:mvn/version "0.6.1"}
+                                     nrepl/nrepl               {:mvn/version "1.6.0-alpha2"}
+                                     kaocha-nrepl/kaocha-nrepl {:mvn/version "1.0.4"}
+                                     mvxcvi/puget              {:mvn/version "1.3.4"}}}
+           :cider-clj {:extra-paths ["aliases/nrepl"]
+                       :extra-deps  {cider/cider-nrepl         {:mvn/version "0.58.0"}
+                                     cider/piggieback          {:mvn/version "0.6.1"}
+                                     nrepl/nrepl               {:mvn/version "1.6.0-alpha2"}
+                                     kaocha-nrepl/kaocha-nrepl {:mvn/version "1.0.4"}
+                                     mvxcvi/puget              {:mvn/version "1.3.4"}
+                                     zprint/zprint             {:mvn/version "1.3.0"}}
+                       :main-opts   ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}
+           :dev-rebel {:extra-paths ["aliases/rebel"]
+                       :extra-deps  {com.bhauman/rebel-readline      {:mvn/version "0.1.5"}
+                                     com.bhauman/rebel-readline-cljs {:mvn/version "0.1.5"}
+                                     io.aviso/pretty                 {:mvn/version "1.4.4"}
+                                     mvxcvi/puget                    {:mvn/version "1.3.4"}
+                                     zprint/zprint                   {:mvn/version "1.3.0"}}
+                       :main-opts   ["-m" "ferment.rebel.main"]}
+           :pack      {:extra-deps {pack/pack.alpha {:git/url "https://github.com/juxt/pack.alpha.git"
+                                                     :sha     "2769a6224bfb938e777906ea311b3daf7d2220f5"}}}
+           :new       {:deps       {org.babashka/cli                {:mvn/version "0.8.67"}
+                                    io.github.seancorfield/deps-new {:git/tag "v0.10.3"
+                                                                     :git/sha "2c012c4"}}
+                       :ns-default org.corfield.new
+                       :exec-args  {}
+                       :main-opts  ["-m" "babashka.cli.exec"]}}
+ :codox   {:name        "Ferment"
+           :description "All-mighty AI Agent"
+           :license     "Proprietary"
+           :package     io.randomseed/ferment
+           :version     "1.0.0"
+           :output-path "docs"
+           :source-uri  "https://github.com/randomseed-io/ferment/tree/{version}/{filepath}#L{line}"
+           :metadata    {:doc/format :markdown}
+           :themes      [:default :randomseed]}}

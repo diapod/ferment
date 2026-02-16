@@ -1,0 +1,8 @@
+{
+
+ :ferment.core/default
+ {:runtime  #ref :ferment.runtime/default
+  :resolver #ref :ferment.resolver/default
+  :protocol #ref :ferment.protocol/default}
+
+}

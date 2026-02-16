@@ -1,0 +1,25 @@
+{
+
+ :ferment.model/bot-session
+ {:sid "ferment-model-runtime"}
+
+ :ferment.model.solver/runtime
+ {:session   #ref :ferment.model/bot-session
+  :env       #ref :ferment.model.solver/env
+  :command   ["mlx_lm.chat" "--model" #ref :ferment.model/coding]
+  :enabled?  true
+  :name      "solver model runtime"}
+
+ :ferment.model.voice/runtime
+ {:session   #ref :ferment.model/bot-session
+  :env       #ref :ferment.model.voice/env
+  :command   ["mlx_lm.chat" "--model" #ref :ferment.model/voice]
+  :enabled?  true
+  :name      "voice model runtime"}
+
+ :ferment.model/runtime
+ {:session #ref :ferment.model/bot-session
+  :workers {:solver #ref :ferment.model.solver/runtime
+            :voice  #ref :ferment.model.voice/runtime}}
+
+}
