@@ -30,3 +30,4 @@ doc/10_introduction.md
 /dev/resources/clj-kondo/.cache
 AGENTS.md
 CLAUDE.md
+/bin/__pycache__
