@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+ARG_PROFILE="${1:-}"
+
+test -f secrets.env && . secrets.env
+
+[ -n "${ARG_PROFILE}" ] && FERMENT_PROFILE="${ARG_PROFILE}"
+
+PROFILE="${FERMENT_PROFILE:-dev}"
+FERMENT_PROFILE="${PROFILE}"
+
+export FERMENT_PROFILE
+export PROFILE
+
+clojure -M:dev -e '
+  (require (quote [clojure.string :as str])
+           (quote [ferment.app :as app])
+           (quote [ferment.db :as db])
+           (quote [ferment.system :as system]))
+  (let [profile (or (some-> (System/getenv "PROFILE") str/trim not-empty)
+                    (some-> (System/getenv "FERMENT_PROFILE") str/trim not-empty)
+                    "dev")
+        profile-k (keyword profile)
+        dirs (-> (vec (system/profile-resource-dirs profile-k))
+                 (conj "config/common/admin" "config/local/admin"))]
+    (binding [app/*resource-admin-dirs* dirs]
+      (db/migrate!)))
+'

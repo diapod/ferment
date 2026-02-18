@@ -14,6 +14,7 @@
 
    [ferment                       :as          ferment]
    [ferment.app                   :as              app]
+   [ferment.model                 :as            model]
    [ferment.utils                 :as             util]
    [ferment.utils.fs              :as               fs]
    [ferment.utils.map             :as              map]
@@ -65,3 +66,98 @@
   (cst/with-instrument-disabled (test-all))
   (cst/with-instrument-disabled (run-all))
   )
+
+(defn model-invoke!
+  "REPL helper for diagnostic model calls through runtime workers.
+
+  Uses current `ferment.app/state` by default."
+  ([model-id payload]
+   (model/diagnostic-invoke! app/state model-id payload))
+  ([system model-id payload]
+   (model/diagnostic-invoke! system model-id payload)))
+
+(def ^:private ns->profile
+  {'user  :dev
+   'dev   :dev
+   'test  :test
+   'prod  :prod
+   'admin :admin})
+
+(defn current-profile
+  "Infers runtime profile from current namespace.
+
+  Defaults to `:dev` for unknown namespaces."
+  []
+  (or (get ns->profile (ns-name *ns*)) :dev))
+
+(defn- start-for-profile!
+  [profile keys]
+  (case profile
+    :dev   (apply app/start-dev! keys)
+    :test  (apply app/start-test! keys)
+    :admin (apply app/start-admin! keys)
+    :prod  (apply app/start! keys)
+    (throw (ex-info "Unsupported runtime profile."
+                    {:profile profile
+                     :supported (set (vals ns->profile))}))))
+
+(defn- stop-for-profile!
+  [_profile keys]
+  (apply app/stop! keys))
+
+(defn- restart-for-profile!
+  [profile keys]
+  ;; Deterministic restart for selected profile:
+  ;; stop selected keys and start the same key-set using profile-specific config dirs.
+  (apply stop-for-profile! profile keys)
+  (apply start-for-profile! profile keys))
+
+(defn- status-for-profile
+  [profile ns-sym]
+  {:profile profile
+   :namespace ns-sym
+   :phase app/phase
+   :configured? (app/configured?)
+   :running? (app/running?)
+   :stopped? (app/stopped?)
+   :suspended? (app/suspended?)
+   :failed? (app/failed?)
+   :start-args app/start-args
+   :state-keys (some-> app/state keys sort vec)})
+
+(defn start!
+  "Starts app for profile inferred from caller namespace."
+  [& keys]
+  (start-for-profile! (current-profile) keys))
+
+(defn stop!
+  "Stops app (or selected keys)."
+  [& keys]
+  (stop-for-profile! (current-profile) keys))
+
+(defn restart!
+  "Restarts app for profile inferred from caller namespace."
+  [& keys]
+  (restart-for-profile! (current-profile) keys))
+
+(defn status!
+  "Returns a concise runtime status map for profile inferred from caller namespace."
+  []
+  (status-for-profile (current-profile) (ns-name *ns*)))
+
+(defn- install-profile-wrappers!
+  []
+  (doseq [[ns-sym profile] (dissoc ns->profile 'user)]
+    (let [target-ns (or (find-ns ns-sym) (create-ns ns-sym))]
+      (binding [*ns* target-ns]
+        (clojure.core/refer 'clojure.core)
+        (intern *ns* 'start! (fn [& keys]
+                               (start-for-profile! profile keys)))
+        (intern *ns* 'stop! (fn [& keys]
+                              (stop-for-profile! profile keys)))
+        (intern *ns* 'restart! (fn [& keys]
+                                 (restart-for-profile! profile keys)))
+        (intern *ns* 'status! (fn []
+                                (status-for-profile profile ns-sym)))))))
+
+(install-profile-wrappers!)

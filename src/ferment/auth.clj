@@ -8,17 +8,19 @@
 
   (:refer-clojure :exclude [parse-long uuid random-uuid])
 
-  (:require [ferment.logging          :as       log]
-            [ferment.auth.pwd         :as       pwd]
-            [ferment.system           :as    system]
-            [ferment.proto.auth       :as         p]
-            [ferment.types.auth       :refer   :all]
-            [ferment                  :refer   :all]
+  (:require [ferment.db             :as        db]
+            [ferment.db.sql         :as       sql]
+            [ferment.logging        :as       log]
+            [ferment.auth.pwd       :as       pwd]
+            [ferment.http           :as      http]
+            [ferment.system         :as    system]
+            [ferment.proto.auth     :as         p]
+            [ferment.types.auth     :refer   :all]
+            [ferment                :refer   :all]
             [io.randomseed.utils      :refer   :all]
             [io.randomseed.utils.time :as      time]
             [io.randomseed.utils.var  :as       var]
             [io.randomseed.utils.map  :as       map]
-            [io.randomseed.utils.db   :as        db]
             [tick.core                :as         t])
 
   (:import (ferment                 AccountTypes
@@ -176,6 +178,60 @@
     (^DataSource [settings-src]
      settings-src))
 
+  ;; Match
+
+  ;; (settings
+  ;;   ^AuthSettings [m]
+  ;;   (get (.data ^Match m) :auth/setup))
+
+  ;; (config
+  ;;   (^AuthConfig [m]
+  ;;    (if-some [^AuthSettings as (get (.data ^Match m) :auth/setup)]
+  ;;      (.default ^AuthSettings as)))
+  ;;   (^AuthConfig [m account-type]
+  ;;    (if account-type
+  ;;      (if-some [^AuthSettings as (get (.data ^Match m) :auth/setup)]
+  ;;        (get (.types ^AuthSettings as)
+  ;;             (if (keyword? account-type) account-type (keyword account-type)))))))
+
+  ;; (db
+  ;;   (^DataSource [m]
+  ;;    (if-some [as (get (.data ^Match m) :auth/setup)]
+  ;;      (.db ^AuthSettings as)))
+  ;;   (^DataSource [m account-type]
+  ;;    (if account-type
+  ;;      (if-some [^AuthSettings as (get (.data ^Match m) :auth/setup)]
+  ;;        (let [at (if (keyword? account-type) account-type (keyword account-type))]
+  ;;          (if-some [^AuthConfig ac (get (.types ^AuthSettings as) at)]
+  ;;            (.db ^AuthConfig ac)))))))
+
+  ;; Associative
+
+  ;; (settings
+  ;;   ^AuthSettings [req]
+  ;;   (http/get-route-data req :auth/setup))
+
+  ;;(config
+  ;;(^AuthConfig [req]
+  ;;   (if-some [^AuthSettings as (http/get-route-data req :auth/setup)]
+  ;;    (.default ^AuthSettings as)))
+  ;; (^AuthConfig [req account-type]
+  ;;  (if account-type
+  ;;    (if-some [^AuthSettings as (http/get-route-data req :auth/setup)]
+  ;;      (get (.types ^AuthSettings as)
+  ;;           (if (keyword? account-type) account-type (keyword account-type)))))))
+
+  ;; (db
+  ;;   (^DataSource [req]
+  ;;    (if-some [^AuthSettings as (http/get-route-data req :auth/setup)]
+  ;;      (.db ^AuthSettings as)))
+  ;;   (^DataSource [req account-type]
+  ;;    (if account-type
+  ;;      (if-some [^AuthSettings as (http/get-route-data req :auth/setup)]
+  ;;        (let [at (if (keyword? account-type) account-type (keyword account-type))]
+  ;;          (if-some [^AuthConfig ac (get (.types ^AuthSettings as) at)]
+  ;;            (.db ^AuthConfig ac)))))))
+
   nil
 
   (settings [settings-src] nil)
@@ -215,7 +271,7 @@
          ids (if dfl (conj ids dfl))
          ids (if ids (set ids))
          nms (if ids (mapv name ids))
-         sql (if ids (if (= 1 (count nms)) " = ?" (str " IN " (db/braced-join-? nms))))]
+         sql (if ids (if (= 1 (count nms)) " = ?" (str " IN " (sql/braced-join-? nms))))]
      (->AccountTypes sql ids nms dfl dfn))))
 
 (defn make-account-types
@@ -251,7 +307,7 @@
   ([k m]
    (if (instance? AuthConfig m) m
        (map->AuthConfig {:id            (keyword (or (:id m) k))
-                         :db                            (:db m)
+                         :db            (db/ds          (:db m))
                          :passwords     (make-passwords      m)
                          :account-types (make-account-types  m)
                          :locking       (make-locking        m)
@@ -279,7 +335,7 @@
   [coll db]
   (->> coll
        (filter map?)
-       (map #(assoc % :account-types (make-account-types %) :db db))
+       (map #(assoc % :account-types (make-account-types %) :db (db/ds db)))
        (mapcat #(map list (map keyword (:ids (:account-types %))) (repeat %)))
        (filter #(and (coll? %) (keyword? (first %)) (map? (second %))))
        (map (fn [[id auth-config]]
@@ -296,7 +352,8 @@
 (defn init-config
   "Prepares authentication settings."
   [config]
-  (let [config (update config :types index-by-type (:db config))]
+  (let [config (map/update-existing config :db db/ds)
+        config (update config :types index-by-type (:db config))]
     (-> config
         (assoc :default (get (:types config) (:default-type config)))
         map->AuthSettings)))

@@ -1,0 +1,20 @@
+;; Databases (usernames and passwords loaded from config-auth.edn)
+{:ferment.db/main.props {:dbtype               #ref :ferment.env/db.main.type
+                         :dbname               #ref :ferment.env/db.main.name
+                         :logger               #ref :ferment.app/logger
+                         :app-timezone         #ref :ferment.app/timezone
+                         :maximumPoolSize      10
+                         :connectionTestQuery  "SELECT 1"
+                         :dataSourceProperties {:useLegacyDatetimeCode false
+                                                :serverTimezone        "UTC"}}
+
+ :ferment.db/main {:properties  #ref :ferment.db/main.props
+                   :caches      #ref :ferment.db/caches
+                   :initializer ferment.db/pool-datasource
+                   :finalizer   ferment.db/close-pool
+                   :suspender   ferment.db/suspend-pool
+                   :resumer     ferment.db/resume-pool}
+
+ :ferment.db/caches {:ferment.user/ids-cache      {:size 2048}
+                     :ferment.user/identity-cache {:ttl [1  minute] :size 2048}}
+ }

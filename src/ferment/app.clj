@@ -10,9 +10,10 @@
 
   (:require [puget.printer            :refer [cprint pprint]]
             [ns-tracker.core          :as         ns-tracker]
-            [ferment.system         :as               system]
-            [ferment.logging        :as                  log]
-            [ferment.env            :as                  env]
+            [ferment.system           :as               system]
+            [ferment.logging          :as                  log]
+            [ferment.env              :as                  env]
+            [ferment.session]
             [tick.core                :as                  t]
             [io.randomseed.utils.map  :as                map]
             [io.randomseed.utils.var  :as                var]
@@ -27,36 +28,10 @@
 (def ^:dynamic *ns-reload-watch-dirs*             ["src" "test"])
 (def ^:dynamic *local-config*                                nil)
 
-(def ^:dynamic *resource-config-dirs*   ["translations/ferment"
-                                         "config/common"
-                                         "config/common/env"
-                                         "config/common/prod"
-                                         "config/local"
-                                         "config/local/env"
-                                         "config/local/prod"
-                                         ])
-
-(def ^:dynamic *resource-admin-dirs*    ["translations/ferment"
-                                         "config/common"
-                                         "config/common/env"
-                                         "config/common/prod"
-                                         "config/common/admin"
-                                         "config/local"
-                                         "config/local/env"
-                                         "config/local/prod"
-                                         "config/local/admin"
-                                         ])
-
-(def ^:dynamic *resource-dev-dirs*      ["translations/ferment"
-                                         "config/common"
-                                         "config/common/env"
-                                         "config/common/prod"
-                                         "config/common/dev"
-                                         "config/local"
-                                         "config/local/env"
-                                         "config/local/prod"
-                                         "config/local/dev"
-                                         ])
+(def ^:dynamic *resource-config-dirs* (system/profile-resource-dirs :prod))
+(def ^:dynamic *resource-admin-dirs*  (system/profile-resource-dirs :admin))
+(def ^:dynamic *resource-dev-dirs*    (system/profile-resource-dirs :dev))
+(def ^:dynamic *resource-test-dirs*   (system/profile-resource-dirs :test))
 
 (defmacro with-config-dirs
   "Binds `ferment.app/*resource-config-dirs*` to `dirs` for the dynamic extent
@@ -76,15 +51,17 @@
 (defmacro with-configs
   "Binds all config-source dynamic vars for the dynamic extent of `body`:
   `ferment.app/*resource-config-dirs*`, `ferment.app/*resource-dev-dirs*`,
-  `ferment.app/*resource-admin-dirs*`, and `ferment.app/*local-config*`.
+  `ferment.app/*resource-admin-dirs*`, `ferment.app/*resource-test-dirs*`, and
+  `ferment.app/*local-config*`.
 
   Useful for instantiating `app.clj` with custom defaults and building wrappers
   around common management functions such as `ferment.app/start!`,
   `ferment.app/stop!`, `ferment.app/reload!`, etc."
-  [local-file dirs dev-dirs admin-dirs & body]
+  [local-file dirs dev-dirs admin-dirs test-dirs & body]
   `(binding [*resource-config-dirs* ~dirs
              *resource-dev-dirs*    ~dev-dirs
              *resource-admin-dirs*  ~admin-dirs
+             *resource-test-dirs*   ~test-dirs
              *local-config*         ~local-file]
      ~@body))
 
@@ -291,7 +268,7 @@ operation ended with an exception stored in `ferment.app/exception`).")
    (let [rc-dirs (if (coll? rc-dirs) rc-dirs (cons rc-dirs nil))]
      (locking lock
        (if-some [keys (seq keys)]
-         (do (if-not config
+         (do (when-not config
                (var/reset config (apply system/read-configs local-config-file rc-dirs)))
              (var/reset post-config (system/expand config identity keys)))
          (do (if (and (nil? local-config-file) (nil? rc-dirs))
@@ -317,7 +294,7 @@ operation ended with an exception stored in `ferment.app/exception`).")
      (if (suspended?)
        (apply resume-app keys)
        (try
-         (if-not (configured?) (apply configure-app local-config-file rc-dirs keys))
+         (when-not (configured?) (apply configure-app local-config-file rc-dirs keys))
          (var/reset start-args [local-config-file rc-dirs keys])
          (if-some [keys (seq keys)]
            (do
@@ -347,14 +324,14 @@ operation ended with an exception stored in `ferment.app/exception`).")
   Returns the current `phase` keyword."
   [& keys]
   (locking lock
-    (if-not (stopped?)
+    (when-not (stopped?)
       (try
         (var/reset phase :stopping)
         (if-some [keys (seq keys)]
-          (do (if-some [s state] (system/halt! s keys))
+          (do (when-some [s state] (system/halt! s keys))
               (var/reset state         (map/nil-existing-keys state keys))
               (var/reset exception     nil))
-          (do (if-some [s state] (system/halt! s))
+          (do (when-some [s state] (system/halt! s))
               (var/reset state         nil)
               (var/reset post-config   nil)
               (var/reset config        nil)
@@ -412,7 +389,7 @@ operation ended with an exception stored in `ferment.app/exception`).")
         (if (seq keys) (system/resume post-config state keys) (system/resume post-config state))
         (var/reset phase :running)
         (catch Throwable e (state-from-exception e)))
-      (if (stopped?)
+      (when (stopped?)
         (apply restart-app keys)))
     phase))
 
@@ -452,10 +429,12 @@ operation ended with an exception stored in `ferment.app/exception`).")
 (defn configure!         [   ] (configure-app *local-config* *resource-config-dirs*))
 (defn configure-dev!     [   ] (configure-app *local-config* *resource-dev-dirs*))
 (defn configure-admin!   [   ] (configure-app *local-config* *resource-admin-dirs*))
+(defn configure-test!    [   ] (configure-app *local-config* *resource-test-dirs*))
 
 (defn start!             [& k] (apply start-app *local-config* *resource-config-dirs* k))
 (defn start-dev!         [& k] (apply start-app *local-config* *resource-dev-dirs*    k))
 (defn start-admin!       [& k] (apply start-app *local-config* *resource-admin-dirs*  k))
+(defn start-test!        [& k] (apply start-app *local-config* *resource-test-dirs*   k))
 
 (defn stop!              [& k] (apply stop-app    k))
 (defn restart!           [& k] (apply restart-app k))
@@ -477,6 +456,12 @@ Delegates to `ferment.app/configure-app`.")
 (defdoc! configure-admin!
   "Configures the application using the current admin defaults:
 `ferment.app/*local-config*` and `ferment.app/*resource-admin-dirs*`.
+
+Delegates to `ferment.app/configure-app`.")
+
+(defdoc! configure-test!
+  "Configures the application using the current test defaults:
+`ferment.app/*local-config*` and `ferment.app/*resource-test-dirs*`.
 
 Delegates to `ferment.app/configure-app`.")
 
@@ -515,6 +500,12 @@ Delegates to `ferment.app/start-app`.")
 (defdoc! start-admin!
   "Starts the application using admin config defaults:
 `ferment.app/*local-config*` and `ferment.app/*resource-admin-dirs*`.
+
+Delegates to `ferment.app/start-app`.")
+
+(defdoc! start-test!
+  "Starts the application using test config defaults:
+`ferment.app/*local-config*` and `ferment.app/*resource-test-dirs*`.
 
 Delegates to `ferment.app/start-app`.")
 
@@ -628,6 +619,12 @@ using `puget.printer/cprint`.")
   run in development mode (and configured with `ferment.app/configure-dev!`).
 
   See also `ferment.app/start-dev!` and `ferment.app/configure-dev!`.")
+
+(defdoc! *resource-test-dirs*
+  "The same as `ferment.app/*resource-config-dirs*` but loaded when application is
+  run in test mode (and configured with `ferment.app/configure-test!`).
+
+  See also `ferment.app/start-test!` and `ferment.app/configure-test!`.")
 
 (defdoc! *ns-tracker*
   "Instance of `ns-tracker` used to track directories for code changes. By default it

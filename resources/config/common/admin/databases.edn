@@ -1,0 +1,17 @@
+{
+ ;; Databases
+
+ :ferment.db/main.props
+ {
+  :dbtype                #ref :ferment.env/db.main.type
+  :serverTimezone        "UTC"
+  :useLegacyDatetimeCode false}
+
+ :ferment.db/main.migrator
+ {:properties     #ref :ferment.db/main.props
+  :initializer    ragtime.next-jdbc/sql-database
+  :loader         ragtime.next-jdbc/load-resources
+  :migrations-dir "migrations/main"
+  :create-extra   "CHARACTER SET = 'utf8mb4' COLLATE = 'utf8mb4_general_ci' COMMENT = 'Ferment Database'"}
+
+ :ferment.db/migrators [#ref :ferment.db/main.migrator]}

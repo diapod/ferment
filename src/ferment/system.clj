@@ -269,6 +269,30 @@ producing the runtime value to be inserted into the system.")
 ;; parsing configuration files and returning a merged map
 ;; for the given profile
 
+(defn profile-resource-dirs
+  "Returns default resource directory scan order for a given profile.
+
+  The order is:
+  - base shared roots (`translations/ferment`, `config/common`, `config/common/env`),
+  - `prod` overlays (`config/common/prod`, `config/local`, `config/local/env`, `config/local/prod`),
+  - optional profile overlays (`config/common/<profile>`, `config/local/<profile>`).
+
+  For `:prod` (or nil/blank) only base+prod directories are returned."
+  [profile]
+  (let [p        (some-> profile name str/lower-case str/trim not-empty)
+        base     ["translations/ferment"
+                  "config/common"
+                  "config/common/env"
+                  "config/common/prod"
+                  "config/local"
+                  "config/local/env"
+                  "config/local/prod"]
+        profile? (and p (not= "prod" p))]
+    (if profile?
+      (conj (conj base (str "config/common/" p))
+            (str "config/local/" p))
+      base)))
+
 (defn conf-resource
   "Loads one or more configuration resources (classpath-based) using Maailma and the
   project’s custom tag readers.
@@ -322,13 +346,17 @@ producing the runtime value to be inserted into the system.")
     (str base-dir "/" rel-path)))
 
 (defn conf-dirs->resource-names
-  "Given one or more resource directories, finds `.edn` and `.env` files under
-  them, sorts them, and returns a seq of resource names (directory-prefixed paths)
-  suitable for loading via `clojure.java.io/resource`."
+  "Given one or more resource directories, finds direct (non-recursive) `.edn`
+  and `.env` files in each directory, sorts them, and returns a seq of resource
+  names (directory-prefixed paths) suitable for loading via
+  `clojure.java.io/resource`.
+
+  For multiple directories, preserves directory order and removes duplicate
+  resource names while keeping the first occurrence."
   ([d]
    (when-some [^java.io.File root (some-> d fs/resource-file)]
-     (->> (file-seq root)
-          (remove #(.isDirectory ^java.io.File %))
+     (->> (seq (.listFiles root))
+          (filter #(.isFile ^java.io.File %))
           (map (partial file->resource-name d root))
           (filter (some-fn edn-path? env-path?))
           sort
@@ -339,6 +367,7 @@ producing the runtime value to be inserted into the system.")
             (map seq)
             (filter identity)
             (apply concat)
+            distinct
             seq)))
 
 ;; loading namespaces required by fully-qualified configuration keys

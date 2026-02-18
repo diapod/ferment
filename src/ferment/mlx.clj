@@ -10,7 +10,8 @@
 (defn sh!
   "Run a process, return {:exit int :out string :err string}."
   [& args]
-  (let [pb (doto (ProcessBuilder. (into-array String args))
+  (let [^java.util.List command (mapv str args)
+        pb (doto (ProcessBuilder. ^java.util.List command)
              (.redirectErrorStream false))
         p  (.start pb)
         out (slurp (.getInputStream p))

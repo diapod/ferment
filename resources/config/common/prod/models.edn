@@ -35,8 +35,8 @@
  :ferment.model.id/voice
  {:profile     #ref :ferment.model.defaults/profile
   :type        :MLX
-  :id/default  "SpeakLeash/bielik-1.5b-instruct"
-  :id/mini     "SpeakLeash/bielik-1.5b-instruct"
+  :id/default  "speakleash/Bielik-4.5B-v3.0-Instruct-MLX-8bit"
+  :id/mini     "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
   :id/fallback "speakleash/Bielik-11B-v3.0-Instruct-MLX-4bit"}
 
  :ferment.model.runtime/voice

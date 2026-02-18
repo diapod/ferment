@@ -12,7 +12,7 @@
                                                 :kaocha.plugin/print-invocations
                                                 :kaocha.plugin/profiling
                                                 :kaocha.plugin/notifier
-                                                :kaocha.plugin/cloverage
+                                                ;; :kaocha.plugin/cloverage
                                                 :kaocha.plugin.alpha/spec-test-check]
  :kaocha/reporter                              [kaocha.report/documentation]
  :kaocha.plugin.capture-output/capture-output? true

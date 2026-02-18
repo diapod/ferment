@@ -3,6 +3,7 @@
  :ferment.core/default
  {:runtime  #ref :ferment.runtime/default
   :resolver #ref :ferment.resolver/default
-  :protocol #ref :ferment.protocol/default}
+  :protocol #ref :ferment.protocol/default
+  :session  #ref :ferment.session/default}
 
 }

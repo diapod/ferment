@@ -31,7 +31,7 @@
    :salt-length  16
    :salt-charset "abcdefghijklmnopqrstuvwzyxABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-."}]
 
- :ferment.auth/strong {:db                            nil
+ :ferment.auth/strong {:db                            #ref :ferment.db/main
                            :passwords                 #ref :ferment.auth.pwd/settings.strong
                            :account-types             [:system :manager]
                            :locking/max-attempts      8             ; max failed attempts before soft-lock
@@ -54,7 +54,7 @@
 
  ;; Main authentication configuration
 
- :ferment.auth/setup {:db           nil
+ :ferment.auth/setup {:db           #ref :ferment.db/main
                           :default-type :user
                           :types        [#ref :ferment.auth/strong
                                          #ref :ferment.auth/simple]}}

@@ -9,7 +9,10 @@
 
   (:require [clojure.test :refer [deftest is testing]]
             [ferment.contracts :as contracts]
-            [ferment.core :as core]))
+            [ferment.core :as core]
+            [ferment.model :as model]
+            [ferment.session :as session]
+            [ferment.session.store :as session-store]))
 
 (deftest solver-retries-when-model-response-is-empty
   (testing "solver! retries when first model response cannot produce valid :value result."
@@ -94,6 +97,34 @@
                (:command @called)))
         (is (= {"HF_HOME" "/tmp/hf"}
                (get (apply hash-map (:opts @called)) :env)))))))
+
+(deftest model-generate-prefers-runtime-invoke
+  (testing "Generator preferuje invoke na uruchomionym runtime workerze (reuse procesu)."
+    (let [called (atom nil)]
+      (with-redefs [model/invoke-model!
+                    (fn [runtime model-k payload opts]
+                      (reset! called {:runtime runtime
+                                      :model-k model-k
+                                      :payload payload
+                                      :opts opts})
+                      {:ok? true
+                       :result {:text "RUNTIME-OK"}})
+                    core/sh!
+                    (fn [& _]
+                      (throw (ex-info "one-shot path should not be called"
+                                      {:error :unexpected-one-shot-path})))]
+        (is (= "RUNTIME-OK"
+               (:response (core/ollama-generate!
+                           {:runtime {:models {}}
+                            :cap-id :llm/solver
+                            :intent :problem/solve
+                            :model "ignored"
+                            :prompt "hej"
+                            :system "sys"
+                            :session-id "s-42"
+                            :mode :live}))))
+        (is (= :ferment.model/solver (:model-k @called)))
+        (is (= "s-42" (get-in @called [:opts :session/id])))))))
 
 (deftest invoke-capability-can-return-plan-with-injected-slots
   (testing "invoke-capability! supports plan results with model-provided bindings (HOF-like plan output)."
@@ -248,3 +279,48 @@
           (is (= :invalid-request (:error (ex-data ex))))
           (is (= :intent/not-supported (:reason (ex-data ex))))
           (is (= 1 @model-calls))))))))
+
+(deftest invoke-capability-opens-session-and-appends-turns
+  (testing "invoke-capability! korzysta z session service i loguje turn user/assistant."
+    (let [store   (session-store/init-store :ferment.session.store/default {:backend :memory})
+          context (session/init-context :ferment.session.context/default {:context/version 1})
+          manager (session/init-manager :ferment.session.manager/default
+                                        {:store store
+                                         :context context})
+          service (session/init-service :ferment.session/default
+                                        {:store store
+                                         :context context
+                                         :manager manager})
+          seen-request (atom nil)
+          seen-ollama (atom nil)]
+      (with-redefs [core/ollama-generate!
+                    (fn [params]
+                      (reset! seen-ollama params)
+                      {:response "OK"})]
+        (let [result (core/invoke-capability!
+                      nil
+                      {:role :solver
+                       :intent :problem/solve
+                       :cap-id :llm/solver
+                       :model "mock/solver"
+                       :input {:prompt "diag: hello"}
+                       :session/service service
+                       :session/id "diag-s1"
+                       :max-attempts 1
+                       :result-parser
+                       (fn [text {:keys [request]}]
+                         (reset! seen-request request)
+                         {:trace (:trace request)
+                          :result {:type :value
+                                   :out {:text text}}})})
+              session-state (session/get! service "diag-s1")
+              turns (:session/turns session-state)]
+          (is (= "OK" (get-in result [:result :out :text])))
+          (is (= "diag-s1" (:session/id @seen-request)))
+          (is (= "diag-s1" (get-in @seen-request [:context :session/id])))
+          (is (= "diag-s1" (:session-id @seen-ollama)))
+          (is (= 2 (count turns)))
+          (is (= :user (get-in turns [0 :turn/role])))
+          (is (= "diag: hello" (get-in turns [0 :turn/text])))
+          (is (= :assistant (get-in turns [1 :turn/role])))
+          (is (= "OK" (get-in turns [1 :turn/text]))))))))

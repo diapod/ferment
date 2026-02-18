@@ -20,6 +20,7 @@
  :ferment.app/logger       #ref :ferment.logging/unilog
  :ferment.app/timezone     #ref :ferment.system/timezone
  :ferment.app/init         #ref :ferment.logging/unilog
+ :ferment.app/db           #ref :ferment.db/main
 
  ;; Lazy map
 

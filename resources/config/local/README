@@ -4,6 +4,7 @@ They should not be put into version control system nor transferred automatically
 Files from prod/  subdirectory are always loaded.
 Files from dev/   subdirectory are loaded when :dev environment is set.
 Files from admin/ subdirectory are loaded when :admin environment is set.
+Files from test/  subdirectory are loaded when :test environment is set.
 
 Typical use is to set :node key of a map keyed as :ferment.app/properties to name a host
 and set paths that will only work on this machine (like caches or directories for model data).

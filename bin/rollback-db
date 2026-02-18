@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+ARG_PROFILE="${1:-}"
+ARG_TARGET="${2:-}"
+
+test -f secrets.env && . secrets.env
+
+if [ -n "${ARG_PROFILE}" ]; then
+  FERMENT_PROFILE="${ARG_PROFILE}"
+fi
+
+: "${FERMENT_PROFILE:=dev}"
+PROFILE="${FERMENT_PROFILE}"
+
+export FERMENT_PROFILE
+export PROFILE
+
+FERMENT_ROLLBACK_TARGET="${ARG_TARGET:-${FERMENT_ROLLBACK_TARGET:-}}"
+export FERMENT_ROLLBACK_TARGET
+
+clojure -M:dev -e '
+  (require (quote [clojure.string :as str])
+           (quote [ferment.app :as app])
+           (quote [ferment.db :as db])
+           (quote [ferment.system :as system]))
+  (let [profile (or (some-> (System/getenv "PROFILE") str/trim not-empty)
+                    (some-> (System/getenv "FERMENT_PROFILE") str/trim not-empty)
+                    "dev")
+        profile-k (keyword profile)
+        dirs (-> (vec (system/profile-resource-dirs profile-k))
+                 (conj "config/common/admin" "config/local/admin"))
+        target-raw (some-> (System/getenv "FERMENT_ROLLBACK_TARGET") str/trim not-empty)
+        target (when target-raw
+                 (try
+                   (Long/parseLong target-raw)
+                   (catch Throwable _ target-raw)))]
+    (binding [app/*resource-admin-dirs* dirs]
+      (if target
+        (db/rollback! nil target)
+        (db/rollback!))))
+'

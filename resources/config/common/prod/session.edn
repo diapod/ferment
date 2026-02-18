@@ -1,0 +1,27 @@
+{
+
+ :ferment.session.store/default
+ {:backend        :db
+  :db             #ref :ferment.db/main
+  :sessions-table :sessions
+  :vars-table     :session_vars
+  :max-sessions   4096}
+
+ :ferment.session.context/default
+ {:context/version      1
+  :window/turns         16
+  :window/max-chars     20000
+  :summary/target-chars 1200}
+
+ :ferment.session.manager/default
+ {:store            #ref :ferment.session.store/default
+  :context          #ref :ferment.session.context/default
+  :max-hot-sessions 32
+  :idle-ttl-ms      900000}
+
+ :ferment.session/default
+ {:manager #ref :ferment.session.manager/default
+  :store   #ref :ferment.session.store/default
+  :context #ref :ferment.session.context/default}
+
+}

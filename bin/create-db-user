@@ -1,0 +1,157 @@
+#!/bin/sh
+
+ARG_PROFILE="${1:-}"
+
+script_dir=$(
+  CDPATH= cd -P -- "$(dirname -- "$0")" && pwd -P
+) || exit 1
+
+[ -n "${ARG_PROFILE}" ] && FERMENT_PROFILE="${ARG_PROFILE}"
+
+PROFILE="${FERMENT_PROFILE:-dev}"
+
+ENVVARS_FILE_PROD="${script_dir}/../resources/config/common/prod/db.env"
+if [ -r "$ENVVARS_FILE_PROD" ]; then
+    . "$ENVVARS_FILE_PROD"
+fi
+
+ENVVARS_FILE_PROD="${script_dir}/../resources/config/local/prod/db.env"
+if [ -r "$ENVVARS_FILE_PROD" ]; then
+    . "$ENVVARS_FILE_PROD"
+fi
+
+if [ "${PROFILE}" != "prod" ]; then
+    ENVVARS_FILE="${script_dir}/../resources/config/common/${PROFILE}/db.env"
+    if [ -r "$ENVVARS_FILE" ]; then
+        . "$ENVVARS_FILE"
+    fi
+fi
+
+if [ "${PROFILE}" != "prod" ]; then
+    ENVVARS_FILE="${script_dir}/../resources/config/local/${PROFILE}/db.env"
+    if [ -r "$ENVVARS_FILE" ]; then
+        . "$ENVVARS_FILE"
+    fi
+fi
+
+required_vars="DB_MAIN_HOST DB_MAIN_NAME DB_MAIN_ID DB_MAIN_USER_ID DB_MAIN_USER_MIGRATOR_ID"
+missing_vars=""
+
+for var_name in $required_vars; do
+    eval "var_value=\${${var_name}-}"
+    if [ -z "${var_value}" ]; then
+        missing_vars="${missing_vars} ${var_name}"
+    fi
+done
+
+if [ -n "${missing_vars}" ]; then
+    echo "[ferment] Missing required DB variables from db.env:${missing_vars}" >&2
+    echo "[ferment] Expected files under resources/config/common/{prod,PROFILE}/db.env and resources/config/local/{prod,PROFILE}/db.env" >&2
+    exit 2
+fi
+
+REL_CREDS_PATH="${script_dir}/../resources/config"
+
+echo "[ferment] Adding database users and setting permissions.."
+echo
+echo "This script will create migration and regular users"
+echo "with the given passwords."
+echo
+
+cleanup() {
+  stty echo 2>/dev/null || true
+  printf "\n" >&2
+}
+
+trap 'cleanup; printf "\n" >&2; exit 130' INT TERM HUP
+trap 'cleanup' EXIT
+
+ask_pwd() {
+    us="${1}"
+    prev="${3}"
+    prevdb="${2}"
+    while :; do
+        prevtxt=""
+        [ -n "${prev}" ] && prevtxt=" [ENTER - re-use from ${prevdb}]"
+        printf "Enter password for ${1}${prevtxt}: " >&2
+        stty -echo
+        IFS=
+        read -r pass1 || exit 1
+        stty echo
+        printf "\n" >&2
+        if [ -z "$pass1" ] && [ -n "$prev" ]; then
+            pass1=$prev
+            break
+        fi
+        [ -n "${pass1}" ] || { continue; }
+        printf "Repeat password: " >&2
+        stty -echo
+        IFS=
+        read -r pass2 || exit 1
+        stty echo
+        printf "\n" >&2
+        [ "${pass1}" = "${pass2}" ] && break
+        printf "Passwords are different. Try again.\n" >&2
+    done
+    printf '%s\n' "${pass1}"
+}
+
+[ -n "${DB_MAIN_ROOT_ID}" ] || DB_MAIN_ROOT_ID='root'
+
+echo "Root database access will be needed to execute the query."
+echo "You will be asked for its password."
+echo
+echo "Profile:      ${PROFILE}"
+echo "Host:         ${DB_MAIN_HOST}"
+echo "Database:     ${DB_MAIN_NAME} (${DB_MAIN_ID})"
+echo "Users to add: ${DB_MAIN_USER_ID}, ${DB_MAIN_USER_MIGRATOR_ID}"
+echo "Root DB user: ${DB_MAIN_ROOT_ID} (used for this session only)"
+echo
+
+[ -n "${DB_MAIN_USER_PASSWORD}" ]          || DB_MAIN_USER_PASSWORD=$(ask_pwd          "${DB_MAIN_USER_ID}")
+[ -n "${DB_MAIN_USER_MIGRATOR_PASSWORD}" ] || DB_MAIN_USER_MIGRATOR_PASSWORD=$(ask_pwd "${DB_MAIN_USER_MIGRATOR_ID}")
+
+[ -n "${DB_MAIN_USER_HOST}" ] && DB_MAIN_USER_STR=$(cat <<EOF
+CREATE USER IF NOT EXISTS '${DB_MAIN_USER_ID}'@'${DB_MAIN_USER_HOST}' identified via ed25519 USING password('${DB_MAIN_USER_PASSWORD}');
+GRANT ALL PRIVILEGES ON \`${DB_MAIN_NAME}\`.* TO '${DB_MAIN_USER_ID}'@'${DB_MAIN_USER_HOST}';
+EOF
+)
+
+[ -n "${DB_MAIN_USER_MIGRATOR_HOST}" ] && DB_MAIN_USER_MIGRATOR_STR=$(cat <<EOF
+CREATE USER IF NOT EXISTS '${DB_MAIN_USER_MIGRATOR_ID}'@'${DB_MAIN_USER_MIGRATOR_HOST}' identified via ed25519 USING password('${DB_MAIN_USER_MIGRATOR_PASSWORD}');
+GRANT CREATE TEMPORARY TABLES, LOCK TABLES, SHOW VIEW ON \`${DB_MAIN_NAME}\`.* TO '${DB_MAIN_USER_MIGRATOR_ID}'@'${DB_MAIN_USER_MIGRATOR_HOST}';
+GRANT ALL PRIVILEGES ON \`${DB_MAIN_NAME}\`.* TO '${DB_MAIN_USER_MIGRATOR_ID}'@'${DB_MAIN_USER_MIGRATOR_HOST}';
+EOF
+)
+
+trap - EXIT INT TERM HUP
+cleanup
+
+echo "Press ENTER to continue or CTRL+C to abort."
+
+read
+
+echo "Connecting to ${DB_MAIN_HOST} (database: ${DB_MAIN_NAME})..."
+echo
+
+mysql -h ${DB_MAIN_HOST} -u ${DB_MAIN_ROOT_ID} -p <<EOF
+CREATE DATABASE IF NOT EXISTS \`${DB_MAIN_NAME}\` /*!40100 DEFAULT CHARACTER SET utf8mb4 */ COMMENT 'Main Database';
+
+CREATE USER IF NOT EXISTS '${DB_MAIN_USER_ID}'@'localhost' identified via ed25519 USING password('${DB_MAIN_USER_PASSWORD}');
+CREATE USER IF NOT EXISTS '${DB_MAIN_USER_MIGRATOR_ID}'@'localhost' identified via ed25519 USING password('${DB_MAIN_USER_MIGRATOR_PASSWORD}');
+
+GRANT CREATE TEMPORARY TABLES, LOCK TABLES, SHOW VIEW ON \`${DB_MAIN_NAME}\`.* TO '${DB_MAIN_USER_MIGRATOR_ID}'@'localhost';
+GRANT ALL PRIVILEGES ON \`${DB_MAIN_NAME}\`.* TO '${DB_MAIN_USER_ID}'@'localhost';
+GRANT ALL PRIVILEGES ON \`${DB_MAIN_NAME}\`.* TO '${DB_MAIN_USER_MIGRATOR_ID}'@'localhost';
+
+${DB_MAIN_USER_STR}
+
+${DB_MAIN_USER_MIGRATOR_STR}
+
+FLUSH PRIVILEGES;
+EOF
+
+echo
+# echo "Next step: run bin/repl and call (db/migrate!)"
+
+exit 0

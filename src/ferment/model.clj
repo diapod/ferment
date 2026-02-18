@@ -8,6 +8,7 @@
 
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
+            [ferment.session :as fsession]
             [ferment.system :as system]
             [io.randomseed.utils.bot :as bot]
             [io.randomseed.utils.bus :as bus])
@@ -17,6 +18,13 @@
            (java.nio.charset StandardCharsets)
            (java.time Instant)
            (java.util.concurrent TimeUnit)))
+
+(def ^:private default-session-idle-ttl-ms 900000)
+(def ^:private default-session-max-per-model 4)
+
+(defn- now-ms
+  []
+  (System/currentTimeMillis))
 
 (defn runtime-config
   "Extracts runtime config map from supported runtime shapes."
@@ -222,9 +230,15 @@
   [worker-config payload]
   (let [prompt      (invoke-prompt payload)
         command0    (vec (map str (:command worker-config)))
-        prompt-via  (or (:prompt-via worker-config) :arg)
-        prompt-arg  (or (:prompt-arg worker-config) "--prompt")
-        command     (if (= :arg prompt-via)
+        prompt-via  (or (:invoke/prompt-via worker-config)
+                        (:prompt-via worker-config)
+                        :stdin)
+        prompt-arg  (or (:invoke/prompt-arg worker-config)
+                        (:prompt-arg worker-config)
+                        "--prompt")
+        command     (if (and (= :arg prompt-via)
+                             (string? prompt-arg)
+                             (not (str/blank? prompt-arg)))
                       (into command0 [prompt-arg prompt])
                       command0)
         command'    (resolve-command-executable command (:env worker-config))
@@ -235,7 +249,7 @@
         _           (apply-process-env! pb (:env worker-config))
         process     (.start pb)
         _           (when (= :stdin prompt-via)
-                      (let [^String in-str (str prompt)]
+                      (let [^String in-str (str prompt "\n")]
                         (with-open [^java.io.Writer w (io/writer (.getOutputStream process))]
                           (.write w in-str))))
         out         (slurp (.getInputStream process))
@@ -243,8 +257,14 @@
         exit        (.waitFor process)
         out'        (some-> out str str/trim not-empty)
         err'        (some-> err str str/trim not-empty)
+        eof-exit?   (and (not (zero? exit))
+                         (= :stdin prompt-via)
+                         (or (some-> err' (str/includes? "EOFError: EOF when reading a line"))
+                             (some-> err' (str/includes? "EOF when reading a line")))
+                         (some? out'))
         text        (or out' err' "")]
-    (when-not (zero? exit)
+    (when (and (not (zero? exit))
+               (not eof-exit?))
       (throw (ex-info "Model invoke command failed."
                       {:exit exit
                        :command command'
@@ -252,7 +272,10 @@
                        :stderr err})))
     {:text text
      :command command'
-     :exit exit}))
+     :exit exit
+     :ok-nonzero? eof-exit?}))
+
+(declare invoke-runtime-process!)
 
 (defn- normalize-runtime-worker-config
   [k config]
@@ -261,10 +284,14 @@
         wid      (or (:id cfg) k)
         name'    (or (:name cfg) (str (name wid) " runtime"))
         session' (or (:session cfg) {:sid "ferment-model-runtime"})
+        invoke-mode (or (:invoke/mode cfg) :runtime-process)
         invoke-fn' (or (:invoke-fn cfg)
                        (when (seq (:command cfg))
-                         (fn [payload _session worker-config]
-                           (invoke-command! worker-config payload))))]
+                         (if (= :oneshot invoke-mode)
+                           (fn [payload _session worker-config]
+                             (invoke-command! worker-config payload))
+                           (fn [payload session worker-config]
+                             (invoke-runtime-process! payload session worker-config)))))]
     (-> cfg
         (assoc :id wid
                :bot (or (:bot cfg) wid)
@@ -300,18 +327,71 @@
 (defn- configure-process-io!
   [^ProcessBuilder pb inherit-io]
   (let [selection (normalize-io-selection inherit-io)]
-    (if (= selection io-streams)
-      (.inheritIO pb)
-      (doto pb
-        (.redirectInput  (if (contains? selection :in)
-                           ProcessBuilder$Redirect/INHERIT
-                           ProcessBuilder$Redirect/PIPE))
-        (.redirectOutput (if (contains? selection :out)
-                           ProcessBuilder$Redirect/INHERIT
-                           ProcessBuilder$Redirect/DISCARD))
-        (.redirectError  (if (contains? selection :err)
-                           ProcessBuilder$Redirect/INHERIT
-                           ProcessBuilder$Redirect/DISCARD))))))
+    ;; Keep stdout/stderr as pipes so :invoke can reuse an already-running process.
+    ;; Optional forwarding to parent stdio is handled by stream pump threads.
+    (doto pb
+      (.redirectInput  (if (contains? selection :in)
+                         ProcessBuilder$Redirect/INHERIT
+                         ProcessBuilder$Redirect/PIPE))
+      (.redirectOutput ProcessBuilder$Redirect/PIPE)
+      (.redirectError  ProcessBuilder$Redirect/PIPE))))
+
+(def ^:private default-io-buffer-max-chars 300000)
+(def ^:private default-invoke-timeout-ms 120000)
+(def ^:private default-invoke-poll-ms 40)
+(def ^:private default-invoke-settle-ms 350)
+(def ^:private default-invoke-ready-pattern #">>\s*$")
+
+(defn- io-buffer-state
+  []
+  {:total 0
+   :text  ""})
+
+(defn- append-buffer-text
+  [state chunk max-chars]
+  (let [chunk' (str (or chunk ""))
+        total' (+ (long (or (:total state) 0))
+                  (count chunk'))
+        text0  (str (or (:text state) "") chunk')
+        max'   (long (max 1024 (or max-chars default-io-buffer-max-chars)))
+        text'  (if (> (count text0) max')
+                 (subs text0 (- (count text0) (int max')))
+                 text0)]
+    {:total total'
+     :text text'}))
+
+(defn- buffer-view-since
+  [buffer-atom since-total]
+  (let [{:keys [total text]} (or @buffer-atom (io-buffer-state))
+        t      (or text "")
+        total' (long (or total 0))
+        since' (long (or since-total 0))
+        tail-start (- total' (count t))
+        truncated? (< since' tail-start)
+        local-start (max 0 (- since' tail-start))]
+    {:total total'
+     :text (subs t (int local-start))
+     :truncated? truncated?}))
+
+(defn- pump-stream!
+  [^java.io.InputStream in stream-k buffer-atom selection max-chars]
+  (let [forward? (contains? selection stream-k)
+        ^java.io.PrintStream target (if (= :err stream-k) System/err System/out)
+        max' (long (max 1024 (or max-chars default-io-buffer-max-chars)))]
+    (future
+      (try
+        (with-open [^java.io.Reader rdr (io/reader in :encoding "UTF-8")]
+          (let [cbuf (char-array 2048)]
+            (loop []
+              (let [n (.read rdr cbuf 0 (alength cbuf))]
+                (when (pos? n)
+                  (let [chunk (String. cbuf 0 n)]
+                    (swap! buffer-atom append-buffer-text chunk max')
+                    (when forward?
+                      (.print target chunk)
+                      (.flush target)))
+                  (recur))))))
+        (catch Throwable _ nil)))))
 
 (defn start-command-process!
   "Starts a local process for worker runtime when `:command` is present in config.
@@ -325,17 +405,30 @@
   [worker-config _session]
   (when-some [cmd0 (seq (map str (:command worker-config)))]
     (let [cmd     (resolve-command-executable (vec cmd0) (:env worker-config))
+          selection (normalize-io-selection (:inherit-io? worker-config))
+          max-chars (or (:io/max-buffer-chars worker-config)
+                        default-io-buffer-max-chars)
           ^java.util.List command (mapv str cmd)
           pb (ProcessBuilder. ^java.util.List command)
           _  (configure-process-io! pb (:inherit-io? worker-config))
           _  (when-some [workdir (:workdir worker-config)]
                (.directory pb (File. (str workdir))))
           _  (apply-process-env! pb (:env worker-config))
-          process (.start pb)]
+          process (.start pb)
+          out-buf (atom (io-buffer-state))
+          err-buf (atom (io-buffer-state))
+          out-pump (pump-stream! (.getInputStream process) :out out-buf selection max-chars)
+          err-pump (pump-stream! (.getErrorStream process) :err err-buf selection max-chars)]
       {:type    :process
        :pid     (.pid process)
        :command (vec cmd)
-       :process process})))
+       :process process
+       :io     {:selection selection
+                :lock (Object.)
+                :max-buffer-chars max-chars
+                :stdout out-buf
+                :stderr err-buf
+                :pumps [out-pump err-pump]}})))
 
 (defn stop-command-process!
   "Stops process runtime started by `start-command-process!`."
@@ -344,11 +437,14 @@
     (.destroy process)
     (when-not (.waitFor process 2000 TimeUnit/MILLISECONDS)
       (.destroyForcibly process)))
+  (doseq [p (get-in runtime-state [:io :pumps])]
+    (when (future? p)
+      (future-cancel p)))
   nil)
 
 (defn- quit-command
   [worker-config]
-  (when-some [cmd (some-> (:cmd/quit worker-config) str str/trim not-empty)]
+  (when-some [^String cmd (some-> (:cmd/quit worker-config) str str/trim not-empty)]
     (if (str/ends-with? cmd "\n")
       cmd
       (str cmd "\n"))))
@@ -358,12 +454,14 @@
   (if-some [cmd (quit-command worker-config)]
     (if-some [^Process process (get-in session [:runtime/state :process])]
       (try
-        (let [^java.io.OutputStream out (.getOutputStream process)
-              bytes (.getBytes cmd StandardCharsets/UTF_8)]
-          (.write out bytes)
-          (.flush out)
-          {:ok? true
-           :sent cmd})
+        (let [lock (or (get-in session [:runtime/state :io :lock]) (Object.))]
+          (locking lock
+            (let [^java.io.OutputStream out (.getOutputStream process)
+                  ^bytes bytes (.getBytes ^String cmd StandardCharsets/UTF_8)]
+              (.write out ^bytes bytes)
+              (.flush out)
+              {:ok? true
+               :sent cmd})))
         (catch Throwable t
           {:ok? false
            :error :quit-write-failed
@@ -372,6 +470,118 @@
        :error :runtime-process-missing})
     {:ok? false
      :error :quit-not-configured}))
+
+(defn- tail-text
+  [s n]
+  (let [s' (str (or s ""))
+        n' (max 1 (int (or n 1)))
+        len (count s')]
+    (if (<= len n')
+      s'
+      (subs s' (- len n')))))
+
+(defn- ready-pattern
+  [worker-config]
+  (let [rp-key? (contains? worker-config :invoke/ready-pattern)
+        rp (:invoke/ready-pattern worker-config)]
+    (cond
+      (and rp-key? (or (nil? rp) (false? rp))) nil
+      (instance? java.util.regex.Pattern rp) rp
+      (string? rp) (try
+                     (re-pattern rp)
+                     (catch Throwable _ default-invoke-ready-pattern))
+      :else default-invoke-ready-pattern)))
+
+(defn- wait-for-runtime-response!
+  [stdout-buf stderr-buf out-total0 err-total0 worker-config]
+  (let [timeout-ms (long (max 100 (or (:invoke/timeout-ms worker-config)
+                                      default-invoke-timeout-ms)))
+        poll-ms    (long (max 10 (or (:invoke/poll-ms worker-config)
+                                     default-invoke-poll-ms)))
+        settle-ms  (long (max 20 (or (:invoke/settle-ms worker-config)
+                                     default-invoke-settle-ms)))
+        ready-re   (ready-pattern worker-config)
+        started-at (System/currentTimeMillis)
+        initial-total (+ out-total0 err-total0)]
+    (loop [last-total initial-total
+           last-change started-at]
+      (Thread/sleep poll-ms)
+      (let [out-view (buffer-view-since stdout-buf out-total0)
+            err-view (buffer-view-since stderr-buf err-total0)
+            stdout' (:text out-view)
+            stderr' (:text err-view)
+            total-now (+ (:total out-view) (:total err-view))
+            changed? (not= total-now last-total)
+            now-ms (System/currentTimeMillis)
+            last-change' (if changed? now-ms last-change)
+            produced? (> total-now initial-total)
+            ready? (when ready-re
+                     (boolean (re-find ready-re (tail-text stdout' 512))))
+            settled? (and (nil? ready-re)
+                          produced?
+                          (>= (- now-ms last-change') settle-ms))
+            timeout? (>= (- now-ms started-at) timeout-ms)]
+        (cond
+          ready? {:stdout stdout'
+                  :stderr stderr'
+                  :stdout/truncated? (:truncated? out-view)
+                  :stderr/truncated? (:truncated? err-view)}
+          settled? {:stdout stdout'
+                    :stderr stderr'
+                    :stdout/truncated? (:truncated? out-view)
+                    :stderr/truncated? (:truncated? err-view)}
+          timeout? (throw (ex-info "Timed out waiting for runtime model response."
+                                   {:error :invoke-timeout
+                                    :timeout-ms timeout-ms
+                                    :stdout stdout'
+                                    :stderr stderr'
+                                    :stdout/truncated? (:truncated? out-view)
+                                    :stderr/truncated? (:truncated? err-view)}))
+          :else (recur total-now last-change'))))))
+
+(defn invoke-runtime-process!
+  "Invokes a running runtime process by writing prompt to stdin and reading
+  response from runtime stdout/stderr buffers."
+  [payload session worker-config]
+  (let [runtime-state (:runtime/state session)
+        ^Process process (:process runtime-state)
+        stdout-buf (get-in runtime-state [:io :stdout])
+        stderr-buf (get-in runtime-state [:io :stderr])
+        lock (or (get-in runtime-state [:io :lock]) (Object.))
+        prompt (str (invoke-prompt payload) "\n")]
+    (when-not (instance? Process process)
+      (throw (ex-info "Runtime process is not available for invoke."
+                      {:error :runtime-process-missing})))
+    (when-not (.isAlive process)
+      (throw (ex-info "Runtime process is not alive."
+                      {:error :runtime-process-dead
+                       :exit (try
+                               (.exitValue process)
+                               (catch Throwable _ nil))})))
+    (when-not (and (instance? clojure.lang.IDeref stdout-buf)
+                   (instance? clojure.lang.IDeref stderr-buf))
+      (throw (ex-info "Runtime process buffers are not available for invoke."
+                      {:error :runtime-process-io-unavailable})))
+    (locking lock
+      (let [out-total0 (:total @stdout-buf)
+            err-total0 (:total @stderr-buf)]
+        (try
+          (let [^java.io.OutputStream out (.getOutputStream process)
+                ^bytes bytes (.getBytes ^String prompt StandardCharsets/UTF_8)]
+            (.write out ^bytes bytes)
+            (.flush out))
+          (catch Throwable t
+            (throw (ex-info "Failed to write invoke payload to runtime process."
+                            {:error :runtime-stdin-write-failed
+                             :message (.getMessage t)}
+                            t))))
+        (let [{:keys [stdout stderr]
+               :as capture} (wait-for-runtime-response!
+                             stdout-buf stderr-buf out-total0 err-total0 worker-config)
+              stdout' (some-> stdout str str/trim not-empty)
+              stderr' (some-> stderr str str/trim not-empty)
+              text (or stdout' stderr' "")]
+          (assoc capture :text text))))))
 
 (defn- warn-quit-stop!
   [message details]
@@ -471,7 +681,17 @@
                     (catch Throwable t
                       {:ok? false
                        :error :invoke-failed
-                       :message (.getMessage t)})))
+                       :message (.getMessage t)
+                       :details (when (instance? clojure.lang.ExceptionInfo t)
+                                  (select-keys (ex-data t)
+                                               [:error
+                                                :exit
+                                                :command
+                                                :stderr
+                                                :stdout
+                                                :timeout-ms
+                                                :stdout/truncated?
+                                                :stderr/truncated?]))})))
                 {:ok? false
                  :error :invoke-not-configured})
       {:ok? false
@@ -602,7 +822,17 @@
 
 (defn stop-model-runtime
   "Stop hook for model runtime aggregate key."
-  [_k _state]
+  [_k state]
+  (when-some [registry (and (map? state)
+                            (instance? clojure.lang.IDeref
+                                       (:ferment.model.session/workers state))
+                            (:ferment.model.session/workers state))]
+    (doseq [[_model sid->entry] @registry
+            [_sid {:keys [worker-state]}] sid->entry]
+      (when (map? worker-state)
+        (try
+          (stop-runtime-worker (:id worker-state) worker-state)
+          (catch Throwable _ nil)))))
   nil)
 
 (defn runtime-worker-state
@@ -640,6 +870,71 @@
   "Resumes selected runtime worker."
   [runtime worker-id]
   (runtime-command! runtime worker-id :run))
+
+(defn- unwrap-system
+  [system]
+  (cond
+    (map? system) system
+    (instance? clojure.lang.Var system) (var-get ^clojure.lang.Var system)
+    (instance? clojure.lang.IDeref system) @system
+    :else nil))
+
+(defn- normalize-model-key
+  [model-id]
+  (let [k (cond
+            (keyword? model-id) model-id
+            (string? model-id) (some-> model-id str/trim not-empty keyword)
+            :else nil)]
+    (when k
+      (case (namespace k)
+        "ferment.model" k
+        "ferment.model.runtime" (keyword "ferment.model" (name k))
+        (keyword "ferment.model" (name k))))))
+
+(defn- runtime-state-from-system
+  [system model-k]
+  (let [runtime-k (keyword "ferment.model.runtime" (name model-k))
+        short-k   (keyword (name model-k))
+        candidates [(get system runtime-k)
+                    (get-in system [model-k :runtime])
+                    (get-in system [:ferment/models model-k :runtime])
+                    (get-in system [:ferment/models short-k :runtime])
+                    (get-in system [:ferment.runtime/default :models model-k :runtime])
+                    (get-in system [:ferment.runtime/default :models short-k :runtime])
+                    (get-in system [:ferment.model/runtime :workers short-k])
+                    (get-in system [:ferment.runtime/default :workers short-k])]]
+    (some #(when (and (map? %) (contains? % :worker)) %) candidates)))
+
+(defn diagnostic-invoke!
+  "Sends diagnostic payload to a running model runtime worker using `:invoke`.
+
+  Arguments:
+  - `system`   running system map (e.g. `ferment.app/state`) or derefable/Var with it
+  - `model-id` model identifier (`:meta`, `:solver`, `:voice`, `:coding` or qualified key)
+  - `payload`  data sent to worker as `:invoke` argument"
+  [system model-id payload]
+  (let [system' (unwrap-system system)
+        model-k (normalize-model-key model-id)]
+    (when-not (map? system')
+      (throw (ex-info "Diagnostic invoke requires running system map."
+                      {:error :system/not-available
+                       :model-id model-id
+                       :system-type (some-> system class str)})))
+    (when-not (keyword? model-k)
+      (throw (ex-info "Diagnostic invoke requires model identifier."
+                      {:error :model/id-invalid
+                       :model-id model-id})))
+    (let [runtime-state (runtime-state-from-system system' model-k)
+          worker (:worker runtime-state)]
+      (when-not worker
+        (throw (ex-info "Model runtime worker is not running or unavailable in system."
+                        {:error :model/worker-not-found
+                         :model model-k
+                         :runtime-key (keyword "ferment.model.runtime" (name model-k))})))
+      (or (command-bot-worker! worker :invoke payload)
+          {:ok? false
+           :error :invoke/empty-response
+           :model model-k}))))
 
 (defn preconfigure-model-entry
   "Pre-configuration hook for grouped model entries."
@@ -686,6 +981,275 @@
         (let [legacy (get cfg model-k)]
           (when (map? legacy) legacy)))))
 
+(defn- runtime-session-registry
+  [runtime]
+  (when (map? runtime)
+    (let [v (:ferment.model.session/workers runtime)]
+      (when (instance? clojure.lang.IDeref v)
+        v))))
+
+(defn- runtime-session-lock
+  [runtime]
+  (if (map? runtime)
+    (or (:ferment.model.session/lock runtime) (Object.))
+    (Object.)))
+
+(defn- session-mode-enabled?
+  [runtime]
+  (and (map? runtime)
+       (not= false (:ferment.model.session/enabled? runtime))))
+
+(defn- session-idle-ttl-ms
+  [runtime]
+  (let [v (when (map? runtime) (:ferment.model.session/idle-ttl-ms runtime))]
+    (long (max 0 (or (when (number? v) v)
+                     default-session-idle-ttl-ms)))))
+
+(defn- session-max-per-model
+  [runtime]
+  (let [v (when (map? runtime) (:ferment.model.session/max-per-model runtime))]
+    (long (max 1 (or (when (number? v) v)
+                     default-session-max-per-model)))))
+
+(defn- normalize-runtime-session-id
+  [sid]
+  (cond
+    (string? sid)  (some-> sid str/trim not-empty)
+    (keyword? sid) (some-> sid name str/trim not-empty)
+    (uuid? sid)    (str sid)
+    (nil? sid)     nil
+    :else          (some-> sid str str/trim not-empty)))
+
+(defn- model-runtime-template
+  [runtime model-k]
+  (let [runtime' (some-> (model-entry runtime model-k) :runtime)]
+    (cond
+      (and (map? runtime') (map? (:config runtime'))) (:config runtime')
+      (map? runtime') runtime'
+      :else nil)))
+
+(defn- sanitize-session-token
+  [sid]
+  (-> (or sid "")
+      str
+      str/lower-case
+      (str/replace #"[^a-z0-9._-]+" "-")
+      (str/replace #"^-+|-+$" "")
+      not-empty
+      (or "anon")))
+
+(defn- session-worker-key
+  [model-k sid]
+  (keyword "ferment.model.runtime.session"
+           (str (name model-k) "--" (sanitize-session-token sid))))
+
+(defn- session-worker-config
+  [runtime model-k sid]
+  (when-some [template (model-runtime-template runtime model-k)]
+    (let [sid' (normalize-runtime-session-id sid)
+          sid* (or sid' "session/default")
+          sid-token (sanitize-session-token sid*)
+          worker-id (session-worker-key model-k sid*)
+          worker-name (str (or (:name template) (name model-k) " model runtime")
+                           " [session:" sid-token "]")]
+      (-> template
+          (dissoc :http)
+          (assoc :id worker-id
+                 :name worker-name
+                 :session {:sid (str "ferment-model-runtime/"
+                                     (name model-k)
+                                     "/"
+                                     sid-token)})))))
+
+(defn- runtime-session-service
+  [runtime]
+  (let [svc (when (map? runtime) (:session runtime))]
+    (when (map? svc) svc)))
+
+(defn- touch-runtime-session!
+  [runtime sid model-k]
+  (when-some [service (runtime-session-service runtime)]
+    (try
+      (fsession/open! service sid {:session/meta {:source :model/invoke
+                                                  :model model-k}})
+      (catch Throwable _ nil))))
+
+(defn- freeze-runtime-session!
+  [runtime sid model-k reason]
+  (when-some [service (runtime-session-service runtime)]
+    (try
+      (fsession/freeze! service sid {:session/meta {:source :model/runtime
+                                                    :reason reason
+                                                    :model model-k}})
+      (catch Throwable _ nil))))
+
+(defn- dissoc-session-entry
+  [registry model-k sid]
+  (let [registry' (update registry model-k #(dissoc (or % {}) sid))]
+    (if (seq (get registry' model-k))
+      registry'
+      (dissoc registry' model-k))))
+
+(defn- stop-session-entry!
+  [runtime model-k sid {:keys [worker-state]} reason]
+  (when (map? worker-state)
+    (try
+      (stop-runtime-worker (:id worker-state) worker-state)
+      (catch Throwable _ nil)))
+  (freeze-runtime-session! runtime sid model-k reason)
+  nil)
+
+(defn- touch-session-entry!
+  [registry model-k sid]
+  (swap! registry assoc-in [model-k sid :last-used-ms] (now-ms))
+  (get-in @registry [model-k sid]))
+
+(defn- drop-session-worker!
+  [runtime model-k sid reason]
+  (when-some [registry (runtime-session-registry runtime)]
+    (when-some [entry (get-in @registry [model-k sid])]
+      (swap! registry dissoc-session-entry model-k sid)
+      (stop-session-entry! runtime model-k sid entry reason))
+    nil))
+
+(defn expire-session-workers!
+  "Stops and removes idle session workers according to runtime TTL policy."
+  [runtime]
+  (when (session-mode-enabled? runtime)
+    (when-some [registry (runtime-session-registry runtime)]
+      (let [ttl-ms (session-idle-ttl-ms runtime)]
+        (when (pos? ttl-ms)
+          (let [now (now-ms)
+                victims (for [[model-k sid->entry] @registry
+                              [sid entry] sid->entry
+                              :let [last-used-ms (long (or (:last-used-ms entry) 0))]
+                              :when (> (- now last-used-ms) ttl-ms)]
+                          [model-k sid entry])]
+            (doseq [[model-k sid entry] victims]
+              (swap! registry dissoc-session-entry model-k sid)
+              (stop-session-entry! runtime model-k sid entry :session/ttl-expired)))))))
+  runtime)
+
+(defn- enforce-session-max-per-model!
+  [runtime model-k keep-sid]
+  (when-some [registry (runtime-session-registry runtime)]
+    (let [max-per-model (session-max-per-model runtime)
+          sid->entry (get @registry model-k)
+          overflow (- (count sid->entry) max-per-model)]
+      (when (pos? overflow)
+        (let [victims (->> sid->entry
+                           (remove (fn [[sid _]] (= sid keep-sid)))
+                           (sort-by (fn [[_ entry]] (long (or (:last-used-ms entry) 0))))
+                           (take overflow))]
+          (doseq [[sid entry] victims]
+            (swap! registry dissoc-session-entry model-k sid)
+            (stop-session-entry! runtime model-k sid entry :session/max-per-model)))))))
+
+(defn- ensure-session-worker!
+  [runtime model-k sid]
+  (when (and (session-mode-enabled? runtime)
+             (keyword? model-k))
+    (when-some [sid' (normalize-runtime-session-id sid)]
+      (when-some [registry (runtime-session-registry runtime)]
+        (expire-session-workers! runtime)
+        (let [lock (runtime-session-lock runtime)]
+          (locking lock
+            (if-let [entry (get-in @registry [model-k sid'])]
+              (touch-session-entry! registry model-k sid')
+              (when-some [cfg (session-worker-config runtime model-k sid')]
+                (touch-runtime-session! runtime sid' model-k)
+                (let [worker-state (init-runtime-worker (:id cfg) cfg)
+                      entry {:model-key model-k
+                             :session/id sid'
+                             :worker-state worker-state
+                             :last-used-ms (now-ms)}]
+                  (swap! registry assoc-in [model-k sid'] entry)
+                  (enforce-session-max-per-model! runtime model-k sid')
+                  entry)))))))))
+
+(defn session-workers-state
+  "Returns operator-friendly map of runtime session workers."
+  [runtime]
+  (if-some [registry (runtime-session-registry runtime)]
+    (into {}
+          (for [[model-k sid->entry] @registry]
+            [model-k
+             (into {}
+                   (for [[sid {:keys [worker-state last-used-ms]}] sid->entry]
+                     [sid {:last-used-ms last-used-ms
+                           :worker-id (or (:id worker-state)
+                                          (some-> worker-state :config :id))
+                           :running? (some? (:worker worker-state))}]))]))
+    {}))
+
+(defn freeze-session-worker!
+  "Stops session worker for model/session pair and marks runtime session as frozen."
+  [runtime model-id session-id]
+  (let [model-k (normalize-model-key model-id)
+        sid     (normalize-runtime-session-id session-id)]
+    (when (and (keyword? model-k) sid)
+      (drop-session-worker! runtime model-k sid :session/manual-freeze))
+    {:ok? true
+     :model model-k
+     :session/id sid}))
+
+(defn thaw-session-worker!
+  "Ensures session worker for model/session pair exists and is ready."
+  [runtime model-id session-id]
+  (let [model-k (normalize-model-key model-id)
+        sid     (normalize-runtime-session-id session-id)
+        entry   (when (and (keyword? model-k) sid)
+                  (ensure-session-worker! runtime model-k sid))]
+    {:ok? (some? entry)
+     :model model-k
+     :session/id sid
+     :worker-id (some-> entry :worker-state :id)}))
+
+(defn- restartable-invoke-error?
+  [response]
+  (let [details (when (map? response) (:details response))]
+    (or (nil? response)
+        (and (map? response)
+             (= false (:ok? response))
+             (= :invoke-failed (:error response))
+             (contains? #{:runtime-process-missing
+                          :runtime-process-dead
+                          :runtime-process-io-unavailable}
+                        (:error details))))))
+
+(defn invoke-model!
+  "Invokes model runtime worker with optional session-aware worker lifecycle.
+
+  Returns worker response map (the same shape as `:invoke` command response)
+  or nil when runtime worker is unavailable."
+  ([runtime model-id payload]
+   (invoke-model! runtime model-id payload nil))
+  ([runtime model-id payload opts]
+   (let [opts'    (if (map? opts) opts {})
+         model-k  (normalize-model-key model-id)
+         sid      (normalize-runtime-session-id (or (:session/id opts')
+                                                   (:session-id opts')))
+         _        (expire-session-workers! runtime)
+         session-entry (when sid (ensure-session-worker! runtime model-k sid))
+         worker-state  (or (:worker-state session-entry)
+                           (some-> (model-entry runtime model-k) :runtime))
+         worker        (some-> worker-state :worker)
+         invoke!       (fn [wrk]
+                         (when wrk
+                           (command-bot-worker! wrk :invoke payload)))
+         response0     (invoke! worker)
+         response      (if (and sid (restartable-invoke-error? response0))
+                         (do
+                           (drop-session-worker! runtime model-k sid :session/restart)
+                           (when-some [retry-entry (ensure-session-worker! runtime model-k sid)]
+                             (invoke! (some-> retry-entry :worker-state :worker))))
+                         response0)]
+     (when (and sid (some? response))
+       (touch-runtime-session! runtime sid model-k)
+       (when-some [registry (runtime-session-registry runtime)]
+         (touch-session-entry! registry model-k sid)))
+     response)))
+
 (defn model-id
   "Returns model identifier for grouped model key."
   [runtime model-k default-id]
@@ -715,7 +1279,7 @@
   "Resolves voice model identifier from runtime config."
   [runtime]
   (or (model-id runtime :ferment.model/voice nil)
-      "SpeakLeash/bielik-1.5b-instruct"))
+      "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"))
 
 (defn meta-id
   "Resolves meta/router model identifier from runtime config."

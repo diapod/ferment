@@ -11,14 +11,21 @@
 (defn preconfigure-runtime
   "Pre-configuration hook for runtime config branch."
   [_k config]
-  config)
+  (let [cfg (if (map? config) config {})]
+    (-> cfg
+        (update :ferment.model.session/enabled? #(if (nil? %) true (boolean %)))
+        (update :ferment.model.session/idle-ttl-ms #(or % 900000))
+        (update :ferment.model.session/max-per-model #(or % 4)))))
 
 (defn init-runtime
   "Initialization hook for runtime config branch.
 
   Runtime branch is configuration-oriented and passed through unchanged."
   [_k config]
-  config)
+  (let [cfg (preconfigure-runtime _k config)]
+    (assoc cfg
+           :ferment.model.session/workers (atom {})
+           :ferment.model.session/lock (Object.))))
 
 (defn stop-runtime
   "Stop hook for runtime config branch."
