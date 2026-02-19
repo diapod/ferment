@@ -39,12 +39,12 @@
 (def ^:private insert-user-sql
   (str "INSERT INTO users"
        " (email, account_type, password_suite_id, password, login_attempts, soft_locked, locked)"
-       " VALUES (?, ?, ?, CAST(? AS JSON), 0, NULL, NULL)"))
+       " VALUES (?, ?, ?, ?, 0, NULL, NULL)"))
 
 (def ^:private update-password-sql
   (str "UPDATE users"
        " SET password_suite_id = ?,"
-       "     password = CAST(? AS JSON),"
+       "     password = ?,"
        "     login_attempts = 0,"
        "     soft_locked = NULL,"
        "     locked = NULL"
@@ -55,7 +55,7 @@
 
 (def ^:private insert-suite-sql
   (str "INSERT INTO password_suites (suite)"
-       " VALUES (CAST(? AS JSON))"
+       " VALUES (?)"
        " ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)"))
 
 (def ^:private select-last-id-sql

@@ -138,6 +138,11 @@
 ;; System handlers
 ;;
 
+;; Oplog aggregate is a pure config/value branch.
+;; Concrete logger workers (e.g. :ferment.oplog.auth/log) are initialized in
+;; `ferment.oplog` and `ferment.oplog.auth`.
+(derive :ferment.logging/oplog :ferment.system/value)
+
 (defn prep-context-transformer
   [m]
   (when m (map/map-keys var/deref-symbol m)))

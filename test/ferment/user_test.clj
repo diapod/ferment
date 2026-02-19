@@ -47,7 +47,7 @@
   [db _connectable query & _opts]
   (let [sql (first query)]
     (cond
-      (= sql "INSERT INTO password_suites (suite) VALUES (CAST(? AS JSON)) ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)")
+      (= sql "INSERT INTO password_suites (suite) VALUES (?) ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)")
       (let [suite (second query)
             existing-id (get @(:suites* db) suite)
             id (or existing-id (next-id! db))]
@@ -55,7 +55,7 @@
         (reset! (:last-id* db) id)
         [{:next.jdbc/update-count 1}])
 
-      (= sql "INSERT INTO users (email, account_type, password_suite_id, password, login_attempts, soft_locked, locked) VALUES (?, ?, ?, CAST(? AS JSON), 0, NULL, NULL)")
+      (= sql "INSERT INTO users (email, account_type, password_suite_id, password, login_attempts, soft_locked, locked) VALUES (?, ?, ?, ?, 0, NULL, NULL)")
       (let [[_ email account-type suite-id password] query
             id (next-id! db)]
         (swap! (:users* db) assoc id {:id id
@@ -69,7 +69,7 @@
         (reset! (:last-id* db) id)
         [{:next.jdbc/update-count 1}])
 
-      (= sql "UPDATE users SET password_suite_id = ?,     password = CAST(? AS JSON),     login_attempts = 0,     soft_locked = NULL,     locked = NULL WHERE id = ?")
+      (= sql "UPDATE users SET password_suite_id = ?,     password = ?,     login_attempts = 0,     soft_locked = NULL,     locked = NULL WHERE id = ?")
       (let [[_ suite-id password id] query
             id (long id)]
         (if (contains? @(:users* db) id)
