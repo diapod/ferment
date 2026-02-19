@@ -44,26 +44,31 @@
     (.getLocalPort s)))
 
 (defn- http-post-json
-  [url payload]
-  (let [conn
-        (doto (.openConnection (java.net.URL. url))
-          (.setRequestMethod "POST")
-          (.setDoOutput true)
-          (.setConnectTimeout 2000)
-          (.setReadTimeout 5000)
-          (.setRequestProperty "Content-Type" "application/json"))]
-    (with-open [w (io/writer (.getOutputStream conn) :encoding "UTF-8")]
-      (.write w (json/generate-string payload)))
-    (let [status (.getResponseCode conn)
-          stream (if (<= 200 status 399)
-                   (.getInputStream conn)
-                   (.getErrorStream conn))
-          body (if stream
-                 (with-open [in stream]
-                   (slurp in :encoding "UTF-8"))
-                 "")]
-      {:status status
-       :body body})))
+  ([url payload]
+   (http-post-json url payload nil))
+  ([url payload headers]
+   (let [conn
+         (doto (.openConnection (java.net.URL. url))
+           (.setRequestMethod "POST")
+           (.setDoOutput true)
+           (.setConnectTimeout 2000)
+           (.setReadTimeout 5000)
+           (.setRequestProperty "Content-Type" "application/json"))]
+     (doseq [[k v] (or headers {})]
+       (when (and (some? k) (some? v))
+         (.setRequestProperty conn (str k) (str v))))
+     (with-open [w (io/writer (.getOutputStream conn) :encoding "UTF-8")]
+       (.write w (json/generate-string payload)))
+     (let [status (.getResponseCode conn)
+           stream (if (<= 200 status 399)
+                    (.getInputStream conn)
+                    (.getErrorStream conn))
+           body (if stream
+                  (with-open [in stream]
+                    (slurp in :encoding "UTF-8"))
+                  "")]
+       {:status status
+        :body body}))))
 
 (defn- http-post-edn
   [url payload]
@@ -313,6 +318,7 @@
                         {:host "127.0.0.1"
                          :port port
                          :runtime runtime
+                         :auth (:auth runtime)
                          :models {}})
           url (str "http://127.0.0.1:" port "/v1/act")]
       (try
@@ -346,6 +352,45 @@
             (is (= "input/invalid" (get-in bad-body [:error :type])))))
         (finally
           (fhttp/stop-http :ferment.http/default server-state))))))
+
+(deftest http-basic-auth-forwards-session-id-into-auth-flow
+  (testing "authorize-request forwards session id (payload/header) and session service into auth-user/authenticate-password."
+    (let [runtime {:session {:open! (fn [sid _opts] {:session/id sid})}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :operator}}
+          auth-calls (atom [])]
+      (with-redefs-fn
+        {#'ferment.http/parse-basic-credentials
+         (fn [_exchange]
+           {:login "diag@example.com"
+            :password "secret"})
+         #'ferment.http/report-auth!
+         (fn [& _] nil)
+         #'ferment.auth.user/authenticate-password
+         (fn [source login password account-type opts]
+           (swap! auth-calls conj {:source source
+                                   :login login
+                                   :password password
+                                   :account-type account-type
+                                   :opts opts})
+           {:ok? true
+            :user {:user/id 91
+                   :user/email login}})}
+        (fn []
+          (is (nil? (#'ferment.http/authorize-request runtime nil {:session/id "sid-payload"})))
+          (with-redefs-fn
+            {#'ferment.http/session-id-from-header
+             (fn [_exchange] "sid-header")}
+            (fn []
+              (is (nil? (#'ferment.http/authorize-request runtime nil {})))))
+          (is (= 2 (count @auth-calls)))
+          (is (= :auth/source (:source (first @auth-calls))))
+          (is (= :operator (:account-type (first @auth-calls))))
+          (is (= "sid-payload" (get-in (first @auth-calls) [:opts :session/id])))
+          (is (= "sid-header" (get-in (second @auth-calls) [:opts :session/id])))
+          (is (= (:session runtime)
+                 (get-in (first @auth-calls) [:opts :session/service]))))))))
 
 (deftest http-v1-act-collects-telemetry-and-exposes-diag-endpoint
   (testing "HTTP bridge aggregates telemetry for /v1/act and exposes it via /diag/telemetry."

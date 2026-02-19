@@ -575,6 +575,13 @@
 
       :else {:prompt body})))
 
+(defn- safe-decode-request-body
+  [^String body ctype]
+  (try
+    (decode-request-body body ctype)
+    (catch Throwable _
+      {})))
+
 (defn- encode-response
   [data]
   (json/generate-string
@@ -599,6 +606,31 @@
 (defn- auth-source
   [runtime]
   (get-in runtime [:auth :source]))
+
+(defn- auth-session-service
+  [runtime]
+  (let [svc (when (map? runtime) (:session runtime))]
+    (when (and (map? svc) (fn? (:open! svc)))
+      svc)))
+
+(defn- session-id-from-header
+  [^HttpExchange exchange]
+  (let [headers (.getRequestHeaders exchange)]
+    (or (some-> headers (.getFirst "X-Session-Id") trim-s)
+        (some-> headers (.getFirst "Session-Id") trim-s))))
+
+(defn- auth-session-id
+  [^HttpExchange exchange payload]
+  (or (session-id-from-payload payload)
+      (session-id-from-header exchange)))
+
+(defn- auth-options
+  [runtime ^HttpExchange exchange payload]
+  (let [sid      (auth-session-id exchange payload)
+        service  (auth-session-service runtime)]
+    (cond-> {}
+      sid (assoc :session/id sid)
+      service (assoc :session/service service))))
 
 (defn- normalize-ipv6-str
   [v]
@@ -665,7 +697,9 @@
           :message "HTTP authentication enabled, but auth source is missing."}})
 
 (defn- authorize-request
-  [runtime exchange]
+  ([runtime exchange]
+   (authorize-request runtime exchange nil))
+  ([runtime exchange payload]
   (when (auth-enabled? runtime)
     (if-not (some? (auth-source runtime))
       (do
@@ -680,7 +714,8 @@
                       (auth-source runtime)
                       login
                       password
-                      (auth-account-type runtime))]
+                      (auth-account-type runtime)
+                      (auth-options runtime exchange payload))]
           (if (:ok? result)
             (do
               (report-auth! runtime exchange
@@ -702,7 +737,7 @@
                          :success false
                          :level :notice
                          :message "Missing or invalid Authorization header."})
-          (unauthorized-response runtime "Missing or invalid Authorization header."))))))
+          (unauthorized-response runtime "Missing or invalid Authorization header.")))))))
 
 (defn- write-response!
   ([^HttpExchange exchange status ^String body]
@@ -767,21 +802,22 @@
                                             :method-not-allowed
                                             "Only POST is supported for this endpoint."
                                             {:allowed ["POST"]})))
-          (if-some [{:keys [status body headers]} (authorize-request runtime exchange)]
-            (write-response! exchange status (encode-response body) headers)
-            (try
-              (let [ctype   (content-type exchange)
-                    body    (read-body exchange)
-                    payload (decode-request-body body ctype)
-                    {:keys [status body]} (invoke-act runtime payload telemetry)]
-                (write-response! exchange status (encode-response body)))
-              (catch Throwable t
-                (write-response! exchange
-                                 400
-                                 (encode-response
-                                  (error-envelope nil
-                                                  :input/invalid
-                                                  (.getMessage t))))))))))))
+          (let [ctype         (content-type exchange)
+                body-str      (read-body exchange)
+                auth-payload  (safe-decode-request-body body-str ctype)]
+            (if-some [{:keys [status body headers]} (authorize-request runtime exchange auth-payload)]
+              (write-response! exchange status (encode-response body) headers)
+              (try
+                (let [payload (decode-request-body body-str ctype)
+                      {:keys [status body]} (invoke-act runtime payload telemetry)]
+                  (write-response! exchange status (encode-response body)))
+                (catch Throwable t
+                  (write-response! exchange
+                                   400
+                                   (encode-response
+                                    (error-envelope nil
+                                                    :input/invalid
+                                                    (.getMessage t)))))))))))))
 
 (defn- telemetry-handler
   [telemetry]
@@ -809,20 +845,21 @@
                            (encode-response {:ok? false
                                              :error :method-not-allowed
                                              :allowed ["POST"]}))
-          (if-some [{:keys [status body headers]} (authorize-request runtime exchange)]
-            (write-response! exchange status (encode-response body) headers)
-            (try
-              (let [ctype   (content-type exchange)
-                    body    (read-body exchange)
-                    payload (decode-request-body body ctype)
-                    {:keys [status body]} (session-action-response runtime payload)]
-                (write-response! exchange status (encode-response body)))
-              (catch Throwable t
-                (write-response! exchange
-                                 500
-                                 (encode-response {:ok? false
-                                                   :error :runtime/internal
-                                                   :message (.getMessage t)}))))))))))
+          (let [ctype         (content-type exchange)
+                body-str      (read-body exchange)
+                auth-payload  (safe-decode-request-body body-str ctype)]
+            (if-some [{:keys [status body headers]} (authorize-request runtime exchange auth-payload)]
+              (write-response! exchange status (encode-response body) headers)
+              (try
+                (let [payload (decode-request-body body-str ctype)
+                      {:keys [status body]} (session-action-response runtime payload)]
+                  (write-response! exchange status (encode-response body)))
+                (catch Throwable t
+                  (write-response! exchange
+                                   500
+                                   (encode-response {:ok? false
+                                                     :error :runtime/internal
+                                                     :message (.getMessage t)})))))))))))
 
 (defn- health-handler
   [route-count]

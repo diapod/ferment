@@ -290,24 +290,61 @@
         ec  (.waitFor p)]
     {:exit ec :out out :err err}))
 
-(defn- cap-id->model-key
-  [cap-id intent]
-  (or (case cap-id
-        :llm/code :ferment.model/coding
-        :llm/solver :ferment.model/solver
-        :llm/meta :ferment.model/meta
-        :llm/judge :ferment.model/meta
-        :llm/voice :ferment.model/voice
-        nil)
-      (if (= :text/respond intent)
-        :ferment.model/voice
-        (if (#{:code/generate :code/patch :code/explain :code/review} intent)
-          :ferment.model/coding
-          :ferment.model/solver))))
+(defn- resolver-config
+  [runtime resolver]
+  (or resolver
+      (some-> (runtime-config runtime) :resolver)))
+
+(defn- resolver-routing
+  [runtime resolver]
+  (or (some-> (resolver-config runtime resolver) :routing)
+      {}))
+
+(defn- resolver-capability
+  [runtime resolver cap-id]
+  (let [resolver' (resolver-config runtime resolver)]
+    (or (some-> resolver' :caps/by-id (get cap-id))
+        (some (fn [cap]
+                (when (= cap-id (:cap/id cap))
+                  cap))
+              (:caps resolver')))))
+
+(defn- default-model-key-by-intent
+  [intent]
+  (cond
+    (= :text/respond intent)
+    :ferment.model/voice
+
+    (#{:code/generate :code/patch :code/explain :code/review} intent)
+    :ferment.model/coding
+
+    (#{:route/decide :context/summarize :eval/grade} intent)
+    :ferment.model/meta
+
+    :else
+    :ferment.model/solver))
+
+(defn- resolve-model-key
+  [runtime resolver cap-id intent]
+  (or (some-> (resolver-capability runtime resolver cap-id) :dispatch/model-key)
+      (some-> (resolver-routing runtime resolver) :cap->model-key (get cap-id))
+      (some-> (resolver-routing runtime resolver) :intent->model-key (get intent))
+      (default-model-key-by-intent intent)))
+
+(defn- model-id-by-key
+  [runtime model-k]
+  (case model-k
+    :ferment.model/coding (model/coding-id runtime)
+    :ferment.model/solver (model/solver-id runtime)
+    :ferment.model/meta   (model/meta-id runtime)
+    :ferment.model/voice  (model/voice-id runtime)
+    (or (when (keyword? model-k)
+          (model/model-id runtime model-k nil))
+        (model/solver-id runtime))))
 
 (defn- model-runtime-cfg
-  [runtime cap-id intent]
-  (let [model-k (cap-id->model-key cap-id intent)]
+  [runtime resolver cap-id intent]
+  (let [model-k (resolve-model-key runtime resolver cap-id intent)]
     (some-> (model/model-entry runtime model-k)
             :runtime)))
 
@@ -357,11 +394,11 @@
   "Model generator (HF/MLX command backend, mock-aware).
 
   Name kept for backward compatibility in tests."
-  [{:keys [runtime cap-id intent model prompt system mode session-id]}]
+  [{:keys [runtime resolver cap-id intent model prompt system mode session-id]}]
   (if (= :mock mode)
     {:response (mock-llm-response {:prompt (compose-prompt system prompt)})
      :raw {:mode :mock}}
-    (let [model-k (cap-id->model-key cap-id intent)
+    (let [model-k (resolve-model-key runtime resolver cap-id intent)
           invoke-response (when model-k
                             (model/invoke-model!
                              runtime
@@ -387,7 +424,7 @@
                :invoke-response invoke-response}}
 
         :else
-        (let [runtime-cfg (model-runtime-cfg runtime cap-id intent)
+        (let [runtime-cfg (model-runtime-cfg runtime resolver cap-id intent)
               command     (or (seq (:command runtime-cfg))
                               ["mlx_lm.chat" "--model" (str model)])
               env         (or (:env runtime-cfg) {})
@@ -484,33 +521,12 @@
     (:route/decide :context/summarize :eval/grade) :router
     :voice))
 
-(defn- cap-id->role
-  [cap-id intent]
-  (or (case cap-id
-        :llm/code  :coder
-        :llm/solver :solver
-        :llm/meta  :router
-        :llm/judge :router
-        :llm/voice :voice
-        :llm/mock  :router
-        nil)
+(defn- resolve-role
+  [runtime resolver cap-id intent]
+  (or (some-> (resolver-capability runtime resolver cap-id) :dispatch/role)
+      (some-> (resolver-routing runtime resolver) :cap->role (get cap-id))
+      (some-> (resolver-routing runtime resolver) :intent->role (get intent))
       (intent->role intent)))
-
-(defn- capability-model-id
-  [runtime cap-id intent]
-  (or (case cap-id
-        :llm/code  (model/coding-id runtime)
-        :llm/solver (model/solver-id runtime)
-        :llm/meta  (model/meta-id runtime)
-        :llm/judge (model/meta-id runtime)
-        :llm/voice (model/voice-id runtime)
-        :llm/mock  "mock/model"
-        nil)
-      (if (= :text/respond intent)
-        (model/voice-id runtime)
-        (if (#{:code/generate :code/patch :code/explain :code/review} intent)
-          (model/coding-id runtime)
-          (model/solver-id runtime)))))
 
 (defn- input->prompt
   [input]
@@ -528,10 +544,11 @@
   `:value`, `:plan` or `:stream` depending on the configured parser."
   [runtime {:keys [role intent cap-id model system prompt input temperature
                    max-attempts result-parser context constraints done budget effects
-                   request-id trace proto session-version]
+                   request-id trace proto session-version resolver]
             :as opts}]
   (let [mode (llm-mode runtime)
         protocol (runtime-protocol runtime)
+        resolver' (resolver-config runtime resolver)
         input' (if (map? input)
                  input
                  {:prompt (or prompt "")})
@@ -569,6 +586,7 @@
         invoke-fn (fn [request* attempt-no]
                     (let [result (ollama-generate! {:model model
                                                     :runtime runtime
+                                                    :resolver resolver'
                                                     :cap-id cap-id
                                                     :intent intent
                                                     :system system'
@@ -629,10 +647,11 @@
     (let [intent  (:intent call-node)
           cap-id  (or (:cap/id call-node)
                       (workflow/resolve-capability-id resolver call-node))
-          role    (or (:role call-node) (cap-id->role cap-id intent))
+          role    (or (:role call-node) (resolve-role runtime resolver cap-id intent))
           prompt  (input->prompt (:input call-node))
+          model-k (resolve-model-key runtime resolver cap-id intent)
           model   (or (:model call-node)
-                      (capability-model-id runtime cap-id intent))
+                      (model-id-by-key runtime model-k))
           system  (:system call-node)
           temp    (if (contains? call-node :temperature)
                     (:temperature call-node)
@@ -656,7 +675,8 @@
                            :effects (:effects call-node)
                            :temperature temp
                            :max-attempts (:max-attempts call-node)
-                           :result-parser (:result-parser call-node)}))))
+                           :result-parser (:result-parser call-node)
+                           :resolver resolver}))))
 
 (defn- judge-score-from-output
   [out score-path]

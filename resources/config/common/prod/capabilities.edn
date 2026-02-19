@@ -7,6 +7,8 @@
   :cap/intents   #{:text/respond}
   :cap/can-produce #{:value}
   :cap/effects-allowed #{:none}
+  :dispatch/role :voice
+  :dispatch/model-key :ferment.model/voice
   :io/in-schema  :req/text
   :io/out-schema :res/text
   :dispatch/tag  :voice}
@@ -17,6 +19,8 @@
   :cap/intents   #{:code/generate :code/patch :code/explain :code/review}
   :cap/can-produce #{:value :plan}
   :cap/effects-allowed #{:none}
+  :dispatch/role :coder
+  :dispatch/model-key :ferment.model/coding
   :io/in-schema  :req/code
   :io/out-schema :res/patch+tests
   :dispatch/tag  :code}
@@ -27,6 +31,8 @@
   :cap/intents   #{:problem/solve}
   :cap/can-produce #{:value :plan}
   :cap/effects-allowed #{:none}
+  :dispatch/role :solver
+  :dispatch/model-key :ferment.model/solver
   :io/in-schema  :req/problem
   :io/out-schema :res/problem
   :dispatch/tag  :solver}
@@ -37,6 +43,8 @@
   :cap/intents   #{:route/decide :context/summarize}
   :cap/can-produce #{:value :plan}
   :cap/effects-allowed #{:none}
+  :dispatch/role :router
+  :dispatch/model-key :ferment.model/meta
   :io/in-schema  :req/meta
   :io/out-schema :res/meta
   :dispatch/tag  :meta}
@@ -47,6 +55,8 @@
   :cap/intents   #{:eval/grade}
   :cap/can-produce #{:value}
   :cap/effects-allowed #{:none}
+  :dispatch/role :router
+  :dispatch/model-key :ferment.model/meta
   :io/in-schema  :req/eval
   :io/out-schema :res/eval
   :dispatch/tag  :judge}
@@ -60,6 +70,8 @@
                    :eval/grade}
   :cap/can-produce #{:value :plan}
   :cap/effects-allowed #{:none}
+  :dispatch/role :router
+  :dispatch/model-key :ferment.model/meta
   :io/in-schema  :req/any
   :io/out-schema :res/any
   :dispatch/tag  :mock}

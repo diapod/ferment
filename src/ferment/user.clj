@@ -76,6 +76,26 @@
        "     END"
        " WHERE id = ?"))
 
+(def ^:private unlock-user-by-id-sql
+  (str "UPDATE users"
+       " SET login_attempts = 0,"
+       "     soft_locked = NULL,"
+       "     locked = NULL"
+       " WHERE id = ?"))
+
+(def ^:private soft-lock-user-by-id-sql
+  (str "UPDATE users"
+       " SET soft_locked = CURRENT_TIMESTAMP(6)"
+       " WHERE id = ?"))
+
+(def ^:private hard-lock-user-by-id-sql
+  (str "UPDATE users"
+       " SET locked = CURRENT_TIMESTAMP(6)"
+       " WHERE id = ?"))
+
+(def ^:private lock-kinds
+  #{:soft :hard})
+
 (defn- parse-email
   [email]
   (some-> email identity/preparse-email))
@@ -148,6 +168,12 @@
   [identity-type]
   (some-> identity-type some-keyword name keyword))
 
+(defn- normalize-lock-kind
+  [lock-kind]
+  (let [k (some-> lock-kind some-keyword name keyword)]
+    (when (contains? lock-kinds k)
+      k)))
+
 (defn- normalize-id
   [user-id]
   (when-some [user-id' (safe-parse-long user-id)]
@@ -200,6 +226,13 @@
   (long (or (some-> execute-result first :next.jdbc/update-count)
             0)))
 
+(defn- result-id
+  [v]
+  (cond
+    (map? v) (safe-parse-long (:id v))
+    (sequential? v) (safe-parse-long (first v))
+    :else (safe-parse-long v)))
+
 (defn- user-public
   [row]
   (when (map? row)
@@ -207,6 +240,12 @@
      :user/email        (:email row)
      :user/account-type (some-> (:account_type row) some-keyword)
      :auth/locked?      (boolean (or (:locked row) (:soft_locked row)))}))
+
+(defn- user-identity
+  [row]
+  {:user/id           (:id row)
+   :user/email        (:email row)
+   :user/account-type (some-> (:account_type row) some-keyword)})
 
 (defn- evict-user-caches!
   [user-id email]
@@ -224,7 +263,7 @@
   (when-some [user-id' (normalize-id user-id)]
     (let [row    (get-user-by-id connectable user-id')
           email' (:email row)
-          result (jdbc/execute! connectable [update-login-success-sql user-id'])
+          result (db/<exec! connectable update-login-success-sql [:users/id user-id'])
           ok?    (pos? (update-count result))]
       (evict-user-caches! user-id' email')
       ok?)))
@@ -238,8 +277,9 @@
      (let [max-attempts' (long (max 1 (or (safe-parse-long max-attempts) 3)))
            row           (get-user-by-id connectable user-id')
            email'        (:email row)
-           result        (jdbc/execute! connectable
-                                        [update-login-failed-sql max-attempts' user-id'])
+           result        (db/<exec! connectable update-login-failed-sql
+                                    max-attempts'
+                                    [:users/id user-id'])
            ok?           (pos? (update-count result))]
        (evict-user-caches! user-id' email')
        ok?))))
@@ -249,13 +289,13 @@
   [connectable user-id]
   (when-some [user-id' (safe-parse-long user-id)]
     (when (pos-int? user-id')
-      (jdbc/execute-one! connectable [select-user-by-id-sql (long user-id')] db/opts-simple-map))))
+      (db/<exec-one! connectable select-user-by-id-sql [:users/id (long user-id')]))))
 
 (defn get-user-by-email
   "Returns user row by e-mail (normalized) or `nil`."
   [connectable email]
   (when-some [email' (normalize-email email)]
-    (jdbc/execute-one! connectable [select-user-by-email-sql email'] db/opts-simple-map)))
+    (db/<exec-one! connectable select-user-by-email-sql [:users/email email'])))
 
 (defn get-user
   "Returns user row by selector (`id`, e-mail string, or map with `:id`/`:email`)."
@@ -288,10 +328,8 @@
 (defmethod query-id :email
   [connectable _identity-type user-identity]
   (when-some [email' (normalize-email user-identity)]
-    (some-> (jdbc/execute-one! connectable
-                               [select-id-by-email-sql email']
-                               db/opts-simple-vec)
-            first
+    (some-> (db/<exec-one! connectable select-id-by-email-sql [:users/email email'])
+            result-id
             long)))
 
 (defmethod query-id :default
@@ -404,8 +442,8 @@
     (pos-int? suite) (long suite)
     :else
     (jdbc/with-transaction [tx connectable]
-      (jdbc/execute! tx [insert-suite-sql suite])
-      (some-> (jdbc/execute-one! tx [select-last-id-sql] db/opts-simple-map)
+      (db/<exec! tx insert-suite-sql suite)
+      (some-> (db/<exec-one! tx select-last-id-sql)
               :id
               long))))
 
@@ -456,17 +494,17 @@
            (jdbc/with-transaction [tx db-src]
              (if (get-user-by-email tx email')
                {:ok?   false
-                :error :user/already-exists
-                :email email'}
+               :error :user/already-exists
+               :email email'}
                (if-some [{:keys [password-suite-id password]}
                          (generate-password-data tx auth-config password')]
                  (do
-                   (jdbc/execute! tx [insert-user-sql
-                                      email'
-                                      at-name
-                                      (long password-suite-id)
-                                      password])
-                   (let [id (some-> (jdbc/execute-one! tx [select-last-id-sql] db/opts-simple-map)
+                   (db/<exec! tx insert-user-sql
+                              [:users/email email']
+                              [:users/account-type at-name]
+                              [:users/password-suite-id (long password-suite-id)]
+                              [:users/password password])
+                   (let [id (some-> (db/<exec-one! tx select-last-id-sql)
                                     :id
                                     long)]
                      (evict-user-caches! id email')
@@ -512,10 +550,10 @@
                                       auth-config)]
                  (if-some [{:keys [password-suite-id password]}
                            (generate-password-data tx auth-config' new-password')]
-                   (let [result (jdbc/execute! tx [update-password-sql
-                                                   (long password-suite-id)
-                                                   password
-                                                   (long (:id user-row))])
+                   (let [result (db/<exec! tx update-password-sql
+                                          [:users/password-suite-id (long password-suite-id)]
+                                          [:users/password password]
+                                          [:users/id (long (:id user-row))])
                          n      (update-count result)]
                      (evict-user-caches! (:id user-row) (:email user-row))
                      {:ok? (pos? n)
@@ -527,6 +565,100 @@
                     :error :auth/password-generation-failed}))
                {:ok? false
                 :error :user/not-found}))))))))
+
+(defn reset-login-attempts!
+  "Resets login attempts and soft lock for user identified by selector."
+  [auth-source selector]
+  (let [auth-config (resolve-auth-config auth-source nil)
+        db-src      (resolve-db auth-source nil auth-config)]
+    (cond
+      (nil? auth-config)
+      {:ok? false :error :auth/not-configured}
+
+      (nil? db-src)
+      {:ok? false :error :db/not-configured}
+
+      :else
+      (jdbc/with-transaction [tx db-src]
+        (if-some [user-row (get-user tx selector)]
+          (let [result (db/<exec! tx update-login-success-sql
+                                  [:users/id (long (:id user-row))])
+                n      (update-count result)]
+            (evict-user-caches! (:id user-row) (:email user-row))
+            {:ok?      (pos? n)
+             :updated? (pos? n)
+             :user     (user-identity user-row)})
+          {:ok? false
+           :error :user/not-found})))))
+
+(defn unlock-user!
+  "Removes hard/soft lock state and clears attempts for user identified by selector."
+  [auth-source selector]
+  (let [auth-config (resolve-auth-config auth-source nil)
+        db-src      (resolve-db auth-source nil auth-config)]
+    (cond
+      (nil? auth-config)
+      {:ok? false :error :auth/not-configured}
+
+      (nil? db-src)
+      {:ok? false :error :db/not-configured}
+
+      :else
+      (jdbc/with-transaction [tx db-src]
+        (if-some [user-row (get-user tx selector)]
+          (let [result (db/<exec! tx unlock-user-by-id-sql
+                                  [:users/id (long (:id user-row))])
+                n      (update-count result)]
+            (evict-user-caches! (:id user-row) (:email user-row))
+            {:ok?      (pos? n)
+             :updated? (pos? n)
+             :user     (user-identity user-row)
+             :auth/locked? false})
+          {:ok? false
+           :error :user/not-found})))))
+
+(defn lock-user!
+  "Applies lock state for user identified by selector.
+
+  Lock kind:
+  - `:hard` sets `locked` timestamp
+  - `:soft` sets `soft_locked` timestamp"
+  ([auth-source selector]
+   (lock-user! auth-source selector :hard))
+  ([auth-source selector lock-kind]
+   (let [auth-config (resolve-auth-config auth-source nil)
+         db-src      (resolve-db auth-source nil auth-config)
+         lock-kind'  (normalize-lock-kind lock-kind)]
+     (cond
+       (nil? lock-kind')
+       {:ok? false
+        :error :user/invalid-lock-kind
+        :lock-kind lock-kind
+        :allowed lock-kinds}
+
+       (nil? auth-config)
+       {:ok? false :error :auth/not-configured}
+
+       (nil? db-src)
+       {:ok? false :error :db/not-configured}
+
+       :else
+       (jdbc/with-transaction [tx db-src]
+         (if-some [user-row (get-user tx selector)]
+           (let [lock-sql (case lock-kind'
+                            :soft soft-lock-user-by-id-sql
+                            :hard hard-lock-user-by-id-sql)
+                 result   (db/<exec! tx lock-sql
+                                     [:users/id (long (:id user-row))])
+                 n        (update-count result)]
+             (evict-user-caches! (:id user-row) (:email user-row))
+             {:ok?      (pos? n)
+              :updated? (pos? n)
+              :user     (user-identity user-row)
+              :auth/locked? (pos? n)
+              :auth/lock-kind lock-kind'})
+           {:ok? false
+            :error :user/not-found}))))))
 
 (defn delete-user!
   "Deletes user identified by selector (ID, e-mail, or `{:id ...}`/`{:email ...}`
@@ -541,7 +673,7 @@
       :else
       (jdbc/with-transaction [tx db-src]
         (if-some [user-row (get-user tx selector)]
-          (let [result (jdbc/execute! tx [delete-user-by-id-sql (long (:id user-row))])
+          (let [result (db/<exec! tx delete-user-by-id-sql [:users/id (long (:id user-row))])
                 n      (update-count result)]
             (evict-user-caches! (:id user-row) (:email user-row))
             {:ok?      (pos? n)
@@ -555,3 +687,6 @@
 (def update-password! change-password!)
 (def set-password!    change-password!)
 (def remove-user!     delete-user!)
+(def lock!            lock-user!)
+(def unlock!          unlock-user!)
+(def reset-login!     reset-login-attempts!)

@@ -3,113 +3,24 @@
             [next.jdbc :as jdbc]
             [ferment.auth :as auth]
             [ferment.db :as db]
+            [ferment.test-support.fake-auth-db :as fake-db]
             [ferment.user :as user]))
 
-(defn- make-fake-db
-  []
-  {:users* (atom {})
-   :suites* (atom {})
-   :last-id* (atom 0)})
-
-(defn- next-id!
-  [db]
-  (swap! (:last-id* db) inc))
-
-(defn- fake-execute-one!
-  [db _connectable query & _opts]
-  (let [sql (first query)]
-    (cond
-      (= sql "SELECT LAST_INSERT_ID() AS id")
-      {:id @(:last-id* db)}
-
-      (= sql "SELECT id, email, account_type, password_suite_id, password, login_attempts, soft_locked, locked FROM users WHERE email = ? LIMIT 1")
-      (let [email (second query)]
-        (some (fn [[_ row]]
-                (when (= email (:email row))
-                  row))
-              @(:users* db)))
-
-      (= sql "SELECT id, email, account_type, password_suite_id, password, login_attempts, soft_locked, locked FROM users WHERE id = ? LIMIT 1")
-      (get @(:users* db) (long (second query)))
-
-      (= sql "SELECT id FROM users WHERE email = ? LIMIT 1")
-      (let [email (second query)]
-        (some (fn [[id row]]
-                (when (= email (:email row))
-                  [id]))
-              @(:users* db)))
-
-      :else
-      (throw (ex-info "Unexpected SQL in fake execute-one!."
-                      {:query query})))))
-
-(defn- fake-execute!
-  [db _connectable query & _opts]
-  (let [sql (first query)]
-    (cond
-      (= sql "INSERT INTO password_suites (suite) VALUES (?) ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)")
-      (let [suite (second query)
-            existing-id (get @(:suites* db) suite)
-            id (or existing-id (next-id! db))]
-        (swap! (:suites* db) assoc suite id)
-        (reset! (:last-id* db) id)
-        [{:next.jdbc/update-count 1}])
-
-      (= sql "INSERT INTO users (email, account_type, password_suite_id, password, login_attempts, soft_locked, locked) VALUES (?, ?, ?, ?, 0, NULL, NULL)")
-      (let [[_ email account-type suite-id password] query
-            id (next-id! db)]
-        (swap! (:users* db) assoc id {:id id
-                                      :email email
-                                      :account_type account-type
-                                      :password_suite_id suite-id
-                                      :password password
-                                      :login_attempts 0
-                                      :soft_locked nil
-                                      :locked nil})
-        (reset! (:last-id* db) id)
-        [{:next.jdbc/update-count 1}])
-
-      (= sql "UPDATE users SET password_suite_id = ?,     password = ?,     login_attempts = 0,     soft_locked = NULL,     locked = NULL WHERE id = ?")
-      (let [[_ suite-id password id] query
-            id (long id)]
-        (if (contains? @(:users* db) id)
-          (do
-            (swap! (:users* db) update id assoc
-                   :password_suite_id suite-id
-                   :password password
-                   :login_attempts 0
-                   :soft_locked nil
-                   :locked nil)
-            [{:next.jdbc/update-count 1}])
-          [{:next.jdbc/update-count 0}]))
-
-      (= sql "DELETE FROM users WHERE id = ?")
-      (let [id (long (second query))]
-        (if (contains? @(:users* db) id)
-          (do
-            (swap! (:users* db) dissoc id)
-            [{:next.jdbc/update-count 1}])
-          [{:next.jdbc/update-count 0}]))
-
-      :else
-      (throw (ex-info "Unexpected SQL in fake execute!."
-                      {:query query})))))
-
 (deftest create-or-get-shared-suite-id-is-idempotent
-  (let [fake (make-fake-db)]
+  (let [fake (fake-db/make-db)]
     (with-redefs [jdbc/transact (fn [connectable f _opts] (f connectable))
-                  jdbc/execute! (partial fake-execute! fake)
-                  jdbc/execute-one! (partial fake-execute-one! fake)]
+                  jdbc/execute! (partial fake-db/execute! fake)
+                  jdbc/execute-one! (partial fake-db/execute-one! fake)]
       (is (= 1 (user/create-or-get-shared-suite-id ::db "{\"suite\":1}")))
       (is (= 1 (user/create-or-get-shared-suite-id ::db "{\"suite\":1}")))
       (is (= 1 (count @(:suites* fake)))))))
 
 (deftest create-change-and-delete-user-flow
-  (let [fake (make-fake-db)
+  (let [fake (fake-db/make-db)
         password-calls (atom 0)]
     (with-redefs [jdbc/transact (fn [connectable f _opts] (f connectable))
-                  jdbc/execute! (partial fake-execute! fake)
-                  jdbc/execute-one! (partial fake-execute-one! fake)
+                  jdbc/execute! (partial fake-db/execute! fake)
+                  jdbc/execute-one! (partial fake-db/execute-one! fake)
                   auth/config (fn
                                 ([_] {:id :ferment.auth/simple
                                       :account-types {:default-name "user"}})
@@ -147,6 +58,55 @@
 
       (is (= 2 @password-calls)))))
 
+(deftest lock-reset-and-unlock-user-flow
+  (let [fake (fake-db/make-db)]
+    (with-redefs [jdbc/transact (fn [connectable f _opts] (f connectable))
+                  jdbc/execute! (partial fake-db/execute! fake)
+                  jdbc/execute-one! (partial fake-db/execute-one! fake)
+                  auth/config (fn
+                                ([_] {:id :ferment.auth/simple
+                                      :account-types {:default-name "user"}})
+                                ([_ _] {:id :ferment.auth/simple
+                                        :account-types {:default-name "user"}}))
+                  auth/db (fn
+                            ([_] ::db)
+                            ([_ _] ::db))
+                  auth/make-password-json (fn [_plain _]
+                                            {:shared "{\"algo\":\"pbkdf2\"}"
+                                             :intrinsic "{\"password\":\"x\"}"})]
+      (let [created (user/create-user! ::auth "lock@example.com" "sekret" :user)
+            user-id (get-in created [:user :user/id])]
+        (testing "soft lock can be set and then reset"
+          (let [locked (user/lock-user! ::auth user-id :soft)]
+            (is (:ok? locked))
+            (is (= :soft (:auth/lock-kind locked)))
+            (is (some? (:soft_locked (user/get-user-by-id ::db user-id)))))
+          (let [reseted (user/reset-login-attempts! ::auth user-id)
+                row (user/get-user-by-id ::db user-id)]
+            (is (:ok? reseted))
+            (is (:updated? reseted))
+            (is (= 0 (:login_attempts row)))
+            (is (nil? (:soft_locked row)))))
+
+        (testing "hard lock can be set and then unlocked"
+          (let [locked (user/lock-user! ::auth user-id :hard)]
+            (is (:ok? locked))
+            (is (= :hard (:auth/lock-kind locked)))
+            (is (some? (:locked (user/get-user-by-id ::db user-id)))))
+          (let [unlocked (user/unlock-user! ::auth user-id)
+                row (user/get-user-by-id ::db user-id)]
+            (is (:ok? unlocked))
+            (is (:updated? unlocked))
+            (is (false? (:auth/locked? unlocked)))
+            (is (= 0 (:login_attempts row)))
+            (is (nil? (:soft_locked row)))
+            (is (nil? (:locked row)))))
+
+        (testing "invalid lock kind is rejected"
+          (let [result (user/lock-user! ::auth user-id :invalid)]
+            (is (false? (:ok? result)))
+            (is (= :user/invalid-lock-kind (:error result)))))))))
+
 (deftest users-coercions-are-registered
   (testing "coercions for :users work for key columns"
     (is (= "test@example.com"
@@ -155,7 +115,7 @@
            ((db/get-out-coercer :users/account-type) "user")))))
 
 (deftest id-lookup-uses-identity-cache
-  (let [fake (make-fake-db)
+  (let [fake (fake-db/make-db)
         db-calls (atom 0)]
     (swap! (:users* fake) assoc 1 {:id 1
                                    :email "cache@test.io"
@@ -168,7 +128,7 @@
     (reset! (var-get #'ferment.user/identity-cache) nil)
     (with-redefs [jdbc/execute-one! (fn [connectable query & opts]
                                       (swap! db-calls inc)
-                                      (apply fake-execute-one! fake connectable query opts))]
+                                      (apply fake-db/execute-one! fake connectable query opts))]
       (is (= 1 (user/id ::db "Cache@test.io")))
       (is (= 1 (user/id ::db "Cache@test.io")))
       (is (= 1 @db-calls)))))

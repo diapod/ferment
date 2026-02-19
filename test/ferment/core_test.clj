@@ -127,6 +127,72 @@
         (is (= :ferment.model/solver (:model-k @called)))
         (is (= "s-42" (get-in @called [:opts :session/id])))))))
 
+(deftest model-generate-uses-capability-dispatch-model-key-from-resolver
+  (testing "Generator resolves model runtime key from resolver capability metadata."
+    (let [called (atom nil)
+          runtime {:resolver {:caps/by-id {:llm/custom
+                                           {:cap/id :llm/custom
+                                            :dispatch/model-key :ferment.model/meta}}}
+                   :models {:ferment.model/meta {:id "meta-selected"}}}]
+      (with-redefs [model/invoke-model!
+                    (fn [_runtime model-k _payload _opts]
+                      (reset! called model-k)
+                      {:ok? true
+                       :result {:text "RUNTIME-OK"}})
+                    core/sh!
+                    (fn [& _]
+                      (throw (ex-info "one-shot path should not be called"
+                                      {:error :unexpected-one-shot-path})))]
+        (is (= "RUNTIME-OK"
+               (:response (core/ollama-generate!
+                           {:runtime runtime
+                            :cap-id :llm/custom
+                            :intent :problem/solve
+                            :model "ignored"
+                            :prompt "hej"
+                            :mode :live}))))
+        (is (= :ferment.model/meta @called))))))
+
+(deftest execute-capability-plan-call-uses-dispatch-role-and-model-from-resolver
+  (testing "Plan call takes role/model from capability dispatch metadata in resolver."
+    (let [nested-call (atom nil)
+          runtime {:resolver {:caps/by-id
+                              {:llm/custom {:cap/id :llm/custom
+                                            :dispatch/role :voice
+                                            :dispatch/model-key :ferment.model/meta}}
+                              :routing {:intent->cap {:custom/intent :llm/custom}}}
+                   :models {:ferment.model/meta {:id "meta-selected"}}}]
+      (with-redefs [core/invoke-capability!
+                    (fn [_runtime opts]
+                      (case (:intent opts)
+                        :route/decide
+                        {:result {:type :plan
+                                  :plan {:nodes [{:op :call
+                                                  :intent :custom/intent
+                                                  :as :answer}
+                                                 {:op :emit
+                                                  :input {:slot/id [:answer :out]}}]}}}
+
+                        :custom/intent
+                        (do
+                          (reset! nested-call opts)
+                          {:result {:type :value
+                                    :out {:text "ok"}}})
+
+                        {:result {:type :value
+                                  :out {:text "noop"}}}))]
+        (let [result (core/execute-capability!
+                      runtime
+                      (:resolver runtime)
+                      {:role :router
+                       :intent :route/decide
+                       :cap-id :llm/meta
+                       :input {:prompt "plan"}})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= :llm/custom (:cap-id @nested-call)))
+          (is (= :voice (:role @nested-call)))
+          (is (= "meta-selected" (:model @nested-call))))))))
+
 (deftest invoke-capability-can-return-plan-with-injected-slots
   (testing "invoke-capability! supports plan results with model-provided bindings (HOF-like plan output)."
     (with-redefs [core/ollama-generate! (fn [_] {:response "ignored"})]

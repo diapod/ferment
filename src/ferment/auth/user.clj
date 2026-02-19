@@ -7,17 +7,18 @@
     ferment.auth.user
 
   (:require [clojure.string :as str]
-            [next.jdbc :as jdbc]
             [tick.core :as t]
             [ferment.auth :as auth]
             [ferment.auth.locking :as locking]
             [ferment.db :as db]
+            [ferment.session :as session]
             [ferment.user :as user])
 
   (:import (ferment AuthConfig)))
 
 (def ^:private login-select-prefix
   (str "SELECT users.id AS id, users.email AS email, users.account_type AS account_type,"
+       " users.login_attempts AS login_attempts,"
        " users.locked AS locked, users.soft_locked AS soft_locked,"
        " users.password AS intrinsic, password_suites.suite AS shared"
        " FROM users JOIN password_suites ON password_suites.id = users.password_suite_id"
@@ -85,6 +86,45 @@
         (try-db auth-source)
         (try-db auth-config))))
 
+(def ^:private session-public-keys
+  [:session/id
+   :session/version
+   :session/state
+   :session/frozen?
+   :session/updated-at
+   :session/last-access-at
+   :session/frozen-at
+   :session/thawed-at])
+
+(defn- session-service
+  [opts]
+  (let [svc (some-> opts :session/service)]
+    (when (and (map? svc) (fn? (:open! svc)))
+      svc)))
+
+(defn- session-id
+  [opts]
+  (or (some-> opts :session/id trim-s)
+      (some-> opts :session-id trim-s)))
+
+(defn- open-auth-session
+  [opts user]
+  (let [sid      (session-id opts)
+        service  (session-service opts)
+        meta'    (if (map? (:session/meta opts)) (:session/meta opts) {})
+        open-raw (if (map? (:session/options opts)) (:session/options opts) {})
+        open-opts (assoc open-raw
+                         :session/meta
+                         (merge {:source :auth/authenticate-password
+                                 :user/id (:user/id user)
+                                 :user/email (:user/email user)}
+                                meta'))]
+    (when (and sid service)
+      (try
+        (some-> (session/open! service sid open-opts)
+                (select-keys session-public-keys))
+        (catch Throwable _ nil)))))
+
 (defn get-login-data
   "Returns login row for `email` and optional `account-type`.
 
@@ -98,12 +138,14 @@
            query (if account-type'
                    (str login-select-prefix " AND users.account_type = ?")
                    login-select-prefix)
-           params (cond-> [query email']
-                    account-type' (conj (name account-type')))
            db-src (or (auth/db auth-source account-type')
                       (auth/db auth-source))]
        (when db-src
-         (some-> (jdbc/execute-one! db-src params db/opts-simple-map)
+         (some-> (if account-type'
+                   (db/<exec-one! db-src query
+                                  [:users/email email']
+                                  [:users/account-type (name account-type')])
+                   (db/<exec-one! db-src query [:users/email email']))
                  login-row->data))))))
 
 (defn authenticate-password
@@ -113,11 +155,16 @@
   - success: `{:ok? true :user {...}}`
   - failure: `{:ok? false :error <keyword>}`"
   ([auth-source email password]
-   (authenticate-password auth-source email password nil))
-  ([auth-source email password account-type]
+   (authenticate-password auth-source email password nil nil))
+  ([auth-source email password account-type-or-opts]
+   (if (map? account-type-or-opts)
+     (authenticate-password auth-source email password nil account-type-or-opts)
+     (authenticate-password auth-source email password account-type-or-opts nil)))
+  ([auth-source email password account-type opts]
    (let [email'       (trim-s email)
          password'    (trim-s password)
          account-type' (account-type-k account-type)
+         opts'        (if (map? opts) opts {})
          auth-config  (or (auth/config auth-source account-type')
                           (auth/config auth-source))
          now          (t/now)]
@@ -155,13 +202,16 @@
                (do
                  (when (and db-src user-id)
                    (user/update-login-ok! db-src user-id))
-                 {:ok? true
-                  :user (dissoc login-data
-                                :auth/password-shared
-                                :auth/password-intrinsic
-                                :auth/locked?
-                                :auth/locked-at
-                                :auth/soft-locked-at)})
+                 (let [user' (dissoc login-data
+                                     :auth/password-shared
+                                     :auth/password-intrinsic
+                                     :auth/locked?
+                                     :auth/locked-at
+                                     :auth/soft-locked-at)
+                       session' (open-auth-session opts' user')]
+                   (cond-> {:ok? true
+                            :user user'}
+                     (map? session') (assoc :session session'))))
                (do
                  (when (and db-src user-id)
                    (user/update-login-failed! db-src user-id max-attempts))
