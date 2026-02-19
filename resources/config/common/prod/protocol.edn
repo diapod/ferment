@@ -24,7 +24,10 @@
                            :code/review       {:in-schema :req/code
                                                :out-schema :res/review}
                            :eval/grade        {:in-schema :req/eval
-                                               :out-schema :res/eval}}
+                                               :out-schema :res/eval
+                                               :result/contract {:type :value
+                                                                 :required [:score]
+                                                                 :score/range [0.0 1.0]}}}
   :roles                  {:router {:allowed [:route :checks :budget]}
                            :solver {:allowed [:analysis :value :notes]}
                            :coder  {:allowed [:patch :tests :notes]}
@@ -32,6 +35,15 @@
   :done/default           {:must      #{:schema-valid}
                            :should    #{:tests-pass :no-hallucinated-apis}
                            :score-min 0.80}
+  :quality/checks         {:schema-valid         :builtin/schema-valid
+                           :tests-pass           :builtin/tests-pass
+                           :no-hallucinated-apis :builtin/no-hallucinated-apis}
+  :quality/judge          {:enabled? false
+                           :intent :eval/grade
+                           :cap/id :llm/judge
+                           :role :router
+                           :max-attempts 1
+                           :score-path [:score]}
   :constraints/default    {:no-web true
                            :language :pl
                            :style :concise}

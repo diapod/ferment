@@ -12,7 +12,8 @@
             [ferment.core :as core]
             [ferment.model :as model]
             [ferment.session :as session]
-            [ferment.session.store :as session-store]))
+            [ferment.session.store :as session-store]
+            [ferment.workflow :as workflow]))
 
 (deftest solver-retries-when-model-response-is-empty
   (testing "solver! retries when first model response cannot produce valid :value result."
@@ -50,7 +51,7 @@
         (is (= "solver-selected" (:model @called-with)))))))
 
 (deftest solver-does-not-fallback-to-coding-model
-  (testing "solver! nie używa modelu coding, gdy brak :ferment.model/solver."
+  (testing "solver! does not use coding model when :ferment.model/solver is missing."
     (let [called-with (atom nil)
           runtime {:models {:ferment.model/coding {:id "coding-from-model-branch"}}}]
       (with-redefs [core/ollama-generate!
@@ -61,7 +62,7 @@
         (is (= "mlx-community/Qwen2.5-7B-Instruct-4bit" (:model @called-with)))))))
 
 (deftest coder-uses-coding-model-selection
-  (testing "coder! używa selektora :ferment.model/coding dla capability kodu."
+  (testing "coder! uses :ferment.model/coding selector for code capability."
     (let [called-with (atom nil)
           runtime {:models {:ferment.model/coding {:id "coding-selected"}}}]
       (with-redefs [core/ollama-generate!
@@ -99,7 +100,7 @@
                (get (apply hash-map (:opts @called)) :env)))))))
 
 (deftest model-generate-prefers-runtime-invoke
-  (testing "Generator preferuje invoke na uruchomionym runtime workerze (reuse procesu)."
+  (testing "Generator prefers invoke on running runtime worker (process reuse)."
     (let [called (atom nil)]
       (with-redefs [model/invoke-model!
                     (fn [runtime model-k payload opts]
@@ -182,8 +183,105 @@
         (is (= :value (contracts/result-type-of result)))
         (is (= "VOICE:hej" (get-in result [:result :out :text])))))))
 
+(deftest execute-capability-uses-configured-checks-and-judge-capability
+  (testing "execute-capability! passes protocol check-fns and triggers judge capability (:eval/grade)."
+    (let [calls (atom [])
+          runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
+                                        :eval/grade {:in-schema :req/eval}}
+                              :result/types [:value :plan :error]
+                              :quality/checks {:tests-pass :builtin/tests-pass}
+                              :quality/judge {:enabled? true
+                                              :intent :eval/grade
+                                              :cap/id :llm/judge
+                                              :role :router
+                                              :max-attempts 1
+                                              :score-path [:score]}}
+                   :resolver {:routing {:intent->cap {:eval/grade :llm/judge}}}}]
+      (with-redefs [core/invoke-capability!
+                    (fn [_runtime opts]
+                      (swap! calls conj opts)
+                      (case (:intent opts)
+                        :problem/solve
+                        {:result {:type :plan
+                                  :plan {:nodes []}}}
+
+                        :eval/grade
+                        {:result {:type :value
+                                  :out {:score 0.42}}}
+
+                        {:result {:type :value
+                                  :out {:text "ok"}}}))
+                    workflow/execute-plan
+                    (fn [{:keys [check-fns judge-fn]}]
+                      (let [judge-out (judge-fn {:intent :text/respond
+                                                 :cap/id :llm/voice
+                                                 :done {:score-min 0.8}}
+                                                {}
+                                                {:result {:type :value
+                                                          :out {:text "x"}}})
+                            tests-check ((get check-fns :tests-pass)
+                                         {:intent :text/respond}
+                                         {}
+                                         {:result {:type :value
+                                                   :out {:tests/pass? true}}})]
+                        {:ok? true
+                         :emitted {:judge-score (:score judge-out)
+                                   :tests-check tests-check}}))]
+        (let [result (core/execute-capability!
+                      runtime
+                      (:resolver runtime)
+                      {:role :solver
+                       :intent :problem/solve
+                       :cap-id :llm/solver
+                       :input {:prompt "diag"}})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= {:judge-score 0.42
+                  :tests-check true}
+                 (get-in result [:result :out])))
+          (is (= [:problem/solve :eval/grade]
+                 (mapv :intent @calls))))))))
+
+(deftest execute-capability-judge-parses-score-from-json-text
+  (testing "Judge may return score as JSON in :out/:text and the result is parsed."
+    (let [runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
+                                        :eval/grade {:in-schema :req/eval}}
+                              :result/types [:value :plan :error]
+                              :quality/judge {:enabled? true
+                                              :intent :eval/grade
+                                              :cap/id :llm/judge
+                                              :score-path [:score]
+                                              :max-attempts 1}}
+                   :resolver {:routing {:intent->cap {:eval/grade :llm/judge}}}}]
+      (with-redefs [core/invoke-capability!
+                    (fn [_runtime opts]
+                      (case (:intent opts)
+                        :problem/solve {:result {:type :plan
+                                                 :plan {:nodes []}}}
+                        :eval/grade {:result {:type :value
+                                              :out {:text "{\"score\":0.73}"}}}
+                        {:result {:type :value
+                                  :out {:text "ok"}}}))
+                    workflow/execute-plan
+                    (fn [{:keys [judge-fn]}]
+                      {:ok? true
+                       :emitted {:judge-score (:score (judge-fn {:intent :text/respond
+                                                                 :cap/id :llm/voice
+                                                                 :done {:score-min 0.8}}
+                                                                {}
+                                                                {:result {:type :value
+                                                                          :out {:text "x"}}}))}})]
+        (let [result (core/execute-capability!
+                      runtime
+                      (:resolver runtime)
+                      {:role :solver
+                       :intent :problem/solve
+                       :cap-id :llm/solver
+                       :input {:prompt "diag"}})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= 0.73 (get-in result [:result :out :judge-score]))))))))
+
 (deftest invoke-capability-applies-protocol-defaults
-  (testing "invoke-capability! buduje request z domyślnych gałęzi protokołu i retry z :retry/max-attempts."
+  (testing "invoke-capability! builds request from protocol default branches and retry from :retry/max-attempts."
     (let [captured (atom nil)
           protocol {:retry/max-attempts 5
                     :intents {:text/respond {:in-schema :req/text}}
@@ -223,7 +321,7 @@
         (is (= 5 (get-in @captured [:opts :max-attempts]))))))
 
 (deftest invoke-capability-uses-request-overrides-and-rejects-unsupported-intent
-  (testing "Request override przesłania defaulty, a nieobsługiwany intent failuje przed wywołaniem modelu."
+  (testing "Request override replaces defaults, and unsupported intent fails before model invocation."
     (let [captured (atom nil)
           model-calls (atom 0)
           protocol {:retry/max-attempts 3
@@ -281,7 +379,7 @@
           (is (= 1 @model-calls))))))))
 
 (deftest invoke-capability-opens-session-and-appends-turns
-  (testing "invoke-capability! korzysta z session service i loguje turn user/assistant."
+  (testing "invoke-capability! uses session service and logs user/assistant turns."
     (let [store   (session-store/init-store :ferment.session.store/default {:backend :memory})
           context (session/init-context :ferment.session.context/default {:context/version 1})
           manager (session/init-manager :ferment.session.manager/default
@@ -319,8 +417,39 @@
           (is (= "diag-s1" (:session/id @seen-request)))
           (is (= "diag-s1" (get-in @seen-request [:context :session/id])))
           (is (= "diag-s1" (:session-id @seen-ollama)))
+          (is (= "diag-s1" (:session/id result)))
+          (is (integer? (:session/version result)))
+          (is (contains? #{:hot :warm} (:session/state result)))
+          (is (boolean? (:session/frozen? result)))
           (is (= 2 (count turns)))
           (is (= :user (get-in turns [0 :turn/role])))
           (is (= "diag: hello" (get-in turns [0 :turn/text])))
           (is (= :assistant (get-in turns [1 :turn/role])))
           (is (= "OK" (get-in turns [1 :turn/text]))))))))
+
+(deftest core-service-exposes-session-bridge-ops
+  (testing "init-service exposes session and session-worker operations without global state."
+    (let [runtime {:id :runtime}
+          session-service {:open! (fn [sid _opts] {:session/id sid})
+                           :get! (fn [sid] {:session/id sid :session/version 3})
+                           :freeze! (fn [sid _opts] {:session/id sid :session/frozen? true})
+                           :thaw! (fn [sid _opts] {:session/id sid :session/frozen? false})}
+          service (core/init-service :ferment.core/default
+                                     {:runtime runtime
+                                      :resolver {}
+                                      :protocol {}
+                                      :session session-service})]
+      (is (= {:session/id "s-1"} ((:session-open! service) "s-1")))
+      (is (= 3 (get-in ((:session-get! service) "s-1") [:session/version])))
+      (is (= true (get-in ((:session-freeze! service) "s-1") [:session/frozen?])))
+      (is (= false (get-in ((:session-thaw! service) "s-1") [:session/frozen?])))
+      (with-redefs [model/session-workers-state (fn [_] {:m {}})
+                    model/freeze-session-worker! (fn [_ model-id sid]
+                                                   {:ok? true :model model-id :session/id sid})
+                    model/thaw-session-worker! (fn [_ model-id sid]
+                                                 {:ok? true :model model-id :session/id sid})]
+        (is (= {:m {}} ((:session-workers service))))
+        (is (= {:ok? true :model :meta :session/id "s-1"}
+               ((:session-worker-freeze! service) :meta "s-1")))
+        (is (= {:ok? true :model :meta :session/id "s-1"}
+               ((:session-worker-thaw! service) :meta "s-1")))))))

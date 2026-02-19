@@ -33,9 +33,9 @@
   [_k config]
   (let [cfg (if (map? config) config {})]
     (-> cfg
-        (update :context/version #(normalize-int % 1 1))
-        (update :window/turns #(normalize-int % 16 1))
-        (update :window/max-chars #(normalize-int % 20000 1024))
+        (update :context/version      #(normalize-int % 1 1))
+        (update :window/turns         #(normalize-int % 16 1))
+        (update :window/max-chars     #(normalize-int % 20000 1024))
         (update :summary/target-chars #(normalize-int % 1200 256)))))
 
 (defn init-context
@@ -136,14 +136,15 @@
 
 (defn open-session!
   [manager sid opts]
-  (let [sid' (session-id sid)
+  (let [sid'  (session-id sid)
         opts' (if (map? opts) opts {})]
     (expire-hot-sessions! manager)
     (store/ensure-session! (:store manager) sid' opts')
-    (let [session (store/thaw-session! (:store manager)
-                                       sid'
-                                       {:session/meta {:context/version
-                                                       (get-in manager [:context :context/version])}})]
+    (let [session (store/thaw-session!
+                   (:store manager)
+                   sid'
+                   {:session/meta {:context/version
+                                   (get-in manager [:context :context/version])}})]
       (mark-hot! manager sid')
       (enforce-hot-limit! manager sid')
       session)))
@@ -183,8 +184,8 @@
   [_k config]
   (let [cfg (if (map? config) config {})]
     (-> cfg
-        (assoc :store (or (:store cfg)
-                          (system/ref :ferment.session.store/default)))
+        (assoc :store   (or (:store cfg)
+                            (system/ref :ferment.session.store/default)))
         (assoc :context (or (:context cfg)
                             (system/ref :ferment.session.context/default)))
         (assoc :manager (or (:manager cfg)
@@ -194,28 +195,28 @@
   [_k {:keys [store context manager] :as config}]
   (let [cfg (preconfigure-service _k config)]
     (assoc cfg
-           :store store
-           :context context
-           :manager manager
-           :open! (fn
-                    ([sid] (open-session! manager sid nil))
-                    ([sid opts] (open-session! manager sid opts)))
-           :get! (fn [sid] (get-session manager sid))
-           :list! (fn [] (list-sessions manager))
-           :append-turn! (fn [sid turn] (append-session-turn! manager sid turn))
-           :get-var! (fn [sid k] (store/get-var store sid k))
-           :get-vars! (fn [sid ks] (store/get-vars store sid ks))
-           :put-var! (fn [sid k v] (store/put-var! store sid k v))
-           :put-vars! (fn [sid kvs] (store/put-vars! store sid kvs))
-           :del-var! (fn [sid k] (store/del-var! store sid k))
-           :del-vars! (fn [sid ks] (store/del-vars! store sid ks))
-           :del-all-vars! (fn [sid] (store/del-all-vars! store sid))
-           :freeze! (fn
-                      ([sid] (freeze-session! manager sid nil))
-                      ([sid opts] (freeze-session! manager sid opts)))
-           :thaw! (fn
-                    ([sid] (thaw-session! manager sid nil))
-                    ([sid opts] (thaw-session! manager sid opts))))))
+           :store         store
+           :context       context
+           :manager       manager
+           :open!         (fn
+                            ([sid]       (open-session!        manager sid nil))
+                            ([sid opts]  (open-session!        manager sid opts)))
+           :get!          (fn [sid]      (get-session          manager sid))
+           :list!         (fn []         (list-sessions        manager))
+           :append-turn!  (fn [sid turn] (append-session-turn! manager sid turn))
+           :get-var!      (fn [sid k]    (store/get-var       store sid k))
+           :get-vars!     (fn [sid ks]   (store/get-vars      store sid ks))
+           :put-var!      (fn [sid k v]  (store/put-var!      store sid k v))
+           :put-vars!     (fn [sid kvs]  (store/put-vars!     store sid kvs))
+           :del-var!      (fn [sid k]    (store/del-var!      store sid k))
+           :del-vars!     (fn [sid ks]   (store/del-vars!     store sid ks))
+           :del-all-vars! (fn [sid]      (store/del-all-vars! store sid))
+           :freeze!       (fn
+                            ([sid]       (freeze-session! manager sid nil))
+                            ([sid opts]  (freeze-session! manager sid opts)))
+           :thaw!         (fn
+                            ([sid]       (thaw-session!   manager sid nil))
+                            ([sid opts]  (thaw-session!   manager sid opts))))))
 
 (defn stop-service
   [_k _state]

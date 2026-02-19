@@ -86,7 +86,7 @@
     true))
 
 (deftest init-store-db-requires-datasource
-  (testing "DB backend fail-fastuje bez datasource."
+  (testing "DB backend fails fast without datasource."
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo
          #"requires :db data source"
@@ -97,7 +97,7 @@
            :vars-table :session_vars})))))
 
 (deftest db-store-session-crud-roundtrip
-  (testing "DB backend obsługuje CRUD sesji oraz transakcyjne update/append/freeze/thaw."
+  (testing "DB backend supports session CRUD and transactional update/append/freeze/thaw."
     (let [rows* (atom {})
           vars* (atom {})]
       (with-redefs [jdbc/transact (fn [connectable f _opts]
@@ -141,7 +141,7 @@
           (is (nil? (session-store/get-session store "db-s1"))))))))
 
 (deftest db-store-session-vars-roundtrip
-  (testing "DB backend obsługuje get/put/del dla session_vars."
+  (testing "DB backend supports get/put/del for session_vars."
     (let [rows* (atom {})
           vars* (atom {})]
       (with-redefs [jdbc/transact (fn [connectable f _opts]

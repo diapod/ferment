@@ -34,12 +34,22 @@
  :ferment.caps.registry/llm-meta
  {:cap/id        :llm/meta
   :cap/kind      :llm
-  :cap/intents   #{:route/decide :context/summarize :eval/grade}
+  :cap/intents   #{:route/decide :context/summarize}
   :cap/can-produce #{:value :plan}
   :cap/effects-allowed #{:none}
   :io/in-schema  :req/meta
   :io/out-schema :res/meta
   :dispatch/tag  :meta}
+
+ :ferment.caps.registry/llm-judge
+ {:cap/id        :llm/judge
+  :cap/kind      :llm
+  :cap/intents   #{:eval/grade}
+  :cap/can-produce #{:value}
+  :cap/effects-allowed #{:none}
+  :io/in-schema  :req/eval
+  :io/out-schema :res/eval
+  :dispatch/tag  :judge}
 
  :ferment.caps.registry/llm-mock
  {:cap/id        :llm/mock
@@ -60,6 +70,7 @@
   #ref :ferment.caps.registry/llm-code
   #ref :ferment.caps.registry/llm-solver
   #ref :ferment.caps.registry/llm-meta
+  #ref :ferment.caps.registry/llm-judge
   #ref :ferment.caps.registry/llm-mock]
 
  ;; Declarative intent routing
@@ -72,12 +83,12 @@
                 :code/patch        :llm/code
                 :code/explain      :llm/code
                 :code/review       :llm/code
-                :eval/grade        :llm/meta}
+                :eval/grade        :llm/judge}
   :policy      :quality-aware
   :switch-on   #{:schema/invalid :format/drift :eval/low-score}
   :retry       {:same-cap-max 1
                 :fallback-max 1}
-  :fallback    [:llm/solver :llm/code :llm/meta :llm/mock]
+  :fallback    [:llm/solver :llm/code :llm/meta :llm/judge :llm/mock]
   :checks      [:schema-valid :tests-pass]}
 
  ;; Runtime/profile policy knobs

@@ -270,6 +270,28 @@
        node))
    (contracts/materialize-plan input env)))
 
+(defn- telemetry-atom
+  [telemetry]
+  (if (instance? clojure.lang.IAtom telemetry)
+    telemetry
+    (atom {:nodes/total 0
+           :nodes/by-op {}
+           :calls/total 0
+           :calls/succeeded 0
+           :calls/failed 0
+           :calls/retries 0
+           :calls/fallback-hops 0
+           :calls/failure-types {}
+           :quality/judge-used 0})))
+
+(defn- telemetry-inc!
+  [telemetry k]
+  (swap! telemetry update k (fnil inc 0)))
+
+(defn- telemetry-inc-in!
+  [telemetry ks]
+  (swap! telemetry update-in ks (fnil inc 0)))
+
 (defn execute-plan
   "Executes minimal plan AST with ops:
   - `:let`
@@ -284,17 +306,22 @@
 
   Returns:
   - `{:ok? true, :env ..., :emitted ...}`"
-  [{:keys [plan resolver invoke-call check-fns judge-fn env]
+  [{:keys [plan resolver invoke-call check-fns judge-fn env telemetry]
     :or   {env {}}}]
-  (let [nodes (vec (:nodes plan))]
+  (let [nodes (vec (:nodes plan))
+        telemetry* (telemetry-atom telemetry)]
     (loop [idx 0
            env env
            emitted nil]
       (if (>= idx (count nodes))
         {:ok? true
          :env env
-         :emitted emitted}
+         :emitted emitted
+         :telemetry @telemetry*}
         (let [node (nth nodes idx)]
+          (telemetry-inc! telemetry* :nodes/total)
+          (when (keyword? (:op node))
+            (telemetry-inc-in! telemetry* [:nodes/by-op (:op node)]))
           (if-not (should-run-node? node env)
             (recur (inc idx) env emitted)
             (case (:op node)
@@ -313,6 +340,7 @@
                     rejected      (-> candidates0 meta :routing/rejected)
                     candidates    (vec (take (inc (:fallback-max retry-policy))
                                              candidates0))]
+                (telemetry-inc! telemetry* :calls/total)
                 (when-not (seq candidates)
                   (throw (ex-info "Unable to resolve capability candidates for call node"
                                   {:node node
@@ -328,6 +356,8 @@
                                :failure/type :unsupported/intent
                                :failure/recover? false})
                           (let [cap-id (nth candidates candidate-idx)
+                                _ (when (pos? candidate-idx)
+                                    (telemetry-inc! telemetry* :calls/fallback-hops))
                                 candidate-node (assoc base-node :cap/id cap-id)
                                 candidate-outcome
                                 (loop [attempt 1
@@ -339,6 +369,8 @@
                                          :failure/recover? false
                                          :cap/id cap-id})
                                     (let [result (invoke-call candidate-node env)
+                                          _ (when (> attempt 1)
+                                              (telemetry-inc! telemetry* :calls/retries))
                                           rtype  (contracts/result-type-of result)
                                           run*   (when (= :plan rtype)
                                                    (let [sub-plan (or (contracts/materialize-plan-result result)
@@ -348,7 +380,8 @@
                                                                     :invoke-call invoke-call
                                                                     :check-fns check-fns
                                                                     :judge-fn judge-fn
-                                                                    :env env})))
+                                                                    :env env
+                                                                    :telemetry telemetry*})))
                                           slot-val (if run*
                                                      (assoc (normalize-call-result cap-id result)
                                                             :out (:emitted run*)
@@ -359,6 +392,8 @@
                                                                     :out (:emitted run*)}}
                                                           result)
                                           done-eval (evaluate-done candidate-node env verify-result check-fns judge-fn)
+                                          _ (when (number? (:judge/score done-eval))
+                                              (telemetry-inc! telemetry* :quality/judge-used))
                                           failure-type (call-failure-type result done-eval)
                                           recover? (recoverable-failure? failure-type switch-on)
                                           accepted? (not recover?)
@@ -381,18 +416,23 @@
                               candidate-outcome
                               (recur (inc candidate-idx) candidate-outcome)))))]
                   (if (:ok? call-outcome)
-                    (let [env' (if (keyword? (:as node))
+                    (let [_ (telemetry-inc! telemetry* :calls/succeeded)
+                          env' (if (keyword? (:as node))
                                  (assoc env (:as node) (:slot-val call-outcome))
                                  env)
                           emitted' (or (:emitted call-outcome) emitted)]
                       (recur (inc idx) env' emitted'))
-                    (throw (ex-info "Call node failed quality/dispatch policy"
-                                    {:node node
-                                     :outcome call-outcome
-                                     :switch-on switch-on
-                                     :retry-policy retry-policy
-                                     :candidates candidates
-                                     :rejected-candidates rejected})))))
+                    (do
+                      (telemetry-inc! telemetry* :calls/failed)
+                      (when (keyword? (:failure/type call-outcome))
+                        (telemetry-inc-in! telemetry* [:calls/failure-types (:failure/type call-outcome)]))
+                      (throw (ex-info "Call node failed quality/dispatch policy"
+                                      {:node node
+                                       :outcome call-outcome
+                                       :switch-on switch-on
+                                       :retry-policy retry-policy
+                                       :candidates candidates
+                                       :rejected-candidates rejected}))))))
 
               :emit
               (let [output (materialize-emit-input (:input node) env)]

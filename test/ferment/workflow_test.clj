@@ -148,7 +148,7 @@
       (is (= {:text "voice-b"} (:emitted run))))))
 
 (deftest execute-plan-filters-candidates-by-capability-intent
-  (testing "Routing odrzuca candidate, który nie deklaruje wsparcia dla intencji."
+  (testing "Routing rejects a candidate that does not declare intent support."
     (let [calls (atom [])
           run   (workflow/execute-plan
                  {:plan {:nodes [{:op :call
@@ -175,7 +175,7 @@
       (is (= {:text "meta"} (:emitted run))))))
 
 (deftest execute-plan-rejects-capability-when-effects-not-allowed
-  (testing "Routing odrzuca capability, gdy node wymaga efektów spoza `:cap/effects-allowed`."
+  (testing "Routing rejects capability when node requires effects outside `:cap/effects-allowed`."
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo
          #"Unable to resolve capability candidates"
@@ -194,3 +194,31 @@
            (fn [_ _]
              {:result {:type :value
                        :out {:text "should-not-run"}}})})))))
+
+(deftest execute-plan-emits-telemetry-for-retry-and-fallback
+  (testing "Telemetry counts retry/fallback and call statuses."
+    (let [calls (atom [])
+          run   (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :dispatch {:candidates [:llm/voice-a :llm/voice-b]
+                                             :retry {:same-cap-max 1
+                                                     :fallback-max 1}
+                                             :switch-on #{:eval/low-score}}
+                                  :as :answer}
+                                 {:op :emit :input {:slot/id [:answer :out]}}]}
+                  :resolver {}
+                  :invoke-call
+                  (fn [call-node _env]
+                    (swap! calls conj (:cap/id call-node))
+                    (if (= :llm/voice-a (:cap/id call-node))
+                      {:error {:type :eval/low-score}}
+                      {:result {:type :value
+                                :out {:text "ok"}}}))})]
+      (is (:ok? run))
+      (is (= [:llm/voice-a :llm/voice-a :llm/voice-b] @calls))
+      (is (= 1 (get-in run [:telemetry :calls/total])))
+      (is (= 1 (get-in run [:telemetry :calls/succeeded])))
+      (is (= 0 (get-in run [:telemetry :calls/failed])))
+      (is (= 1 (get-in run [:telemetry :calls/retries])))
+      (is (= 1 (get-in run [:telemetry :calls/fallback-hops]))))))

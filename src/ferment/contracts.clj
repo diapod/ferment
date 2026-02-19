@@ -219,6 +219,70 @@
                        (keyword? (get-in result [:error :type])))
       :else false)))
 
+(defn- score-in-range?
+  [v min-score max-score]
+  (and (number? v)
+       (<= (double min-score) (double v) (double max-score))))
+
+(defn- validate-eval-grade-out
+  [out contract]
+  (let [required (set (or (:required contract) [:score]))
+        [min-score max-score] (or (:score/range contract) [0.0 1.0])]
+    (cond
+    (not (map? out))
+    {:ok? false
+     :reason :eval/grade-out-not-map}
+
+    (and (contains? required :score)
+         (not (contains? out :score)))
+    {:ok? false
+     :reason :eval/grade-score-missing}
+
+    (not (number? (:score out)))
+    {:ok? false
+     :reason :eval/grade-score-not-number}
+
+    (not (score-in-range? (:score out) min-score max-score))
+    {:ok? false
+     :reason :eval/grade-score-out-of-range}
+
+    (and (contains? out :retry?)
+         (not (boolean? (:retry? out))))
+    {:ok? false
+     :reason :eval/grade-retry-not-boolean}
+
+    (and (contains? out :violations)
+         (not (or (set? (:violations out))
+                  (sequential? (:violations out)))))
+    {:ok? false
+     :reason :eval/grade-violations-not-coll}
+
+    :else
+    {:ok? true})))
+
+(defn- validate-intent-result-shape
+  [protocol intent result]
+  (let [judge-intent (or (get-in protocol [:quality/judge :intent])
+                         :eval/grade)
+        contract     (or (get-in protocol [:intents intent :result/contract])
+                         {:type :value
+                          :required [:score]
+                          :score/range [0.0 1.0]})]
+    (if (= intent judge-intent)
+      (cond
+        (contains? result :error)
+        {:ok? false
+         :reason :eval/grade-error-not-allowed}
+
+        (not= (:type contract) (result-type-of result))
+        {:ok? false
+         :reason :eval/grade-result-type-not-value
+         :result/type (result-type-of result)}
+
+        :else
+        (validate-eval-grade-out (result-out-of result) contract))
+      {:ok? true})))
+
 (defn validate-result
   "Validates result envelope and semantic branch shape.
 
@@ -226,6 +290,8 @@
   ([result]
    (validate-result nil result))
   ([protocol result]
+   (validate-result protocol nil result))
+  ([protocol intent result]
    (cond
      (not (map? result))
      {:ok? false
@@ -240,15 +306,28 @@
      (contains? result :result)
      (let [allowed-types (set (or (:result/types protocol) result-types))
            rtype (get-in result [:result :type])]
-       (if (contains? allowed-types rtype)
-         {:ok? true}
+       (if-not (contains? allowed-types rtype)
          {:ok? false
           :error :invalid-result
           :reason :result/type-not-allowed
-          :result/type rtype}))
+          :result/type rtype}
+         (let [intent-check (validate-intent-result-shape protocol intent result)]
+           (if (:ok? intent-check)
+             {:ok? true}
+             {:ok? false
+              :error :invalid-result
+              :reason (:reason intent-check)
+              :intent intent
+              :result/type rtype}))))
 
      :else
-     {:ok? true})))
+     (let [intent-check (validate-intent-result-shape protocol intent result)]
+       (if (:ok? intent-check)
+         {:ok? true}
+         {:ok? false
+          :error :invalid-result
+          :reason (:reason intent-check)
+          :intent intent})))))
 
 (defn invoke-with-contract
   "Runs `invoke-fn` under protocol validation with bounded retries.
@@ -267,7 +346,9 @@
        request-check
        (loop [attempt 1]
          (let [result (invoke-fn request attempt)
-               check  (validate-result protocol result)]
+               check  (validate-result protocol
+                                       (get-in request [:task :intent])
+                                       result)]
            (if (:ok? check)
              {:ok? true
               :attempt attempt

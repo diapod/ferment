@@ -1,6 +1,8 @@
 (ns ferment.core
 
-  (:require [clojure.java.io :as io]
+  (:require [cheshire.core :as json]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [ferment.contracts :as contracts]
             [ferment.model :as model]
@@ -37,12 +39,122 @@
   [runtime]
   (some-> (runtime-config runtime) :protocol))
 
-(declare input->prompt find-text llm-profile)
+(declare input->prompt find-text llm-profile judge-score-from-output)
 
 (defn- protocol-default
   [protocol k fallback]
   (let [v (get protocol k ::missing)]
     (if (identical? ::missing v) fallback v)))
+
+(defn- parse-double-safe
+  [v]
+  (cond
+    (number? v) (double v)
+    (string? v) (try
+                  (Double/parseDouble (str/trim v))
+                  (catch Throwable _ nil))
+    :else nil))
+
+(defn- parse-structured-text
+  [s]
+  (when (string? s)
+    (let [s' (some-> s str/trim not-empty)]
+      (when s'
+        (or (try
+              (json/parse-string s' true)
+              (catch Throwable _ nil))
+            (try
+              (edn/read-string s')
+              (catch Throwable _ nil)))))))
+
+(defn- score-at-path
+  [m score-path]
+  (let [path-k (vec (or score-path [:score]))
+        path-s (mapv (fn [k]
+                       (if (keyword? k) (name k) k))
+                     path-k)]
+    (or (parse-double-safe (get-in m path-k))
+        (parse-double-safe (get-in m path-s)))))
+
+(declare judge-score-from-output)
+
+(defn- score-from-map
+  [m score-path]
+  (or (score-at-path m score-path)
+      (parse-double-safe (:score m))
+      (parse-double-safe (get m "score"))
+      (parse-double-safe (:eval/score m))
+      (parse-double-safe (get m "eval/score"))
+      (some-> (:text m) parse-structured-text (judge-score-from-output score-path))
+      (some-> (get m "text") parse-structured-text (judge-score-from-output score-path))))
+
+(defn- result-error?
+  [result]
+  (or (contains? result :error)
+      (= :error (contracts/result-type-of result))))
+
+(defn- tests-pass?
+  [_call-node _env result]
+  (let [out (contracts/result-out-of result)]
+    (cond
+      (result-error? result) false
+      (boolean? (get out :tests/pass?)) (get out :tests/pass?)
+      (sequential? (get out :tests))
+      (every? (fn [t]
+                (or (true? t)
+                    (and (map? t)
+                         (contains? #{:pass "pass" true} (:status t)))))
+              (get out :tests))
+      :else true)))
+
+(defn- no-hallucinated-apis?
+  [_call-node _env result]
+  (let [out (contracts/result-out-of result)
+        violations (set (or (when (set? (:violations out)) (:violations out))
+                            (when (sequential? (:violations out)) (:violations out))
+                            []))]
+    (cond
+      (= :hallucinated/api (get-in result [:error :type])) false
+      (seq (get out :hallucinated-apis)) false
+      (contains? violations :hallucinated/api) false
+      :else true)))
+
+(defn- schema-valid?
+  [_call-node _env result]
+  (:ok? (contracts/validate-result result)))
+
+(def ^:private builtin-check-fns
+  {:schema-valid schema-valid?
+   :tests-pass tests-pass?
+   :no-hallucinated-apis no-hallucinated-apis?})
+
+(def ^:private default-check-descriptors
+  {:schema-valid :builtin/schema-valid
+   :tests-pass :builtin/tests-pass
+   :no-hallucinated-apis :builtin/no-hallucinated-apis})
+
+(defn- resolve-check-descriptor
+  [descriptor]
+  (cond
+    (= descriptor :builtin/schema-valid) schema-valid?
+    (= descriptor :builtin/tests-pass) tests-pass?
+    (= descriptor :builtin/no-hallucinated-apis) no-hallucinated-apis?
+    (keyword? descriptor) (get builtin-check-fns descriptor)
+    (ifn? descriptor) descriptor
+    :else nil))
+
+(defn- runtime-check-fns
+  [runtime]
+  (let [protocol    (or (runtime-protocol runtime) {})
+        descriptors (merge default-check-descriptors
+                           (or (:quality/checks protocol) {}))]
+    (reduce-kv
+     (fn [acc check-k descriptor]
+       (if-some [f (resolve-check-descriptor descriptor)]
+         (assoc acc check-k f)
+         acc))
+     {}
+     descriptors)))
 
 (defn- runtime-session
   [runtime]
@@ -74,6 +186,33 @@
     (try
       (session/append-turn! session-service sid turn)
       (catch Throwable _ nil))))
+
+(def ^:private session-response-keys
+  [:session/id
+   :session/version
+   :session/state
+   :session/frozen?
+   :session/updated-at
+   :session/last-access-at
+   :session/frozen-at
+   :session/thawed-at])
+
+(defn- session-state-safe
+  [session-service sid]
+  (when (and (map? session-service) sid)
+    (try
+      (session/get! session-service sid)
+      (catch Throwable _ nil))))
+
+(defn- attach-session-response
+  [response sid session-state]
+  (if-not (and (map? response) sid)
+    response
+    (let [state' (when (map? session-state)
+                   (select-keys session-state session-response-keys))]
+      (cond-> response
+        sid (assoc :session/id sid)
+        (map? state') (merge (dissoc state' :session/id))))))
 
 (defn- session-turn-text
   [v]
@@ -157,6 +296,7 @@
         :llm/code :ferment.model/coding
         :llm/solver :ferment.model/solver
         :llm/meta :ferment.model/meta
+        :llm/judge :ferment.model/meta
         :llm/voice :ferment.model/voice
         nil)
       (if (= :text/respond intent)
@@ -266,9 +406,21 @@
 
 (defn- build-request
   [runtime {:keys [role intent cap-id input context constraints done budget effects protocol
-                   session-id session-version session-state]}]
-  (let [request-id (str (java.util.UUID/randomUUID))
+                   session-id session-version session-state request-id trace proto]}]
+  (let [request-id (or (some-> request-id str str/trim not-empty)
+                       (str (java.util.UUID/randomUUID)))
         protocol'  (or protocol (runtime-protocol runtime) {})
+        trace-id   (or (some-> trace :id str str/trim not-empty)
+                       request-id)
+        trace-turn (when (and (map? trace)
+                              (nat-int? (:turn trace)))
+                     (:turn trace))
+        trace'     (cond-> {:id trace-id}
+                     (some? trace-turn) (assoc :turn trace-turn))
+        proto'     (let [p (or proto
+                               (protocol-default protocol' :proto/version 1)
+                               1)]
+                     (if (pos-int? p) p 1))
         session-fragment (when (map? session-state)
                            (cond-> {:session/id      (:session/id session-state)
                                     :session/version (:session/version session-state)
@@ -285,8 +437,8 @@
         budget'      (or budget (protocol-default protocol' :budget/default nil))
         effects'     (or effects (protocol-default protocol' :effects/default nil))
         input'       (if (map? input) input {:prompt (input->prompt input)})]
-    (cond-> {:proto      1
-             :trace      {:id request-id}
+    (cond-> {:proto      proto'
+             :trace      trace'
              :role       role
              :request/id request-id
              :session/id (or session-id (str "session/" (llm-profile runtime)))
@@ -308,6 +460,22 @@
             :out   {:text text}
             :usage {:mode mode}}})
 
+(defn- judge-result-parser
+  [text {:keys [request mode]}]
+  (let [parsed (parse-structured-text text)
+        score  (judge-score-from-output (or parsed text) [:score])
+        out-map (cond
+                  (map? parsed) parsed
+                  :else {:text text})
+        out-map (if (number? score)
+                  (assoc out-map :score score)
+                  out-map)]
+    {:proto  1
+     :trace  (:trace request)
+     :result {:type  :value
+              :out   out-map
+              :usage {:mode mode}}}))
+
 (defn- intent->role
   [intent]
   (case intent
@@ -322,6 +490,7 @@
         :llm/code  :coder
         :llm/solver :solver
         :llm/meta  :router
+        :llm/judge :router
         :llm/voice :voice
         :llm/mock  :router
         nil)
@@ -333,6 +502,7 @@
         :llm/code  (model/coding-id runtime)
         :llm/solver (model/solver-id runtime)
         :llm/meta  (model/meta-id runtime)
+        :llm/judge (model/meta-id runtime)
         :llm/voice (model/voice-id runtime)
         :llm/mock  "mock/model"
         nil)
@@ -357,7 +527,8 @@
   Returns validated result envelope (`:result` or `:error`), which may represent
   `:value`, `:plan` or `:stream` depending on the configured parser."
   [runtime {:keys [role intent cap-id model system prompt input temperature
-                   max-attempts result-parser context constraints done budget effects]
+                   max-attempts result-parser context constraints done budget effects
+                   request-id trace proto session-version]
             :as opts}]
   (let [mode (llm-mode runtime)
         protocol (runtime-protocol runtime)
@@ -382,8 +553,12 @@
                                         :budget budget
                                         :effects effects
                                         :protocol protocol
+                                        :request-id request-id
+                                        :trace trace
+                                        :proto proto
                                         :session-id session-id
-                                        :session-version (:session/version session-state)
+                                        :session-version (or session-version
+                                                             (:session/version session-state))
                                         :session-state session-state})
         _ (append-session-turn-safe! session-service session-id
                                      {:turn/role :user
@@ -429,7 +604,11 @@
                                     :turn/intent intent
                                     :turn/cap-id cap-id
                                     :turn/result-type (contracts/result-type-of result)})
-        result)
+        (attach-session-response
+         result
+         session-id
+         (or (session-state-safe session-service session-id)
+             session-state)))
       (do
         (append-session-turn-safe! session-service session-id
                                    {:turn/role :assistant
@@ -479,6 +658,56 @@
                            :max-attempts (:max-attempts call-node)
                            :result-parser (:result-parser call-node)}))))
 
+(defn- judge-score-from-output
+  [out score-path]
+  (or (parse-double-safe out)
+      (when (map? out)
+        (or (score-from-map out score-path)
+            (parse-double-safe (:grade/score out))
+            (parse-double-safe (get out "grade/score"))))
+      (when (string? out)
+        (some-> out
+                parse-structured-text
+                (judge-score-from-output score-path)))))
+
+(defn- runtime-judge-fn
+  [runtime resolver parent-opts]
+  (let [protocol   (or (runtime-protocol runtime) {})
+        judge-cfg  (or (:quality/judge protocol) {})
+        enabled?   (boolean (:enabled? judge-cfg))
+        judge-intent (or (:intent judge-cfg) :eval/grade)
+        judge-cap  (or (:cap/id judge-cfg)
+                       (some-> resolver :routing :intent->cap (get judge-intent))
+                       :llm/judge)
+        judge-role (or (:role judge-cfg) :router)
+        score-path (:score-path judge-cfg)
+        max-attempts (or (:max-attempts judge-cfg) 1)]
+    (when enabled?
+      (fn [call-node env result]
+        (when-not (or (= judge-intent (:intent call-node))
+                      (= judge-cap (:cap/id call-node)))
+          (try
+            (let [judge-result (invoke-capability!
+                                runtime
+                                {:role judge-role
+                                 :intent judge-intent
+                                 :cap-id judge-cap
+                                 :input {:task/call call-node
+                                         :task/result result
+                                         :task/done (:done call-node)
+                                         :task/env env}
+                                 :context {:judge/for-intent (:intent call-node)
+                                           :judge/for-cap (:cap/id call-node)}
+                                 :max-attempts max-attempts
+                                 :result-parser judge-result-parser
+                                 :session/id (:session/id parent-opts)})
+                  out (contracts/result-out-of judge-result)
+                  score (judge-score-from-output out score-path)]
+              (cond-> {}
+                (number? score) (assoc :score score)))
+            (catch Throwable _
+              nil)))))))
+
 (defn- emitted->out
   [emitted]
   (cond
@@ -493,7 +722,9 @@
   ([runtime opts]
    (execute-capability! runtime nil opts))
   ([runtime resolver opts]
-   (let [result (invoke-capability! runtime opts)
+   (let [check-fns (runtime-check-fns runtime)
+         judge-fn  (runtime-judge-fn runtime resolver opts)
+         result (invoke-capability! runtime opts)
          rtype  (contracts/result-type-of result)]
      (if (= :plan rtype)
        (let [plan (or (contracts/materialize-plan-result result)
@@ -501,7 +732,9 @@
              run  (workflow/execute-plan
                    {:plan plan
                     :resolver resolver
-                    :invoke-call (invoke-plan-call! runtime resolver)})
+                    :invoke-call (invoke-plan-call! runtime resolver)
+                    :check-fns check-fns
+                    :judge-fn judge-fn})
              out  (emitted->out (:emitted run))]
          (assoc result
                 :result {:type :value
@@ -644,6 +877,23 @@
    :resolver resolver
    :protocol protocol
    :session  session
+   :session-open! (fn
+                    ([sid] (when (map? session) (session/open! session sid)))
+                    ([sid opts] (when (map? session) (session/open! session sid opts))))
+   :session-get! (fn [sid]
+                   (when (map? session) (session/get! session sid)))
+   :session-freeze! (fn
+                      ([sid] (when (map? session) (session/freeze! session sid)))
+                      ([sid opts] (when (map? session) (session/freeze! session sid opts))))
+   :session-thaw! (fn
+                    ([sid] (when (map? session) (session/thaw! session sid)))
+                    ([sid opts] (when (map? session) (session/thaw! session sid opts))))
+   :session-workers (fn []
+                      (model/session-workers-state runtime))
+   :session-worker-freeze! (fn [model-id sid]
+                             (model/freeze-session-worker! runtime model-id sid))
+   :session-worker-thaw! (fn [model-id sid]
+                           (model/thaw-session-worker! runtime model-id sid))
    :coder!   (fn
                ([user-text] (coder! user-text runtime (with-session-service session nil)))
                ([user-text opts] (coder! user-text runtime (with-session-service session opts))))

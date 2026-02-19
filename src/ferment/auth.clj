@@ -12,7 +12,6 @@
             [ferment.db.sql         :as       sql]
             [ferment.logging        :as       log]
             [ferment.auth.pwd       :as       pwd]
-            [ferment.http           :as      http]
             [ferment.system         :as    system]
             [ferment.proto.auth     :as         p]
             [ferment.types.auth     :refer   :all]
@@ -366,3 +365,4 @@
 
 (derive ::strong ::auth)
 (derive ::simple ::auth)
+(derive ::setup  ::system/var-make)

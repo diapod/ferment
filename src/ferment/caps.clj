@@ -6,7 +6,8 @@
 
     ferment.caps
 
-  (:require [ferment.system :as system]))
+  (:require [ferment.caps.registry]
+            [ferment.system :as system]))
 
 (def ^:private default-can-produce
   #{:value})
