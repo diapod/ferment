@@ -1229,26 +1229,30 @@
   ([]
    (migrate! nil))
   ([opts]
-   (let [mig-key      (migrators-key opts)
-         app-state    (or (:app/state opts) app/state)
-         state-pre    (migrators-state mig-key app-state)
-         start-admin! (get opts :fn/start-admin app/start-admin!)]
+   (let [mig-key        (migrators-key opts)
+         explicit-state (if (map? opts) (:app/state opts))
+         initial-state  (or explicit-state app/state)
+         state-pre      (migrators-state mig-key initial-state)
+         start-admin!   (get opts :fn/start-admin app/start-admin!)]
      (when-not (:migrators? state-pre) (start-admin! mig-key))
-     (if (fn? opts)
-       (ragtime-repl/migrate (opts))
-       (doseq [mconfig (get app-state mig-key)]
-         (let [config (merge (mconfig) opts)
-               dbname (db-name config)
-               dbkey  (db-key-name config)]
-           (when (pos-int? (::jdbc/update-count (first (try-initialize-db config))))
-             (log/msg "Created empty database" dbname (str "(" dbkey ")")))
-           (ragtime-repl/migrate config))))
-     (when-not (:migrators? state-pre)
-       (let [state-post (migrators-state mig-key app-state)
-             stop-keys  (concat (set/difference (:dbs-up   state-post) (:dbs-up   state-pre))
-                                (set/difference (:props-up state-post) (:props-up state-pre)))]
-         (apply app/stop! mig-key (filter identity stop-keys)))))
-   nil))
+     (let [app-state (if (:migrators? state-pre)
+                       initial-state
+                       app/state)]
+       (if (fn? opts)
+         (ragtime-repl/migrate (opts))
+         (doseq [mconfig (get app-state mig-key)]
+           (let [config (merge (mconfig) opts)
+                 dbname (db-name config)
+                 dbkey  (db-key-name config)]
+             (when (pos-int? (::jdbc/update-count (first (try-initialize-db config))))
+               (log/msg "Created empty database" dbname (str "(" dbkey ")")))
+             (ragtime-repl/migrate config))))
+       (when-not (:migrators? state-pre)
+         (let [state-post (migrators-state mig-key app/state)
+               stop-keys  (concat (set/difference (:dbs-up   state-post) (:dbs-up   state-pre))
+                                  (set/difference (:props-up state-post) (:props-up state-pre)))]
+           (apply app/stop! mig-key (filter identity stop-keys)))))
+     nil)))
 
 (defn rollback!
   "Rolls back all databases or a database specified by a migrator function passed as an
@@ -1258,36 +1262,45 @@
   ([]
    (rollback! nil))
   ([opts]
-   (let [app-state    (or (:app/state opts) app/state)
-         mig-key      (migrators-key opts)
-         state-pre    (migrators-state mig-key app-state)
-         start-admin! (get opts :fn/start-admin app/start-admin!)]
+   (let [mig-key        (migrators-key opts)
+         explicit-state (if (map? opts) (:app/state opts))
+         initial-state  (or explicit-state app/state)
+         state-pre      (migrators-state mig-key initial-state)
+         start-admin!   (get opts :fn/start-admin app/start-admin!)]
      (when-not (:migrators? state-pre) (start-admin! mig-key))
-     (if (fn? opts)
-       (ragtime-repl/rollback (opts))
-       (if (or (not opts) (map? opts))
-         (doseq [migrator (get app-state mig-key)] (ragtime-repl/rollback (merge (migrator) opts)))
-         (doseq [migrator (get app-state mig-key)] (ragtime-repl/rollback (migrator) opts))))
-     (when-not (:migrators? state-pre)
-       (let [state-post (migrators-state mig-key app-state)
-             stop-keys  (concat (set/difference (:dbs-up   state-post) (:dbs-up   state-pre))
-                                (set/difference (:props-up state-post) (:props-up state-pre)))]
-         (apply app/stop! mig-key (filter identity stop-keys))))))
+     (let [app-state (if (:migrators? state-pre)
+                       initial-state
+                       app/state)]
+       (if (fn? opts)
+         (ragtime-repl/rollback (opts))
+         (if (or (not opts) (map? opts))
+           (doseq [migrator (get app-state mig-key)] (ragtime-repl/rollback (merge (migrator) opts)))
+           (doseq [migrator (get app-state mig-key)] (ragtime-repl/rollback (migrator) opts))))
+       (when-not (:migrators? state-pre)
+         (let [state-post (migrators-state mig-key app/state)
+               stop-keys  (concat (set/difference (:dbs-up   state-post) (:dbs-up   state-pre))
+                                  (set/difference (:props-up state-post) (:props-up state-pre)))]
+           (apply app/stop! mig-key (filter identity stop-keys)))))
+     nil))
   ([opts amount-or-id]
-   (let [app-state    (or (:app/state opts) app/state)
-         mig-key      (migrators-key opts)
-         state-pre    (migrators-state mig-key app-state)
-         start-admin! (get opts :fn/start-admin app/start-admin!)]
+   (let [mig-key        (migrators-key opts)
+         explicit-state (if (map? opts) (:app/state opts))
+         initial-state  (or explicit-state app/state)
+         state-pre      (migrators-state mig-key initial-state)
+         start-admin!   (get opts :fn/start-admin app/start-admin!)]
      (when-not (:migrators? state-pre) (start-admin! mig-key))
-     (if (fn? opts)
-       (ragtime-repl/rollback (opts) amount-or-id)
-       (doseq [migrator (get app-state mig-key)] (ragtime-repl/rollback (merge (migrator) opts) amount-or-id)))
-     (when-not (:migrators? state-pre)
-       (let [state-post (migrators-state mig-key app-state)
-             stop-keys  (concat (set/difference (:dbs-up   state-post) (:dbs-up   state-pre))
-                                (set/difference (:props-up state-post) (:props-up state-pre)))]
-         (apply app/stop! mig-key (filter identity stop-keys)))))
-   nil))
+     (let [app-state (if (:migrators? state-pre)
+                       initial-state
+                       app/state)]
+       (if (fn? opts)
+         (ragtime-repl/rollback (opts) amount-or-id)
+         (doseq [migrator (get app-state mig-key)] (ragtime-repl/rollback (merge (migrator) opts) amount-or-id)))
+       (when-not (:migrators? state-pre)
+         (let [state-post (migrators-state mig-key app/state)
+               stop-keys  (concat (set/difference (:dbs-up   state-post) (:dbs-up   state-pre))
+                                  (set/difference (:props-up state-post) (:props-up state-pre)))]
+           (apply app/stop! mig-key (filter identity stop-keys)))))
+     nil)))
 
 (defn migration-index
   "Gets a current value of ragtime-repl/migration-indexes."
@@ -1499,6 +1512,7 @@
 (defn- phone-to-db    ^String [v] (identity/->db :phone v))
 (defn- long-or-nil    ^Long   [n] (when n (long n)))
 (defn- identity-to-db         [v] (identity/->db v))
+(defn- ip-v6-str      ^String [v] (some-> v ip/to-address ip/to-v6 ip/to-str-v6))
 
 (defcoercions ::any
   :identity          identity-to-db               identity/of
@@ -1508,7 +1522,8 @@
   :first-name        some-str                     some-str
   :middle-name       some-str                     some-str
   :last-name         some-str                     some-str
-  :ip                ip/to-address                ip/string-to-address
-  :ip-address        ip/to-address                ip/string-to-address
+  :ip                ip-v6-str                    ip-v6-str
+  :ip-address        ip-v6-str                    ip-v6-str
+  :client-ip         ip-v6-str                    ip-v6-str
   :password-suite-id safe-parse-long              long-or-nil
   :password          nil                          nil)

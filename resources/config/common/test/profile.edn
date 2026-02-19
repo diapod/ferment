@@ -1,1 +1,3 @@
-{:ferment.app/properties {:profile :test}}
+{:ferment.app/properties      {:profile :test}
+ :ferment.env/ferment.profile "test"
+ :ferment.env/ferment.llm.mode "mock"}

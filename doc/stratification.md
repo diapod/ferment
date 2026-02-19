@@ -223,10 +223,9 @@ Błąd:
 1. Capability registry (ID -> meta, schematy): częściowo wdrożone.
 2. IR/Plan + CallNode: wdrożone minimalnie (`:plan`, materializacja slotów, `CallNode`).
 3. Aplikator/evaluator (resolve/execute/rekurencja): wdrożone minimalnie (`:let`, `:call`, `:emit`, plan->plan).
-   Wdrożone częściowo: verify (`:done`), retry/fallback (`:retry`, `:switch-on`, kandydaci).
-   Judge-loop pozostaje planowane.
+   Wdrożone: verify (`:done`), retry/fallback (`:retry`, `:switch-on`, kandydaci), judge-loop (opcjonalny, konfigurowalny).
 4. Walidatory kontraktów: wdrożone (`request` i `response` envelope).
-5. Judge capability: planowane.
+5. Judge capability: wdrożone opcjonalnie (gałąź `:quality/judge`, domyślnie wyłączone w `prod`, możliwe włączenie np. w `dev`).
 
 ## 6) Dlaczego to jest stratified
 

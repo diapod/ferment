@@ -64,7 +64,10 @@
 (deftest execute-plan-respects-failure-conditions
   (testing "Node guarded by `:when {:failed? ...}` runs only after failed call."
     (let [called (atom [])
-          plan   {:nodes [{:op :call :intent :demo/fail :as :failed-call}
+          plan   {:nodes [{:op :call
+                           :intent :demo/fail
+                           :dispatch {:allow-failure? true}
+                           :as :failed-call}
                           {:op :call :intent :demo/repair :when {:failed? :failed-call} :as :repair}
                           {:op :call :intent :demo/skip :when {:failed? :repair} :as :skip}
                           {:op :emit :input {:slot/id [:repair :out]}}]}
@@ -146,6 +149,52 @@
       (is (:ok? run))
       (is (= [:llm/voice-a :llm/voice-b] @calls))
       (is (= {:text "voice-b"} (:emitted run))))))
+
+(deftest execute-plan-fails-on-invalid-result-without-switch-policy
+  (testing "Invalid result fails fast when failure type is not declared in :switch-on."
+    (let [err (try
+                (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :dispatch {:candidates [:llm/voice]}
+                                  :as :answer}
+                                 {:op :emit :input {:slot/id [:answer :out]}}]}
+                  :resolver {}
+                  :invoke-call
+                  (fn [_ _]
+                    {:result {:type :value}})})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :schema/invalid (get-in err [:outcome :failure/type])))
+      (is (false? (get-in err [:outcome :failure/recover?]))))))
+
+(deftest execute-plan-does-not-fallback-on-terminal-failure
+  (testing "Terminal failure does not hop to next candidate unless :switch-on allows it."
+    (let [calls (atom [])
+          err   (try
+                  (workflow/execute-plan
+                   {:plan {:nodes [{:op :call
+                                    :intent :text/respond
+                                    :dispatch {:candidates [:llm/voice-a :llm/voice-b]
+                                               :retry {:fallback-max 1}
+                                               :switch-on #{:eval/low-score}}
+                                    :as :answer}
+                                   {:op :emit :input {:slot/id [:answer :out]}}]}
+                    :resolver {}
+                    :invoke-call
+                    (fn [call-node _env]
+                      (swap! calls conj (:cap/id call-node))
+                      (if (= :llm/voice-a (:cap/id call-node))
+                        {:error {:type :timeout/hard}}
+                        {:result {:type :value
+                                  :out {:text "should-not-run"}}}))})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e
+                    (ex-data e)))]
+      (is (= :timeout/hard (get-in err [:outcome :failure/type])))
+      (is (false? (get-in err [:outcome :failure/recover?])))
+      (is (= [:llm/voice-a] @calls)))))
 
 (deftest execute-plan-filters-candidates-by-capability-intent
   (testing "Routing rejects a candidate that does not declare intent support."

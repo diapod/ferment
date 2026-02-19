@@ -80,6 +80,7 @@
   {'user  :dev
    'dev   :dev
    'test  :test
+   'test-live :test-live
    'prod  :prod
    'admin :admin})
 
@@ -95,6 +96,7 @@
   (case profile
     :dev   (apply app/start-dev! keys)
     :test  (apply app/start-test! keys)
+    :test-live (apply app/start-test-live! keys)
     :admin (apply app/start-admin! keys)
     :prod  (apply app/start! keys)
     (throw (ex-info "Unsupported runtime profile."

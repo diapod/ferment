@@ -1,45 +1,54 @@
 {
 
+ ;; Buffered database loggers
+
+ :ferment.oplog.auth/log {:db           #ref :ferment.db/main
+                          :table        :authlog
+                          :timeout      [25 seconds]
+                          :buffered-max 108}
+
+ :ferment.logging/oplog {:auth #ref :ferment.oplog.auth/log}
+
  ;; Logging to files
 
  :ferment.logging/unilog {:system              #ref :ferment.app/properties
-                            :prev-config         {}
-                            :level               :info
-                            :console             false
-                            :appenders           [{:appender       :rolling-file
-                                                   :file           "${user.home}/.ferment/ferment.log"
-                                                   :encoder        :pattern-cool
-                                                   :pattern        "%p [%date{yyyy-MM-dd'T'HH:mm:ss, UTC},%date{SSS, UTC}Z] %t - %c %m%n"
-                                                   :rolling-policy {:type        :time-based
-                                                                    :max-history 7
-                                                                    :pattern     ".%d{yyyy-MM-dd}"}}
-                                                  {:appender       :rolling-file
-                                                   :file           "${user.home}/.ferment/ferment-json.log"
-                                                   :encoder        :json-log
-                                                   :rolling-policy {:type        :time-based
-                                                                    :max-history 7
-                                                                    :pattern     ".%d{yyyy-MM-dd}"}}
-                                                  {:appender :console-info
-                                                   :encoder  :pattern
-                                                   :pattern
-                                                   "%highlight(%-5level) %gray([%d{HH:mm:ss, UTC}] %magenta([%-7thread])) %cyan(%-34c) %m%n"}]
-                            :overrides           {"org.apache.http"                               :info
-                                                  "org.apache.http.wire"                          :error
-                                                  "org.eclipse.jetty"                             :info
-                                                  "org.eclipse.jetty.util.log"                    :info
-                                                  "io.netty"                                      :info
-                                                  "io.netty.util"                                 :info
-                                                  "io.netty.util.internal"                        :info
-                                                  "io.netty.util.ResourceLeakDetector"            :info
-                                                  "io.netty.util.internal.PlatformDependent"      :info
-                                                  "io.netty.util.internal.PlatformDependent0"     :info
-                                                  "io.netty.util.internal.CleanerJava9"           :info
-                                                  "io.netty.util.internal.InternalThreadLocalMap" :info}
-                            :context-transformer {ferment.logging/mask         [:password :user/password :user/new-password
-                                                                                  :user/repeated-password :new-password :repeated-password
-                                                                                  :pwd :private-key :private
-                                                                                  :secret :signature :request-id
-                                                                                  :anti-phisihng-code]
-                                                  ferment.logging/pseudonymize [:user/login :login :email :user/email :user :username :nick :nickname]
-                                                  clojure.core/str               [:currency]
-                                                  ferment.logging/pr-session   [:session :cnota-niewiescia :utoken]}}}}
+                          :prev-config         {}
+                          :level               :info
+                          :console             false
+                          :appenders           [{:appender       :rolling-file
+                                                 :file           "${user.home}/.ferment/ferment.log"
+                                                 :encoder        :pattern-cool
+                                                 :pattern        "%p [%date{yyyy-MM-dd'T'HH:mm:ss, UTC},%date{SSS, UTC}Z] %t - %c %m%n"
+                                                 :rolling-policy {:type        :time-based
+                                                                  :max-history 7
+                                                                  :pattern     ".%d{yyyy-MM-dd}"}}
+                                                {:appender       :rolling-file
+                                                 :file           "${user.home}/.ferment/ferment-json.log"
+                                                 :encoder        :json-log
+                                                 :rolling-policy {:type        :time-based
+                                                                  :max-history 7
+                                                                  :pattern     ".%d{yyyy-MM-dd}"}}
+                                                {:appender :console-info
+                                                 :encoder  :pattern
+                                                 :pattern
+                                                 "%highlight(%-5level) %gray([%d{HH:mm:ss, UTC}] %magenta([%-7thread])) %cyan(%-34c) %m%n"}]
+                          :overrides           {"org.apache.http"                               :info
+                                                "org.apache.http.wire"                          :error
+                                                "org.eclipse.jetty"                             :info
+                                                "org.eclipse.jetty.util.log"                    :info
+                                                "io.netty"                                      :info
+                                                "io.netty.util"                                 :info
+                                                "io.netty.util.internal"                        :info
+                                                "io.netty.util.ResourceLeakDetector"            :info
+                                                "io.netty.util.internal.PlatformDependent"      :info
+                                                "io.netty.util.internal.PlatformDependent0"     :info
+                                                "io.netty.util.internal.CleanerJava9"           :info
+                                                "io.netty.util.internal.InternalThreadLocalMap" :info}
+                          :context-transformer {ferment.logging/mask         [:password :user/password :user/new-password
+                                                                              :user/repeated-password :new-password :repeated-password
+                                                                              :pwd :private-key :private
+                                                                              :secret :signature :request-id
+                                                                              :anti-phisihng-code]
+                                                ferment.logging/pseudonymize [:user/login :login :email :user/email :user :username :nick :nickname]
+                                                clojure.core/str             [:currency]
+                                                ferment.logging/pr-session   [:session :cnota-niewiescia :utoken]}}}

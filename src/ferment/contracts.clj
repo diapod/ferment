@@ -87,6 +87,11 @@
     (and (contains? done :score-min)
          (not (number? (:score-min done))))
     {:ok? false :reason :done/score-min-not-number}
+    (and (contains? done :score-min)
+         (let [score-min (double (:score-min done))]
+           (or (< score-min 0.0)
+               (> score-min 1.0))))
+    {:ok? false :reason :done/score-min-out-of-range}
     :else {:ok? true}))
 
 (defn- validate-effects-shape

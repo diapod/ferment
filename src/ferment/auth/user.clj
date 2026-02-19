@@ -8,8 +8,11 @@
 
   (:require [clojure.string :as str]
             [next.jdbc :as jdbc]
+            [tick.core :as t]
             [ferment.auth :as auth]
-            [ferment.db :as db])
+            [ferment.auth.locking :as locking]
+            [ferment.db :as db]
+            [ferment.user :as user])
 
   (:import (ferment AuthConfig)))
 
@@ -45,9 +48,42 @@
     {:user/id                  (:id row)
      :user/email               (:email row)
      :user/account-type        (some-> (:account_type row) trim-s keyword)
+     :user/login-attempts      (:login_attempts row)
+     :auth/locked-at           (:locked row)
+     :auth/soft-locked-at      (:soft_locked row)
      :auth/locked?             (boolean (or (:locked row) (:soft_locked row)))
      :auth/password-intrinsic  (:intrinsic row)
      :auth/password-shared     (:shared row)}))
+
+(defn- lock-state
+  [login-data auth-config now]
+  (let [hard?      (locking/hard-locked? login-data)
+        soft?      (locking/soft-locked? login-data auth-config now)
+        legacy?    (true? (:auth/locked? login-data))
+        locked?    (or hard? soft? legacy?)
+        soft-left  (when soft?
+                     (locking/soft-lock-remains login-data auth-config now))]
+    {:locked? locked?
+     :hard? hard?
+     :soft? soft?
+     :soft/remaining soft-left}))
+
+(defn- resolve-db-source
+  [auth-source auth-config account-type]
+  (letfn [(try-db
+            ([src]
+             (when (some? src)
+               (try
+                 (auth/db src)
+                 (catch Throwable _ nil))))
+            ([src at]
+             (when (and (some? src) (some? at))
+               (try
+                 (auth/db src at)
+                 (catch Throwable _ nil)))))]
+    (or (try-db auth-source account-type)
+        (try-db auth-source)
+        (try-db auth-config))))
 
 (defn get-login-data
   "Returns login row for `email` and optional `account-type`.
@@ -83,7 +119,8 @@
          password'    (trim-s password)
          account-type' (account-type-k account-type)
          auth-config  (or (auth/config auth-source account-type')
-                          (auth/config auth-source))]
+                          (auth/config auth-source))
+         now          (t/now)]
      (cond
        (or (nil? email') (nil? password'))
        {:ok? false
@@ -96,23 +133,40 @@
        :else
        (if-some [{password-shared    :auth/password-shared
                   password-intrinsic :auth/password-intrinsic
-                  locked?            :auth/locked?
+                  user-id            :user/id
                   :as                login-data}
                  (get-login-data auth-source email' account-type')]
-         (if locked?
-           {:ok? false
-            :error :auth/account-locked}
-           (if (true? (auth/check-password-json password'
-                                                password-shared
-                                                password-intrinsic
-                                                auth-config))
-             {:ok? true
-              :user (dissoc login-data
-                            :auth/password-shared
-                            :auth/password-intrinsic
-                            :auth/locked?)}
-             {:ok? false
-              :error :auth/invalid-credentials}))
+         (let [db-src       (resolve-db-source auth-source auth-config account-type')
+               max-attempts (or (some-> auth-config :locking :max-attempts)
+                                3)
+               {:keys [locked? hard? soft? soft/remaining]}
+               (lock-state login-data auth-config now)]
+           (if locked?
+             (cond-> {:ok? false
+                      :error :auth/account-locked
+                      :auth/lock-kind (cond hard? :hard
+                                            soft? :soft
+                                            :else :unknown)}
+               (some? remaining) (assoc :auth/lock-remaining remaining))
+             (if (true? (auth/check-password-json password'
+                                                  password-shared
+                                                  password-intrinsic
+                                                  auth-config))
+               (do
+                 (when (and db-src user-id)
+                   (user/update-login-ok! db-src user-id))
+                 {:ok? true
+                  :user (dissoc login-data
+                                :auth/password-shared
+                                :auth/password-intrinsic
+                                :auth/locked?
+                                :auth/locked-at
+                                :auth/soft-locked-at)})
+               (do
+                 (when (and db-src user-id)
+                   (user/update-login-failed! db-src user-id max-attempts))
+                 {:ok? false
+                  :error :auth/invalid-credentials}))))
          (do
            (wait-no-user! auth-config)
            {:ok? false

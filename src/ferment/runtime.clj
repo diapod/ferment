@@ -13,6 +13,8 @@
   [_k config]
   (let [cfg (if (map? config) config {})]
     (-> cfg
+        (cond-> (not (contains? cfg :oplog))
+          (assoc :oplog (system/ref :ferment.logging/oplog)))
         (update :ferment.model.session/enabled? #(if (nil? %) true (boolean %)))
         (update :ferment.model.session/idle-ttl-ms #(or % 900000))
         (update :ferment.model.session/max-per-model #(or % 4)))))

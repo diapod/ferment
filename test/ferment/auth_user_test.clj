@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [ferment.auth :as auth]
             [ferment.auth.user :as auth-user]
+            [ferment.user :as user]
             [next.jdbc :as jdbc]))
 
 (deftest get-login-data-builds-query
@@ -20,6 +21,9 @@
         (is (= {:user/id 7
                 :user/email "user@example.com"
                 :user/account-type :system
+                :user/login-attempts nil
+                :auth/locked-at nil
+                :auth/soft-locked-at nil
                 :auth/locked? false
                 :auth/password-intrinsic "{\"y\":2}"
                 :auth/password-shared "{\"x\":1}"}
@@ -49,6 +53,54 @@
                      :user/account-type :system}}
              (auth-user/authenticate-password :auth "a@b.c" "secret" :system))))))
 
+(deftest authenticate-password-updates-login-counters
+  (testing "Successful auth resets counters, failed auth increments counters."
+    (let [ok-calls   (atom [])
+          fail-calls (atom [])]
+      (with-redefs [auth/config (fn
+                                  ([_] :cfg)
+                                  ([_ _] :cfg))
+                    auth/db (fn
+                              ([_] :db)
+                              ([_ _] :db))
+                    auth-user/get-login-data (fn [_ _ _]
+                                               {:user/id 9
+                                                :user/email "a@b.c"
+                                                :user/account-type :system
+                                                :auth/locked? false
+                                                :auth/password-shared "{}"
+                                                :auth/password-intrinsic "{}"})
+                    auth/check-password-json (fn [_ _ _ _] true)
+                    user/update-login-ok! (fn [db-src user-id]
+                                            (swap! ok-calls conj [db-src user-id])
+                                            true)]
+        (is (= {:ok? true
+                :user {:user/id 9
+                       :user/email "a@b.c"
+                       :user/account-type :system}}
+               (auth-user/authenticate-password :auth "a@b.c" "secret" :system)))
+        (is (= [[:db 9]] @ok-calls)))
+      (with-redefs [auth/config (fn
+                                  ([_] :cfg)
+                                  ([_ _] :cfg))
+                    auth/db (fn
+                              ([_] :db)
+                              ([_ _] :db))
+                    auth-user/get-login-data (fn [_ _ _]
+                                               {:user/id 9
+                                                :user/email "a@b.c"
+                                                :user/account-type :system
+                                                :auth/locked? false
+                                                :auth/password-shared "{}"
+                                                :auth/password-intrinsic "{}"})
+                    auth/check-password-json (fn [_ _ _ _] false)
+                    user/update-login-failed! (fn [db-src user-id max-attempts]
+                                                (swap! fail-calls conj [db-src user-id max-attempts])
+                                                true)]
+        (is (= {:ok? false :error :auth/invalid-credentials}
+               (auth-user/authenticate-password :auth "a@b.c" "bad" :system)))
+        (is (= [[:db 9 3]] @fail-calls))))))
+
 (deftest authenticate-password-failures
   (testing "returns error for invalid input data"
     (with-redefs [auth/config (fn
@@ -72,7 +124,9 @@
                                               :auth/locked? true
                                               :auth/password-shared "{}"
                                               :auth/password-intrinsic "{}"})]
-      (is (= {:ok? false :error :auth/account-locked}
+      (is (= {:ok? false
+              :error :auth/account-locked
+              :auth/lock-kind :unknown}
              (auth-user/authenticate-password :auth "a@b.c" "secret")))))
   (testing "returns error when password does not match"
     (with-redefs [auth/config (fn

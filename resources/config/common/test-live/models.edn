@@ -1,0 +1,48 @@
+{
+ ;; Lightweight "live" profile for smoke/integration checks.
+ ;; All model roles share one small runtime process to minimize memory usage.
+
+ :ferment.model.defaults/profile "mini"
+ :ferment.model.defaults/runtime {:enabled? false
+                                  :inherit-io? false
+                                  :http {:enabled? false}}
+
+ :ferment.model.id/solver {:profile "mini"
+                           :id/default "mlx-community/SmolLM3-3B-8bit"
+                           :id/mini "mlx-community/SmolLM3-3B-8bit"
+                           :id/fallback "mlx-community/SmolLM3-3B-8bit"}
+ :ferment.model.id/voice {:profile "mini"
+                          :id/default "mlx-community/SmolLM3-3B-8bit"
+                          :id/mini "mlx-community/SmolLM3-3B-8bit"
+                          :id/fallback "mlx-community/SmolLM3-3B-8bit"}
+ :ferment.model.id/coding {:profile "mini"
+                           :id/default "mlx-community/SmolLM3-3B-8bit"
+                           :id/mini "mlx-community/SmolLM3-3B-8bit"
+                           :id/fallback "mlx-community/SmolLM3-3B-8bit"}
+ :ferment.model.id/meta {:profile "mini"
+                         :id/default "mlx-community/SmolLM3-3B-8bit"
+                         :id/mini "mlx-community/SmolLM3-3B-8bit"
+                         :id/fallback "mlx-community/SmolLM3-3B-8bit"}
+
+ ;; Keep only one process alive (meta); other runtimes stay disabled.
+ :ferment.model.runtime/solver {:enabled? false
+                                :http {:enabled? false}}
+ :ferment.model.runtime/voice {:enabled? false
+                               :http {:enabled? false}}
+ :ferment.model.runtime/coding {:enabled? false
+                                :http {:enabled? false}}
+ :ferment.model.runtime/meta {:enabled? true
+                              :inherit-io? false
+                              :command ["mlx_lm.chat" "--model" #ref :ferment.model.id/meta]
+                              :http {:enabled? false}}
+
+ ;; Point all roles to the shared runtime.
+ :ferment.model/solver {:id #ref :ferment.model.id/solver
+                        :runtime #ref :ferment.model.runtime/meta}
+ :ferment.model/voice {:id #ref :ferment.model.id/voice
+                       :runtime #ref :ferment.model.runtime/meta}
+ :ferment.model/coding {:id #ref :ferment.model.id/coding
+                        :runtime #ref :ferment.model.runtime/meta}
+ :ferment.model/meta {:id #ref :ferment.model.id/meta
+                      :runtime #ref :ferment.model.runtime/meta}
+}

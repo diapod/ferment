@@ -61,6 +61,21 @@
 (def ^:private select-last-id-sql
   "SELECT LAST_INSERT_ID() AS id")
 
+(def ^:private update-login-success-sql
+  (str "UPDATE users"
+       " SET login_attempts = 0,"
+       "     soft_locked = NULL"
+       " WHERE id = ?"))
+
+(def ^:private update-login-failed-sql
+  (str "UPDATE users"
+       " SET login_attempts = login_attempts + 1,"
+       "     soft_locked = CASE"
+       "       WHEN login_attempts + 1 >= ? THEN CURRENT_TIMESTAMP(6)"
+       "       ELSE soft_locked"
+       "     END"
+       " WHERE id = ?"))
+
 (defn- parse-email
   [email]
   (some-> email identity/preparse-email))
@@ -200,6 +215,34 @@
   (when-some [email' (normalize-email email)]
     (cache-evict-safe! identity-cache (email-cache-key email')))
   nil)
+
+(declare get-user-by-id)
+
+(defn update-login-ok!
+  "Marks successful login and resets soft lock + login attempts for a user."
+  [connectable user-id]
+  (when-some [user-id' (normalize-id user-id)]
+    (let [row    (get-user-by-id connectable user-id')
+          email' (:email row)
+          result (jdbc/execute! connectable [update-login-success-sql user-id'])
+          ok?    (pos? (update-count result))]
+      (evict-user-caches! user-id' email')
+      ok?)))
+
+(defn update-login-failed!
+  "Marks failed login attempt and applies soft lock when threshold is reached."
+  ([connectable user-id]
+   (update-login-failed! connectable user-id 3))
+  ([connectable user-id max-attempts]
+   (when-some [user-id' (normalize-id user-id)]
+     (let [max-attempts' (long (max 1 (or (safe-parse-long max-attempts) 3)))
+           row           (get-user-by-id connectable user-id')
+           email'        (:email row)
+           result        (jdbc/execute! connectable
+                                        [update-login-failed-sql max-attempts' user-id'])
+           ok?           (pos? (update-count result))]
+       (evict-user-caches! user-id' email')
+       ok?))))
 
 (defn get-user-by-id
   "Returns user row by numeric user ID or `nil`."

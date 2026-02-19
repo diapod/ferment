@@ -182,13 +182,14 @@
            :cap/can-produce #{:plan}})))))
 
 (deftest runtime-config-contains-core-runtime-branch
-  (testing "Runtime branch has refs to resolver/protocol, session, and models aggregate."
+  (testing "Runtime branch has refs to resolver/protocol/session/oplog and models aggregate."
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/runtime.edn")
           runtime (get cfg :ferment.runtime/default)]
       (is (map? runtime))
       (is (= :ferment.resolver/default (:resolver runtime)))
       (is (= :ferment.protocol/default (:protocol runtime)))
       (is (= :ferment.session/default (:session runtime)))
+      (is (= :ferment.logging/oplog (:oplog runtime)))
       (is (= :ferment/models
              (:models runtime))))))
 
@@ -675,7 +676,29 @@
                                    "config/local/test")]
       (is (contains? cfg :ferment.core/default))
       (is (= :test (get-in cfg [:ferment.app/properties :profile])))
-      (is (= "ferment_test" (:ferment.env/db.main.name cfg))))))
+      (is (= "ferment_test" (:ferment.env/db.main.name cfg)))
+      (is (= "mock" (:ferment.env/ferment.llm.mode cfg)))
+      (is (false? (get-in cfg [:ferment.model.defaults/runtime :enabled?]))))))
+
+(deftest test-live-config-is-lightweight-single-runtime
+  (testing "Test-live config keeps one small shared runtime enabled for smoke checks."
+    (let [cfg (system/read-configs nil
+                                   "config/common/prod"
+                                   "config/local/prod"
+                                   "config/common/test-live"
+                                   "config/local/test-live")]
+      (is (= :test-live (get-in cfg [:ferment.app/properties :profile])))
+      (is (= "live" (:ferment.env/ferment.llm.mode cfg)))
+      (is (false? (get-in cfg [:ferment.model.runtime/solver :enabled?])))
+      (is (false? (get-in cfg [:ferment.model.runtime/voice :enabled?])))
+      (is (false? (get-in cfg [:ferment.model.runtime/coding :enabled?])))
+      (is (true? (get-in cfg [:ferment.model.runtime/meta :enabled?])))
+      (is (= :ferment.model.runtime/meta
+             (:key (get-in cfg [:ferment.model/solver :runtime]))))
+      (is (= :ferment.model.runtime/meta
+             (:key (get-in cfg [:ferment.model/voice :runtime]))))
+      (is (= :ferment.model.runtime/meta
+             (:key (get-in cfg [:ferment.model/coding :runtime])))))))
 
 (deftest dev-overlay-order-beats-local-prod
   (testing "Overlay order guarantees dev overrides prod (including local)."
@@ -708,7 +731,11 @@
     (is (= "config/common/test"
            (nth (system/profile-resource-dirs :test) 7)))
     (is (= "config/local/test"
-           (peek (system/profile-resource-dirs :test))))))
+           (peek (system/profile-resource-dirs :test))))
+    (is (= "config/common/test-live"
+           (nth (system/profile-resource-dirs :test-live) 7)))
+    (is (= "config/local/test-live"
+           (peek (system/profile-resource-dirs :test-live))))))
 
 (deftest model-selector-initialization-picks-profile-specific-value
   (testing "model/init-model-key chooses model according to profile."

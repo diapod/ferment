@@ -224,7 +224,7 @@ Zdolności, które pozostają zachowane:
 Uwagi integracyjne:
 1. Brak kolizji semantycznych; oba dokumenty są komplementarne.
 2. Nie tracimy zdolności ze stratyfikacji: heterogeniczne wykonawstwo, rekurencyjna delegacja, late binding i quality-aware dispatch pozostają wymaganiami architektury.
-3. Do doprecyzowania implementacyjnego w Etapie C: komplet pól metadata capability (np. `:cap/cost`, `:cap/limits`) i formalna bramka oceny jakości (`must` + `score` + opcjonalny judge).
+3. Do doprecyzowania implementacyjnego w Etapie C: komplet pól metadata capability (np. `:cap/cost`, `:cap/limits`) oraz strojenie polityk jakości per-intent (`:done`, `:switch-on`, scoring judge).
 
 ## 12. Definicja „done” dla nowych pączków
 

@@ -1,0 +1,17 @@
+{
+ ;; Test profile should not start heavyweight model runtimes.
+ ;; Contract/integration tests use mock mode by default.
+ :ferment.model.defaults/profile "mini"
+ :ferment.model.defaults/runtime {:enabled? false
+                                  :inherit-io? false
+                                  :http {:enabled? false}}
+
+ :ferment.model.runtime/solver {:enabled? false
+                                :http {:enabled? false}}
+ :ferment.model.runtime/voice {:enabled? false
+                               :http {:enabled? false}}
+ :ferment.model.runtime/coding {:enabled? false
+                                :http {:enabled? false}}
+ :ferment.model.runtime/meta {:enabled? false
+                              :http {:enabled? false}}
+}

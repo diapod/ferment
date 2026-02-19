@@ -1,0 +1,10 @@
+#!/bin/sh
+
+test -f secrets.env && . secrets.env
+
+: "${FERMENT_PROFILE:=test-live}"
+: "${FERMENT_LLM_MODE:=live}"
+export FERMENT_PROFILE
+export FERMENT_LLM_MODE
+
+clojure -M:test "$@"

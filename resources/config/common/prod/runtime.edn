@@ -3,6 +3,7 @@
  {:models   #ref :ferment/models
   :resolver #ref :ferment.resolver/default
   :protocol #ref :ferment.protocol/default
-  :session  #ref :ferment.session/default}
+  :session  #ref :ferment.session/default
+  :oplog    #ref :ferment.logging/oplog}
 
  }

@@ -12,10 +12,13 @@
             [ferment.auth.user :as auth-user]
             [ferment.contracts :as contracts]
             [ferment.core :as core]
+            [ferment.middleware.remote-ip :as remote-ip]
             [ferment.model :as model]
+            [ferment.oplog :as oplog]
             [ferment.session :as session]
             [ferment.system :as system]
-            [ferment.workflow :as workflow])
+            [ferment.workflow :as workflow]
+            [io.randomseed.utils.ip :as ip])
 
   (:import (com.sun.net.httpserver HttpExchange HttpHandler HttpServer)
     (java.io OutputStream)
@@ -597,6 +600,34 @@
   [runtime]
   (get-in runtime [:auth :source]))
 
+(defn- normalize-ipv6-str
+  [v]
+  (some-> v
+          remote-ip/remote-addr-parse
+          ip/to-address
+          ip/to-v6
+          ip/to-str-v6))
+
+(defn- auth-client-ip
+  [runtime ^HttpExchange exchange]
+  (let [proxy-header (some-> (get-in runtime [:auth :proxy-header])
+                             remote-ip/process-proxy)
+        proxy-value  (when proxy-header
+                       (some-> (.getRequestHeaders exchange)
+                               (.getFirst proxy-header)))
+        proxy-first  (some-> proxy-value (str/split #",") first trim-s)
+        remote-addr  (some-> exchange .getRemoteAddress .getAddress .getHostAddress)]
+    (or (normalize-ipv6-str proxy-first)
+        (normalize-ipv6-str remote-addr))))
+
+(defn- report-auth!
+  [runtime exchange message]
+  (let [logger (oplog/auth-logger runtime)]
+    (when (fn? logger)
+      (let [base {:client-ip (auth-client-ip runtime exchange)}
+            data (if (map? message) (merge base message) base)]
+        (apply logger (mapcat identity data))))))
+
 (defn- parse-basic-credentials
   [^HttpExchange exchange]
   (when-some [header (some-> (.getRequestHeaders exchange)
@@ -637,16 +668,41 @@
   [runtime exchange]
   (when (auth-enabled? runtime)
     (if-not (some? (auth-source runtime))
-      (auth-config-error-response)
+      (do
+        (report-auth! runtime exchange
+                      {:operation :auth/http-basic
+                       :success false
+                       :level :error
+                       :message "HTTP auth enabled, but auth source is missing."})
+        (auth-config-error-response))
       (if-some [{:keys [login password]} (parse-basic-credentials exchange)]
         (let [result (auth-user/authenticate-password
                       (auth-source runtime)
                       login
                       password
                       (auth-account-type runtime))]
-          (when-not (:ok? result)
-            (unauthorized-response runtime "Invalid credentials.")))
-        (unauthorized-response runtime "Missing or invalid Authorization header.")))))
+          (if (:ok? result)
+            (do
+              (report-auth! runtime exchange
+                            {:operation :auth/http-basic
+                             :success true
+                             :user-id (get-in result [:user :user/id])
+                             :message "HTTP basic auth accepted."})
+              nil)
+            (do
+              (report-auth! runtime exchange
+                            {:operation :auth/http-basic
+                             :success false
+                             :level :warning
+                             :message (str "HTTP basic auth rejected: " (or (:error result) :unknown))})
+              (unauthorized-response runtime "Invalid credentials."))))
+        (do
+          (report-auth! runtime exchange
+                        {:operation :auth/http-basic
+                         :success false
+                         :level :notice
+                         :message "Missing or invalid Authorization header."})
+          (unauthorized-response runtime "Missing or invalid Authorization header."))))))
 
 (defn- write-response!
   ([^HttpExchange exchange status ^String body]

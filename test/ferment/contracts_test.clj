@@ -72,6 +72,12 @@
                     :task {:intent :text/respond}
                     :input {:prompt "x"}
                     :done {:must ["schema-valid"]}}
+          bad-done-score {:proto 1
+                          :trace {:id "trace-done-score"}
+                          :task {:intent :text/respond}
+                          :input {:prompt "x"}
+                          :done {:must #{:schema-valid}
+                                 :score-min 1.2}}
           bad-effects {:proto 1
                        :trace {:id "trace-effects"}
                        :task {:intent :text/respond}
@@ -86,6 +92,10 @@
               :error :invalid-request
               :reason :done/must-not-keywords}
              (contracts/validate-request protocol bad-done)))
+      (is (= {:ok? false
+              :error :invalid-request
+              :reason :done/score-min-out-of-range}
+             (contracts/validate-request protocol bad-done-score)))
       (is (= {:ok? false
               :error :invalid-request
               :reason :effects/allowed-not-keywords}

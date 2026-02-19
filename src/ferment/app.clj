@@ -32,6 +32,7 @@
 (def ^:dynamic *resource-admin-dirs*  (system/profile-resource-dirs :admin))
 (def ^:dynamic *resource-dev-dirs*    (system/profile-resource-dirs :dev))
 (def ^:dynamic *resource-test-dirs*   (system/profile-resource-dirs :test))
+(def ^:dynamic *resource-test-live-dirs* (system/profile-resource-dirs :test-live))
 
 (defmacro with-config-dirs
   "Binds `ferment.app/*resource-config-dirs*` to `dirs` for the dynamic extent
@@ -430,11 +431,13 @@ operation ended with an exception stored in `ferment.app/exception`).")
 (defn configure-dev!     [   ] (configure-app *local-config* *resource-dev-dirs*))
 (defn configure-admin!   [   ] (configure-app *local-config* *resource-admin-dirs*))
 (defn configure-test!    [   ] (configure-app *local-config* *resource-test-dirs*))
+(defn configure-test-live! [ ] (configure-app *local-config* *resource-test-live-dirs*))
 
 (defn start!             [& k] (apply start-app *local-config* *resource-config-dirs* k))
 (defn start-dev!         [& k] (apply start-app *local-config* *resource-dev-dirs*    k))
 (defn start-admin!       [& k] (apply start-app *local-config* *resource-admin-dirs*  k))
 (defn start-test!        [& k] (apply start-app *local-config* *resource-test-dirs*   k))
+(defn start-test-live!   [& k] (apply start-app *local-config* *resource-test-live-dirs* k))
 
 (defn stop!              [& k] (apply stop-app    k))
 (defn restart!           [& k] (apply restart-app k))
@@ -462,6 +465,12 @@ Delegates to `ferment.app/configure-app`.")
 (defdoc! configure-test!
   "Configures the application using the current test defaults:
 `ferment.app/*local-config*` and `ferment.app/*resource-test-dirs*`.
+
+Delegates to `ferment.app/configure-app`.")
+
+(defdoc! configure-test-live!
+  "Configures the application using the current test-live defaults:
+`ferment.app/*local-config*` and `ferment.app/*resource-test-live-dirs*`.
 
 Delegates to `ferment.app/configure-app`.")
 
@@ -506,6 +515,12 @@ Delegates to `ferment.app/start-app`.")
 (defdoc! start-test!
   "Starts the application using test config defaults:
 `ferment.app/*local-config*` and `ferment.app/*resource-test-dirs*`.
+
+Delegates to `ferment.app/start-app`.")
+
+(defdoc! start-test-live!
+  "Starts the application using test-live config defaults:
+`ferment.app/*local-config*` and `ferment.app/*resource-test-live-dirs*`.
 
 Delegates to `ferment.app/start-app`.")
 
