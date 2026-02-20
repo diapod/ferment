@@ -7,87 +7,99 @@
   :envelope/request       {:required [:proto :trace :task :input]
                            :optional [:constraints :done :context :budget :effects]}
   :envelope/response      {:required-one-of [:result :error]}
+
   :intents                {:route/decide      {:in-schema :req/route
                                                :out-schema :res/route
                                                :result/contract {:type :value
-                                                                 :contract/kind :route/decide}
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :score-min 1.0}
-                                                         :checks [:schema-valid]
-                                                         :judge {:enabled? false}}}
+                                                                 :contract/kind :route/decide}}
                            :context/summarize {:in-schema :req/context
-                                               :out-schema :res/context-summary
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :score-min 1.0}
-                                                         :checks [:schema-valid]
-                                                         :judge {}}}
+                                               :out-schema :res/context-summary}
                            :text/respond      {:in-schema :req/text
-                                               :out-schema :res/text
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :should #{:no-hallucinated-apis}
-                                                                :score-min 0.8}
-                                                         :checks [:schema-valid :no-hallucinated-apis]
-                                                         :judge {}}}
+                                               :out-schema :res/text}
                            :problem/solve     {:in-schema :req/problem
-                                               :out-schema :res/problem
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :should #{:no-hallucinated-apis}
-                                                                :score-min 0.8}
-                                                         :checks [:schema-valid :no-hallucinated-apis]
-                                                         :judge {}}}
+                                               :out-schema :res/problem}
                            :code/generate     {:in-schema :req/code
-                                               :out-schema :res/code
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :should #{:tests-pass :no-hallucinated-apis}
-                                                                :score-min 0.8}
-                                                         :checks [:schema-valid :tests-pass]
-                                                         :judge {}}}
+                                               :out-schema :res/code}
                            :code/patch        {:in-schema :req/code
-                                               :out-schema :res/patch+tests
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :should #{:tests-pass :no-hallucinated-apis}
-                                                                :score-min 0.8}
-                                                         :checks [:schema-valid :tests-pass]
-                                                         :judge {}}}
+                                               :out-schema :res/patch+tests}
                            :code/explain      {:in-schema :req/code
-                                               :out-schema :res/explanation
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :should #{:tests-pass :no-hallucinated-apis}
-                                                                :score-min 0.8}
-                                                         :checks [:schema-valid :tests-pass]
-                                                         :judge {}}}
+                                               :out-schema :res/explanation}
                            :code/review       {:in-schema :req/code
-                                               :out-schema :res/review
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :should #{:tests-pass :no-hallucinated-apis}
-                                                                :score-min 0.8}
-                                                         :checks [:schema-valid :tests-pass]
-                                                         :judge {}}}
+                                               :out-schema :res/review}
                            :eval/grade        {:in-schema :req/eval
                                                :out-schema :res/eval
                                                :result/contract {:type :value
                                                                  :required [:score]
-                                                                 :score/range [0.0 1.0]}
-                                               :quality {:done {:must #{:schema-valid}
-                                                                :score-min 1.0}
-                                                         :checks [:schema-valid]
-                                                         :judge {:enabled? false}}}}
+                                                                 :score/range [0.0 1.0]}}}
+
+  :policy/checks          {:schema-valid         :builtin/schema-valid
+                           :tests-pass           :builtin/tests-pass
+                           :no-hallucinated-apis :builtin/no-hallucinated-apis}
+
+  :policy/default         {:done {:must      #{:schema-valid}
+                                   :should    #{:tests-pass :no-hallucinated-apis}
+                                   :score-min 0.80}
+                           :checks [:schema-valid]
+                           :judge {:enabled? false
+                                   :intent :eval/grade
+                                   :cap/id :llm/judge
+                                   :role :router
+                                   :max-attempts 1
+                                   :score-path [:score]}
+                           :retry {:max-attempts 3
+                                   :same-cap-max 1
+                                   :fallback-max 1}
+                           :switch-on #{:schema/invalid :format/drift :eval/low-score}
+                           :fallback  [:llm/solver :llm/code :llm/meta :llm/judge :llm/mock]}
+
+  :policy/intents         {:route/decide      {:done {:must #{:schema-valid}
+                                                      :score-min 1.0}
+                                               :checks [:schema-valid]
+                                               :judge {:enabled? false}}
+                           :context/summarize {:done {:must #{:schema-valid}
+                                                      :score-min 1.0}
+                                               :checks [:schema-valid]
+                                               :judge {:enabled? false}}
+                           :text/respond      {:done {:must #{:schema-valid}
+                                                      :should #{:no-hallucinated-apis}
+                                                      :score-min 0.8}
+                                               :checks [:schema-valid :no-hallucinated-apis]
+                                               :judge {:enabled? false}}
+                           :problem/solve     {:done {:must #{:schema-valid}
+                                                      :should #{:no-hallucinated-apis}
+                                                      :score-min 0.8}
+                                               :checks [:schema-valid :no-hallucinated-apis]
+                                               :judge {:enabled? false}}
+                           :code/generate     {:done {:must #{:schema-valid}
+                                                      :should #{:tests-pass :no-hallucinated-apis}
+                                                      :score-min 0.8}
+                                               :checks [:schema-valid :tests-pass]
+                                               :judge {:enabled? false}}
+                           :code/patch        {:done {:must #{:schema-valid}
+                                                      :should #{:tests-pass :no-hallucinated-apis}
+                                                      :score-min 0.8}
+                                               :checks [:schema-valid :tests-pass]
+                                               :judge {:enabled? false}}
+                           :code/explain      {:done {:must #{:schema-valid}
+                                                      :should #{:tests-pass :no-hallucinated-apis}
+                                                      :score-min 0.8}
+                                               :checks [:schema-valid :tests-pass]
+                                               :judge {:enabled? false}}
+                           :code/review       {:done {:must #{:schema-valid}
+                                                      :should #{:tests-pass :no-hallucinated-apis}
+                                                      :score-min 0.8}
+                                               :checks [:schema-valid :tests-pass]
+                                               :judge {:enabled? false}}
+                           :eval/grade        {:done {:must #{:schema-valid}
+                                                      :score-min 1.0}
+                                               :checks [:schema-valid]
+                                               :judge {:enabled? false}}}
+
   :roles                  {:router {:allowed [:route :checks :budget]}
                            :solver {:allowed [:analysis :value :notes]}
                            :coder  {:allowed [:patch :tests :notes]}
                            :voice  {:allowed [:text :summary]}}
-  :done/default           {:must      #{:schema-valid}
-                           :should    #{:tests-pass :no-hallucinated-apis}
-                           :score-min 0.80}
-  :quality/checks         {:schema-valid         :builtin/schema-valid
-                           :tests-pass           :builtin/tests-pass
-                           :no-hallucinated-apis :builtin/no-hallucinated-apis}
-  :quality/judge          {:enabled? false
-                           :intent :eval/grade
-                           :cap/id :llm/judge
-                           :role :router
-                           :max-attempts 1
-                           :score-path [:score]}
+
   :constraints/default    {:no-web true
                            :language :pl
                            :style :concise}
@@ -95,6 +107,7 @@
                            :temperature 0.0
                            :max-roundtrips 3}
   :effects/default        {:allowed #{:none}}
+
   :error/catalog          {:schema/invalid      {:retryable? true}
                            :format/drift        {:retryable? true}
                            :timeout/soft        {:retryable? true}
@@ -103,6 +116,7 @@
                            :timeout/hard        {:retryable? false}
                            :input/invalid       {:retryable? false}
                            :unsupported/intent  {:retryable? false}}
+
   :result/types           [:value :plan :stream :error]
   :retry/max-attempts     3}
 

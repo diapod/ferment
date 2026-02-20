@@ -11,6 +11,7 @@
             [clojure.java.io :as io]
             [ferment.contracts :as contracts]
             [ferment.core :as core]
+            [ferment.effects :as effects]
             [ferment.model :as model]
             [ferment.session :as session]
             [ferment.session.store :as session-store]
@@ -282,6 +283,53 @@
           (is (= true (get-in result [:result :out :wrote?])))
           (is (= "tool-ok"
                  (slurp (io/file root "sandbox/tool.txt")))))))))
+
+(deftest execute-capability-propagates-auth-context-into-tool-plan
+  (testing "execute-capability! passes auth user and role policy into tool node payload and workflow env."
+    (let [seen (atom nil)
+          runtime {}
+          roles-cfg {:enabled? true
+                     :authorize-default? false
+                     :anonymous-role :role/anonymous
+                     :logged-in-role :role/user
+                     :account-type->roles {:admin #{:role/admin}}
+                     :effects {:fs/write {:any #{:role/admin}}}}
+          auth-user {:user/id 21
+                     :user/account-type :admin
+                     :user/roles #{:role/admin}}
+          plan {:nodes [{:op :tool
+                         :tool/id :fs/write-file
+                         :effects {:allowed #{:fs/write}}
+                         :input {:path "sandbox/out.txt"
+                                 :content "tool-ok"}
+                         :as :write}
+                        {:op :emit
+                         :input {:slot/id [:write :out]}}]}]
+      (with-redefs [core/invoke-capability!
+                    (fn [_runtime _opts]
+                      {:result {:type :plan
+                                :plan plan}})
+                    effects/invoke-tool!
+                    (fn [_cfg tool-node env]
+                      (reset! seen {:tool-node tool-node
+                                    :env env})
+                      {:result {:type :value
+                                :out {:ok? true}}})]
+        (let [result (core/execute-capability!
+                      runtime
+                      {}
+                      {:role :router
+                       :intent :route/decide
+                       :cap-id :llm/meta
+                       :input {:prompt "plan"}
+                       :auth/user auth-user
+                       :roles roles-cfg})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= 21 (get-in @seen [:tool-node :auth/user :user/id])))
+          (is (= roles-cfg (get-in @seen [:tool-node :roles/config])))
+          (is (= true (get-in @seen [:tool-node :auth/effects :ok?])))
+          (is (= 21 (get-in @seen [:env :auth/user :user/id])))
+          (is (= roles-cfg (get-in @seen [:env :roles/config]))))))))
 
 (deftest execute-capability-uses-configured-checks-and-judge-capability
   (testing "execute-capability! passes protocol check-fns and triggers judge capability (:eval/grade)."

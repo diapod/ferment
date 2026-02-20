@@ -29,19 +29,23 @@
              (get-in protocol [:envelope/response :required-one-of])))
       (is (contains? (:intents protocol) :code/patch))
       (is (contains? (:intents protocol) :text/respond))
+      (is (= :req/text
+             (get-in protocol [:intents :text/respond :in-schema])))
+      (is (= :res/text
+             (get-in protocol [:intents :text/respond :out-schema])))
       (is (= :route/decide
              (get-in protocol [:intents :route/decide :result/contract :contract/kind])))
       (is (= #{:schema-valid}
-             (get-in protocol [:intents :route/decide :quality :done :must])))
+             (get-in protocol [:policy/intents :route/decide :done :must])))
       (is (= [:schema-valid :no-hallucinated-apis]
-             (get-in protocol [:intents :text/respond :quality :checks])))
+             (get-in protocol [:policy/intents :text/respond :checks])))
       (is (contains? (:error/catalog protocol) :schema/invalid))
       (is (= :builtin/schema-valid
-             (get-in protocol [:quality/checks :schema-valid])))
+             (get-in protocol [:policy/checks :schema-valid])))
       (is (= :eval/grade
-             (get-in protocol [:quality/judge :intent])))
+             (get-in protocol [:policy/default :judge :intent])))
       (is (= :llm/judge
-             (get-in protocol [:quality/judge :cap/id])))
+             (get-in protocol [:policy/default :judge :cap/id])))
       (is (= [:value :plan :stream :error]
              (:result/types protocol))))))
 
@@ -49,8 +53,8 @@
   (testing "Dev profile can override protocol branch and enable judge."
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/dev/protocol.edn")
           protocol (get cfg :ferment.protocol/default)]
-      (is (= true (get-in protocol [:quality/judge :enabled?])))
-      (is (= :llm/judge (get-in protocol [:quality/judge :cap/id]))))))
+      (is (= true (get-in protocol [:policy/default :judge :enabled?])))
+      (is (= :llm/judge (get-in protocol [:policy/default :judge :cap/id]))))))
 
 (deftest request-validation-works
   (testing "Valid request passes, malformed request fails."
@@ -106,6 +110,21 @@
               :error :invalid-request
               :reason :effects/allowed-not-keywords}
              (contracts/validate-request protocol bad-effects))))))
+
+(deftest request-validation-enforces-in-schema
+  (testing "Input payload is validated against intent in-schema validators."
+    (let [protocol {:intents {:text/respond {:in-schema :req/text}}}
+          bad-request {:proto 1
+                       :trace {:id "trace-schema-in"}
+                       :task {:intent :text/respond}
+                       :input {:x 1}}
+          ok-request {:proto 1
+                      :trace {:id "trace-schema-in-ok"}
+                      :task {:intent :text/respond}
+                      :input {:prompt "hej"}}]
+      (is (= :input/schema-invalid
+             (:reason (contracts/validate-request protocol bad-request))))
+      (is (:ok? (contracts/validate-request protocol ok-request))))))
 
 (deftest invoke-with-contract-retries-until-valid-result
   (testing "Invoker retries invalid result and accepts first valid one."
@@ -192,6 +211,45 @@
       (is (:ok? (contracts/validate-result protocol :text/respond
                                            {:result {:type :value
                                                      :out {:text "ok"}}}))))))
+
+(deftest result-validation-enforces-out-schema
+  (testing "Value responses are validated against intent out-schema validators."
+    (let [protocol {:intents {:text/respond {:out-schema :res/text}}
+                    :result/types [:value :error]}]
+      (is (= :output/schema-invalid
+             (:reason (contracts/validate-result protocol
+                                                 :text/respond
+                                                 {:result {:type :value
+                                                           :out {:x 1}}}))))
+      (is (:ok? (contracts/validate-result protocol
+                                           :text/respond
+                                           {:result {:type :value
+                                                     :out {:text "ok"}}}))))))
+
+(deftest requires-are-used-as-hard-result-contract
+  (testing "Request-level :task/:requires enforces expected result type and schema."
+    (let [protocol {:intents {:text/respond {:in-schema :req/text
+                                             :out-schema :res/text}}
+                    :result/types [:value :plan :error]}
+          request {:proto 1
+                   :trace {:id "trace-requires"}
+                   :task {:intent :text/respond
+                          :requires {:result/type :value
+                                     :out-schema :res/text}}
+                   :input {:prompt "hej"}}
+          calls (atom 0)
+          invoke (fn [_request _attempt]
+                   (let [n (swap! calls inc)]
+                     (if (= n 1)
+                       {:result {:type :plan
+                                 :plan {:nodes []}}}
+                       {:result {:type :value
+                                 :out {:text "ok"}}})))]
+      (let [result (contracts/invoke-with-contract invoke request {:max-attempts 2
+                                                                   :protocol protocol})]
+        (is (:ok? result))
+        (is (= 2 (:attempt result)))
+        (is (= 2 @calls))))))
 
 (deftest route-decide-result-contract-is-enforced
   (testing "Intent :route/decide requires canonical route decision payload with keyword target and valid dispatch policy."

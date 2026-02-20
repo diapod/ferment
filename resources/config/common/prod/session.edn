@@ -5,6 +5,16 @@
   :db             #ref :ferment.db/main
   :sessions-table :sessions
   :vars-table     :session_vars
+  :session-vars/contract
+  {:keys/require-qualified? true
+   :keys/allowed-namespaces #{"session" "user" "agent" "runtime" "request" "context"}
+   :ttl/default-ms          14400000
+   :ttl/max-ms              604800000
+   :freeze/allow-write?     false
+   :freeze/allow-delete?    false
+   :limits/max-vars         256
+   :limits/max-key-chars    191
+   :limits/max-value-bytes  131072}
   :max-sessions   4096}
 
  :ferment.session.context/default

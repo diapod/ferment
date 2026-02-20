@@ -22,15 +22,40 @@
     (keyword? v) #{v}
     :else #{}))
 
+(defn- call-requires
+  [node]
+  (let [requires0 (if (map? (:requires node))
+                    (:requires node)
+                    {})
+        requires1 (cond-> requires0
+                    (keyword? (get-in node [:output :schema]))
+                    (assoc :out-schema (get-in node [:output :schema]))
+                    (keyword? (or (:result/type node)
+                                  (get-in node [:expect :result/type])))
+                    (assoc :result/type (or (:result/type node)
+                                            (get-in node [:expect :result/type]))))
+        requires2 (contracts/normalize-requires requires1)]
+    (if (map? requires2) requires2 {})))
+
+(defn- normalize-call-node
+  [node]
+  (let [requires (call-requires node)]
+    (if (seq requires)
+      (assoc node :requires requires)
+      node)))
+
 (defn- requested-result-type
   [node]
-  (or (:result/type node)
+  (or (:result/type (call-requires node))
+      (:result/type node)
       (get-in node [:expect :result/type])))
 
 (defn- requested-effects
   [node]
-  (keyword-set (or (:effects/allowed node)
-                   (get-in node [:effects :allowed]))))
+  (let [declared (keyword-set (or (:effects/allowed node)
+                                  (get-in node [:effects :allowed])))
+        required (keyword-set (get-in (call-requires node) [:effects/allowed]))]
+    (into declared required)))
 
 (defn- auth-user
   [env]
@@ -39,6 +64,19 @@
           (:auth/user env'))
         (when (map? (get-in env' [:workflow/auth :user]))
           (get-in env' [:workflow/auth :user])))))
+
+(defn- public-auth-user
+  [user]
+  (when (map? user)
+    (let [roles' (->> (keyword-set (or (:user/roles user)
+                                       (:roles user)))
+                      sort
+                      vec)]
+      (cond-> {}
+        (some? (:user/id user)) (assoc :user/id (:user/id user))
+        (some? (:user/email user)) (assoc :user/email (:user/email user))
+        (some? (:user/account-type user)) (assoc :user/account-type (:user/account-type user))
+        (seq roles') (assoc :user/roles roles')))))
 
 (defn- roles-config
   [resolver env]
@@ -51,27 +89,40 @@
         (when (map? (:roles resolver'))
           (:roles resolver')))))
 
+(defn- effect-authorization-context
+  [resolver node env]
+  (let [req-effects (requested-effects node)
+        user        (public-auth-user (auth-user env))
+        roles-cfg   (roles-config resolver env)
+        authz       (when (and (seq req-effects)
+                               (map? roles-cfg))
+                      (roles/authorize-effects roles-cfg req-effects user))]
+    {:requested-effects req-effects
+     :auth/user user
+     :roles/config roles-cfg
+     :auth/effects authz}))
+
 (defn- enforce-effects-authorization!
   [resolver call-node env]
-  (let [req-effects  (requested-effects call-node)
-        user         (auth-user env)
-        roles-cfg    (roles-config resolver env)]
-    (when (and (seq req-effects)
-               (map? user)
-               (map? roles-cfg))
-      (let [authz (roles/authorize-effects roles-cfg req-effects user)]
-        (when-not (:ok? authz)
-          (throw (ex-info "Call node requested effects forbidden for authenticated principal."
-                          {:error :auth/forbidden-effect
-                           :failure/type :auth/forbidden-effect
-                           :retryable? false
-                           :node call-node
-                           :requested-effects req-effects
-                           :denied-effects (:denied authz)
-                           :user (select-keys user [:user/id
-                                                    :user/email
-                                                    :user/account-type
-                                                    :user/roles])})))))))
+  (let [{:keys [requested-effects] :as ctx}
+        (effect-authorization-context resolver call-node env)
+        user         (:auth/user ctx)
+        auth-effects (:auth/effects ctx)]
+    (when (and (seq requested-effects)
+               (map? auth-effects)
+               (not (:ok? auth-effects)))
+      (throw (ex-info "Call node requested effects forbidden for authenticated principal."
+                      {:error :auth/forbidden-effect
+                       :failure/type :auth/forbidden-effect
+                       :retryable? false
+                       :node call-node
+                       :requested-effects requested-effects
+                       :denied-effects (:denied auth-effects)
+                       :user (select-keys user [:user/id
+                                                :user/email
+                                                :user/account-type
+                                                :user/roles])})))
+    ctx))
 
 (defn- cap-supports-intent?
   [cap intent]
@@ -95,12 +146,36 @@
           (every? allowed req-effects)))
     true))
 
+(defn- cap-matches-required-schema?
+  [cap requires]
+  (let [in-schema  (:in-schema requires)
+        out-schema (:out-schema requires)]
+    (and (or (not (keyword? in-schema))
+             (= in-schema (:io/in-schema cap)))
+         (or (not (keyword? out-schema))
+             (= out-schema (:io/out-schema cap))))))
+
+(defn- cap-matches-required-kind?
+  [cap requires]
+  (let [required-kind (:cap/kind requires)]
+    (or (not (keyword? required-kind))
+        (= required-kind (:cap/kind cap)))))
+
+(defn- cap-matches-required-tags?
+  [cap requires]
+  (let [required-tags (keyword-set (:cap/tags requires))]
+    (if (seq required-tags)
+      (let [cap-tags (keyword-set (:cap/tags cap))]
+        (every? cap-tags required-tags))
+      true)))
+
 (defn- candidate-verdict
   [resolver node cap-id]
   (if-not (map? (:caps/by-id resolver))
     {:ok? true
      :cap/id cap-id}
     (let [cap         (get-in resolver [:caps/by-id cap-id])
+          requires    (call-requires node)
           intent      (:intent node)
           result-type (requested-result-type node)
           req-effects (requested-effects node)]
@@ -128,22 +203,51 @@
          :reason :effects/not-allowed
          :effects req-effects}
 
+        (not (cap-matches-required-schema? cap requires))
+        {:ok? false
+         :cap/id cap-id
+         :reason :requires/schema-mismatch
+         :requires (select-keys requires [:in-schema :out-schema])
+         :cap-schemas (select-keys cap [:io/in-schema :io/out-schema])}
+
+        (not (cap-matches-required-kind? cap requires))
+        {:ok? false
+         :cap/id cap-id
+         :reason :requires/cap-kind-mismatch
+         :required-kind (:cap/kind requires)
+         :cap-kind (:cap/kind cap)}
+
+        (not (cap-matches-required-tags? cap requires))
+        {:ok? false
+         :cap/id cap-id
+         :reason :requires/cap-tags-mismatch
+         :required-tags (keyword-set (:cap/tags requires))
+         :cap-tags (keyword-set (:cap/tags cap))}
+
         :else
         {:ok? true
          :cap/id cap-id}))))
 
 (defn- resolve-candidates
   [resolver node]
-  (let [explicit (:cap/id node)
+  (let [protocol (if (map? (:protocol resolver)) (:protocol resolver) {})
+        policy (contracts/intent-policy protocol (:intent node))
+        explicit (:cap/id node)
         listed   (vec (or (get-in node [:dispatch :candidates]) []))
         routed   (some-> (get-in resolver [:routing :intent->cap (:intent node)]) vector)
+        policy-fallback (vec (or (:fallback policy) []))
+        routing-fallback (vec (or (get-in resolver [:routing :fallback]) []))
+        base-candidates
+        (cond
+          (keyword? explicit) [explicit]
+          (seq listed) listed
+          (seq routed) routed
+          :else [])
         candidates
-        (vec
-         (cond
-           (keyword? explicit) [explicit]
-           (seq listed) listed
-           (seq routed) routed
-           :else []))]
+        (->> (concat base-candidates policy-fallback routing-fallback)
+             (filter keyword?)
+             distinct
+             vec)]
     (if (map? (:caps/by-id resolver))
       (let [verdicts (mapv #(candidate-verdict resolver node %) candidates)
             accepted (->> verdicts (filter :ok?) (mapv :cap/id))
@@ -207,26 +311,38 @@
 
 (defn- resolve-retry-policy
   [resolver node]
-  (let [routing-retry (get-in resolver [:routing :retry])
+  (let [protocol      (if (map? (:protocol resolver)) (:protocol resolver) {})
+        policy-retry  (get-in (contracts/intent-policy protocol (:intent node))
+                              [:retry])
+        routing-retry (get-in resolver [:routing :retry])
         node-retry    (get-in node [:dispatch :retry])]
     {:same-cap-max (nonneg-int (or (:same-cap-max node-retry)
                                    (:same-cap-max routing-retry)
+                                   (:same-cap-max policy-retry)
                                    (:same-cap-max default-retry-policy))
                                0)
      :fallback-max (nonneg-int (or (:fallback-max node-retry)
                                    (:fallback-max routing-retry)
+                                   (:fallback-max policy-retry)
                                    (:fallback-max default-retry-policy))
                                0)}))
 
 (defn- resolve-switch-on
   [resolver node]
-  (let [routing (set (or (get-in resolver [:routing :switch-on]) #{}))
+  (let [protocol (if (map? (:protocol resolver)) (:protocol resolver) {})
+        policy  (set (or (get-in (contracts/intent-policy protocol (:intent node))
+                                 [:switch-on])
+                         #{}))
+        routing (set (or (get-in resolver [:routing :switch-on]) #{}))
         local   (set (or (get-in node [:dispatch :switch-on]) #{}))]
-    (into routing local)))
+    (into (into policy routing) local)))
 
 (defn- default-schema-check
-  [result]
-  (:ok? (contracts/validate-result result)))
+  [protocol call-node result]
+  (:ok? (contracts/validate-result protocol
+                                   (:intent call-node)
+                                   result
+                                   (:requires call-node))))
 
 (defn- invoke-check-fn
   [f call-node env result]
@@ -245,10 +361,10 @@
     :else {:ok? false}))
 
 (defn- run-check
-  [check-key call-node env result check-fns]
+  [protocol check-key call-node env result check-fns]
   (let [check-fn (or (get check-fns check-key)
                      (when (= :schema-valid check-key)
-                       (fn [_ _ r] (default-schema-check r))))]
+                       (fn [n _ r] (default-schema-check protocol n r))))]
     (if (fn? check-fn)
       (let [raw (invoke-check-fn check-fn call-node env result)
             out (normalize-check raw)]
@@ -264,30 +380,34 @@
     (map? judge-out)    (some-> (:score judge-out) double)
     :else nil))
 
-(defn- intent-quality
-  [protocol intent]
-  (let [cfg (when (and (map? protocol) (keyword? intent))
-              (get-in protocol [:intents intent :quality]))]
-    (if (map? cfg) cfg {})))
-
 (defn- done-score-min
   [v]
   (if (number? v) (double v) 0.0))
 
+(defn- merge-done-overrides
+  [base override]
+  (let [base' (if (map? base) base {})
+        over' (if (map? override) override {})
+        merged (merge base' over')]
+    (cond-> merged
+      (or (contains? base' :must) (contains? over' :must))
+      (assoc :must (into (keyword-set (:must base'))
+                         (keyword-set (:must over'))))
+      (or (contains? base' :should) (contains? over' :should))
+      (assoc :should (into (keyword-set (:should base'))
+                           (keyword-set (:should over')))))))
+
 (defn- effective-done
   [protocol call-node]
   (let [intent         (:intent call-node)
-        quality        (intent-quality protocol intent)
-        default-done   (if (map? (:done/default protocol))
-                         (:done/default protocol)
-                         {})
-        quality-done   (if (map? (:done quality)) (:done quality) {})
+        policy         (contracts/intent-policy protocol intent)
+        policy-done    (if (map? (:done policy)) (:done policy) {})
         node-done      (if (map? (:done call-node)) (:done call-node) {})
-        merged-done    (merge default-done quality-done node-done)
-        quality-checks (keyword-set (:checks quality))
+        merged-done    (merge-done-overrides policy-done node-done)
+        policy-checks  (keyword-set (:checks policy))
         dispatch-checks (keyword-set (get-in call-node [:dispatch :checks]))
         must-keys      (into (keyword-set (:must merged-done))
-                             (concat quality-checks dispatch-checks))
+                             (concat policy-checks dispatch-checks))
         should-keys    (keyword-set (:should merged-done))]
     (cond-> merged-done
       true (assoc :must must-keys
@@ -299,8 +419,8 @@
         must-keys    (set (or (:must done) #{}))
         should-keys  (set (or (:should done) #{}))
         score-min    (done-score-min (:score-min done))
-        must-results (mapv #(run-check % call-node env result check-fns) must-keys)
-        should-results (mapv #(run-check % call-node env result check-fns) should-keys)
+        must-results (mapv #(run-check protocol % call-node env result check-fns) must-keys)
+        should-results (mapv #(run-check protocol % call-node env result check-fns) should-keys)
         must-failed  (->> must-results (remove :ok?) (mapv :check))
         should-failed (->> should-results (remove :ok?) (mapv :check))
         should-score (if (seq should-results)
@@ -332,7 +452,8 @@
   (or (get-in result [:error :type])
       (when-not (:ok? (contracts/validate-result protocol
                                                  (:intent call-node)
-                                                 result))
+                                                 result
+                                                 (:requires call-node)))
         :schema/invalid)
       (:failure/type done-eval)))
 
@@ -416,7 +537,9 @@
                 (recur (inc idx) env' emitted))
 
               :call
-              (let [base-node    (update node :input contracts/materialize-plan env)
+              (let [base-node    (-> node
+                                     (update :input contracts/materialize-plan env)
+                                     normalize-call-node)
                     _            (enforce-effects-authorization! resolver base-node env)
                     retry-policy (resolve-retry-policy resolver base-node)
                     switch-on    (resolve-switch-on resolver base-node)
@@ -530,7 +653,9 @@
                                          :rejected-candidates rejected})))))))
 
               :tool
-              (let [base-node      (update node :input contracts/materialize-plan env)
+              (let [base-node      (-> node
+                                       (update :input contracts/materialize-plan env)
+                                       normalize-call-node)
                     tool-id        (:tool/id base-node)
                     req-effects    (requested-effects base-node)
                     allow-failure? (true? (get-in base-node [:dispatch :allow-failure?]))]
@@ -553,11 +678,18 @@
                                    :error :effects/runtime-missing
                                    :failure/type :effects/runtime-missing
                                    :retryable? false})))
-                (enforce-effects-authorization! resolver base-node env)
+                (let [authz-ctx (enforce-effects-authorization! resolver base-node env)
+                      tool-node (cond-> base-node
+                                  (map? (:auth/user authz-ctx))
+                                  (assoc :auth/user (:auth/user authz-ctx))
+                                  (map? (:roles/config authz-ctx))
+                                  (assoc :roles/config (:roles/config authz-ctx))
+                                  (map? (:auth/effects authz-ctx))
+                                  (assoc :auth/effects (:auth/effects authz-ctx)))]
                 (telemetry-inc! telemetry* :calls/total)
                 (let [outcome
                       (try
-                        (let [raw-result (invoke-tool base-node env)
+                        (let [raw-result (invoke-tool tool-node env)
                               result (if (and (map? raw-result)
                                               (or (contains? raw-result :result)
                                                   (contains? raw-result :error)))
@@ -623,8 +755,8 @@
                         (throw (ex-info "Tool node execution failed"
                                         (merge {:node node
                                                 :outcome outcome}
-                                               (when (map? (:details outcome))
-                                                 (:details outcome))))))))))
+                                                (when (map? (:details outcome))
+                                                  (:details outcome)))))))))))
 
               :emit
               (let [output (materialize-emit-input (:input node) env)]

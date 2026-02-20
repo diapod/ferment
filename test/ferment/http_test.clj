@@ -273,3 +273,40 @@
       (is (= 1 (get-in @telemetry [:act :routing :route/fail-open])))
       (is (= 1 (get-in @telemetry [:act :routing :route/fail-closed])))
       (is (= 1 (get-in @telemetry [:act :routing :route/strict]))))))
+
+(deftest invoke-act-writes-audit-trail-event
+  (testing "invoke-act emits persistent audit event with trace/request/session/principal/intent/capability/outcome."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}}
+          payload {:proto 1
+                   :trace {:id "trace-audit-1"}
+                   :request/id "req-audit-1"
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :session/id "sess-audit-1"
+                   :input {:prompt "hej"}}
+          auth {:source :http/basic
+                :user {:user/id 42
+                       :user/email "audit@example.com"
+                       :user/account-type :operator
+                       :user/roles #{:role/operator}}}
+          response (with-redefs [core/execute-capability!
+                                 (fn [_runtime _resolver _opts]
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})
+                                 ferment.oplog/logger
+                                 (fn [_sub _cfg]
+                                   (fn [& {:as msg}]
+                                     (reset! seen msg)))]
+                     (http/invoke-act runtime payload nil auth))]
+      (is (= 200 (:status response)))
+      (is (= "trace-audit-1" (:trace-id @seen)))
+      (is (= "req-audit-1" (:request-id @seen)))
+      (is (= "sess-audit-1" (:session-id @seen)))
+      (is (= :text/respond (:intent @seen)))
+      (is (= :llm/voice (:capability @seen)))
+      (is (= :ok (:outcome @seen)))
+      (is (= 200 (:status @seen)))
+      (is (= 42 (:principal-id @seen)))
+      (is (= "audit@example.com" (:principal-email @seen))))))

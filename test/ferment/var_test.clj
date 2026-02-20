@@ -127,7 +127,13 @@
                     (let [cap (get cfg k)]
                       (and (contains? cap :cap/intents)
                            (contains? cap :cap/can-produce)
-                           (contains? cap :cap/effects-allowed))))
+                           (contains? cap :cap/effects-allowed)
+                           (contains? cap :cap/version)
+                           (contains? cap :cap/cost)
+                           (contains? cap :cap/limits)
+                           (contains? cap :cap/tags)
+                           (contains? cap :io/in-schema)
+                           (contains? cap :io/out-schema))))
                   cap-keys))
       (is (= 6 (count refs)))
       (is (= cap-keys (set refs))))))
@@ -165,6 +171,8 @@
   (testing "Entry hooks normalize capability contract metadata."
     (let [entry {:cap/id :llm/meta
                  :dispatch/tag :meta
+                 :io/in-schema :req/meta
+                 :io/out-schema :res/meta
                  :cap/intents [:route/decide]
                  :cap/can-produce :plan}
           initialized (caps/init-capability-value
@@ -176,7 +184,11 @@
               entry)))
       (is (= #{:route/decide} (:cap/intents initialized)))
       (is (= #{:plan} (:cap/can-produce initialized)))
-      (is (= #{:none} (:cap/effects-allowed initialized))))))
+      (is (= #{:none} (:cap/effects-allowed initialized)))
+      (is (= "1.0.0" (:cap/version initialized)))
+      (is (= {} (:cap/cost initialized)))
+      (is (= {} (:cap/limits initialized)))
+      (is (= #{} (:cap/tags initialized))))))
 
 (deftest caps-entry-hooks-fail-fast-on-missing-required-metadata
   (testing "Capability init fails fast when required metadata keys are missing."
@@ -186,6 +198,8 @@
          (caps/init-capability-value
           :ferment.caps.registry/llm-meta
           {:cap/id :llm/meta
+           :io/in-schema :req/meta
+           :io/out-schema :res/meta
            :dispatch/tag :meta
            :cap/intents #{:route/decide}})))
     (is (thrown-with-msg?
@@ -194,6 +208,8 @@
          (caps/init-capability-value
           :ferment.caps.registry/llm-meta
           {:cap/id :llm/meta
+           :io/in-schema :req/meta
+           :io/out-schema :res/meta
            :dispatch/tag :meta
            :cap/can-produce #{:plan}})))))
 

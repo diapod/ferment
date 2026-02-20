@@ -7,7 +7,8 @@
     ferment.effects
 
   (:require [clojure.java.io :as io]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [ferment.roles :as roles])
 
   (:import (java.net HttpURLConnection URI URL)
            (java.nio.charset Charset StandardCharsets)
@@ -104,6 +105,50 @@
       (or (get scope (keyword (name effect)))
           {})
       :else {})))
+
+(defn- auth-user
+  [tool-node env]
+  (let [node' (if (map? tool-node) tool-node {})
+        env'  (if (map? env) env {})]
+    (or (when (map? (:auth/user node'))
+          (:auth/user node'))
+        (when (map? (:auth/user env'))
+          (:auth/user env'))
+        (when (map? (get-in env' [:workflow/auth :user]))
+          (get-in env' [:workflow/auth :user])))))
+
+(defn- roles-config
+  [tool-node env]
+  (let [node' (if (map? tool-node) tool-node {})
+        env'  (if (map? env) env {})]
+    (or (when (map? (:roles/config node'))
+          (:roles/config node'))
+        (when (map? (:roles/config env'))
+          (:roles/config env'))
+        (when (map? (:roles env'))
+          (:roles env')))))
+
+(defn- enforce-effects-authorization!
+  [tool-node env]
+  (let [requested (effect-requested tool-node)
+        user      (auth-user tool-node env)
+        roles-cfg (roles-config tool-node env)]
+    (when (and (seq requested)
+               (map? roles-cfg))
+      (let [authz (roles/authorize-effects roles-cfg requested user)]
+        (when-not (:ok? authz)
+          (throw (ex-info "Tool node requested effects forbidden for authenticated principal."
+                          {:error :auth/forbidden-effect
+                           :failure/type :auth/forbidden-effect
+                           :retryable? false
+                           :requested-effects requested
+                           :denied-effects (:denied authz)
+                           :user (cond-> {}
+                                   (some? (:user/id user)) (assoc :user/id (:user/id user))
+                                   (some? (:user/email user)) (assoc :user/email (:user/email user))
+                                   (some? (:user/account-type user)) (assoc :user/account-type (:user/account-type user))
+                                   (seq (:user/roles user)) (assoc :user/roles (:user/roles user)))
+                           :roles (:roles authz)})))))))
 
 (defn- deny-scope!
   [effect reason details]
@@ -533,7 +578,7 @@
   - `env`:         current workflow env (reserved for future use)"
   ([effects-cfg tool-node]
    (invoke-tool! effects-cfg tool-node nil))
-  ([effects-cfg tool-node _env]
+  ([effects-cfg tool-node env]
    (let [tool-id (or (keywordish (:tool/id tool-node))
                      (keywordish (:tool tool-node)))
          effect  (get tool->effect tool-id)]
@@ -542,6 +587,7 @@
      (when-not (keyword? effect)
        (unsupported-tool! tool-id))
      (assert-effect-requested! tool-node tool-id effect)
+     (enforce-effects-authorization! tool-node env)
      (case tool-id
        :fs/write-file    (fs-write-file! effects-cfg tool-node)
        :fs/write         (fs-write-file! effects-cfg tool-node)

@@ -191,6 +191,7 @@ Cel praktyczny:
 
 ### Etap D – Pamięć i obserwowalność
 - `session-state` i korelacja `request/id`,
+- jawny kontrakt `session vars` jako pamięć robocza (namespace kluczy, TTL, freeze/thaw, limity),
 - telemetry events (start/stop/error),
 - lokalny cache odpowiedzi (opcjonalnie).
 

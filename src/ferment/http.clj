@@ -180,6 +180,9 @@
                              (some-> request :intent keywordish))
                   cap-id (or (some-> request :task :cap/id keywordish)
                              (some-> request :cap/id keywordish))
+                  requires (contracts/normalize-requires
+                            (or (get-in request [:task :requires])
+                                (:requires request)))
                   role   (keywordish (:role request))
                   response-type (or (some-> request :response/type keywordish)
                                     (some-> request :response :type keywordish))
@@ -188,6 +191,7 @@
               (cond-> request
                 (keyword? intent) (assoc-in [:task :intent] intent)
                 (keyword? cap-id) (assoc-in [:task :cap/id] cap-id)
+                (map? requires) (assoc-in [:task :requires] requires)
                 (keyword? role) (assoc :role role)
                 (keyword? response-type) (assoc :response/type response-type)
                 (some? stream?) (assoc :stream? stream?)
@@ -336,6 +340,7 @@
       (workflow/resolve-capability-id
        resolver
        {:intent  (get-in request [:task :intent])
+        :requires (get-in request [:task :requires])
         :effects (:effects request)})))
 
 (defn- effective-resolver
@@ -380,6 +385,7 @@
              :done            (:done request)
              :budget          budget
              :effects         (:effects request)
+             :requires        (get-in request [:task :requires])
              :request-id      (:request/id request)
              :trace           (:trace request)
              :proto           (:proto request)
@@ -396,6 +402,62 @@
       (map? auth-user) (assoc :auth/user auth-user)
       (map? (:roles runtime)) (assoc :roles (:roles runtime))
       (map? session-meta) (assoc :session/meta session-meta))))
+
+(defn- response-error-type
+  [response]
+  (let [body (if (map? response) (:body response) nil)]
+    (or (some-> body :error :type keywordish)
+        (some-> body :result :error :type keywordish))))
+
+(defn- response-outcome
+  [response]
+  (if (< (int (or (:status response) 500)) 400)
+    :ok
+    :error))
+
+(defn- audit-principal
+  [auth request]
+  (or (auth-user-public (some-> auth :user))
+      (auth-user-public (:auth/user request))))
+
+(defn- report-act!
+  [runtime request response auth elapsed-ms]
+  (let [logger (oplog/logger :act runtime)]
+    (when (fn? logger)
+      (let [principal (audit-principal auth request)
+            trace-id (some-> request :trace :id trim-s)
+            request-id (some-> request :request/id trim-s)
+            session-id (or (some-> request :session/id trim-s)
+                           (some-> request :session-id trim-s))
+            intent (some-> request :task :intent keywordish)
+            capability (or (some-> request :task :cap/id keywordish)
+                           (some-> request :cap/id keywordish))
+            status (int (or (:status response) 500))
+            outcome (response-outcome response)
+            error-type (response-error-type response)
+            message (or (some-> response :body :error :message trim-s)
+                        (when (= :ok outcome) "Request processed.")
+                        "Request failed.")]
+        (apply logger
+               (mapcat identity
+                       (cond-> {:trace-id trace-id
+                                :request-id request-id
+                                :session-id session-id
+                                :intent intent
+                                :capability capability
+                                :outcome outcome
+                                :status status
+                                :error-type error-type
+                                :latency-ms elapsed-ms
+                                :message message}
+                         (some? (:user/id principal))
+                         (assoc :principal-id (:user/id principal))
+                         (some? (:user/email principal))
+                         (assoc :principal-email (:user/email principal))
+                         (some? (:user/account-type principal))
+                         (assoc :principal-account-type (:user/account-type principal))
+                         (seq (:user/roles principal))
+                         (assoc :principal-roles (vec (:user/roles principal))))))))))
 
 (defn- keyword-vec
   [v]
@@ -852,6 +914,7 @@
                        (update response :body merge session-view)
                        response)]
      (record-act-telemetry! telemetry response' elapsed-ms route-telemetry)
+     (report-act! runtime request* response' auth elapsed-ms)
      response')))
 
 (def ^:private session-public-keys

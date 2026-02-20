@@ -60,24 +60,28 @@
       (if (map? cfg) cfg {}))
     {}))
 
-(defn- intent-quality-config
+(defn- intent-policy-config
   [protocol intent]
-  (let [cfg (some-> (intent-config protocol intent) :quality)]
+  (let [cfg (contracts/intent-policy protocol intent)]
     (if (map? cfg) cfg {})))
 
 (defn- intent-default-done
   [protocol intent]
-  (let [done-cfg (:done (intent-quality-config protocol intent))]
+  (let [done-cfg (:done (intent-policy-config protocol intent))]
     (if (map? done-cfg) done-cfg nil)))
 
 (defn- intent-judge-config
   [protocol intent]
-  (let [global-cfg (if (map? (:quality/judge protocol))
-                     (:quality/judge protocol)
-                     {})
-        intent-cfg (let [cfg (:judge (intent-quality-config protocol intent))]
-                     (if (map? cfg) cfg {}))]
-    (merge global-cfg intent-cfg)))
+  (let [cfg (:judge (intent-policy-config protocol intent))]
+    (if (map? cfg) cfg {})))
+
+(defn- intent-retry-max-attempts
+  [protocol intent]
+  (let [retry-cfg (:retry (intent-policy-config protocol intent))
+        max-attempts (:max-attempts retry-cfg)]
+    (when (and (integer? max-attempts)
+               (pos? max-attempts))
+      max-attempts)))
 
 (defn- parse-double-safe
   [v]
@@ -164,12 +168,14 @@
       :else true)))
 
 (defn- schema-valid?
-  [_call-node _env result]
-  (:ok? (contracts/validate-result result)))
+  [protocol call-node result]
+  (:ok? (contracts/validate-result protocol
+                                   (:intent call-node)
+                                   result
+                                   (:requires call-node))))
 
 (def ^:private builtin-check-fns
-  {:schema-valid schema-valid?
-   :tests-pass tests-pass?
+  {:tests-pass tests-pass?
    :no-hallucinated-apis no-hallucinated-apis?})
 
 (def ^:private default-check-descriptors
@@ -178,9 +184,13 @@
    :no-hallucinated-apis :builtin/no-hallucinated-apis})
 
 (defn- resolve-check-descriptor
-  [descriptor]
+  [protocol descriptor]
   (cond
-    (= descriptor :builtin/schema-valid) schema-valid?
+    (or (= descriptor :builtin/schema-valid)
+        (= descriptor :schema-valid))
+    (fn [call-node _env result]
+      (schema-valid? protocol call-node result))
+
     (= descriptor :builtin/tests-pass) tests-pass?
     (= descriptor :builtin/no-hallucinated-apis) no-hallucinated-apis?
     (keyword? descriptor) (get builtin-check-fns descriptor)
@@ -191,10 +201,15 @@
   [runtime]
   (let [protocol    (or (runtime-protocol runtime) {})
         descriptors (merge default-check-descriptors
-                           (or (:quality/checks protocol) {}))]
+                           (if (map? (:quality/checks protocol))
+                             (:quality/checks protocol)
+                             {})
+                           (if (map? (:policy/checks protocol))
+                             (:policy/checks protocol)
+                             {}))]
     (reduce-kv
      (fn [acc check-k descriptor]
-       (if-some [f (resolve-check-descriptor descriptor)]
+       (if-some [f (resolve-check-descriptor protocol descriptor)]
          (assoc acc check-k f)
          acc))
      {}
@@ -475,7 +490,7 @@
   (boolean (re-find #"(stacktrace|Exception|NullPointer|compile|deps\.edn|defn|ns\s|\bClojure\b|patch|diff|regex|SQL|HTTP|API)" s)))
 
 (defn- build-request
-  [runtime {:keys [role intent cap-id input context constraints done budget effects protocol
+  [runtime {:keys [role intent cap-id input context constraints done budget effects requires protocol
                    auth-user
                    session-id session-version session-state request-id trace proto]}]
   (let [request-id (or (some-> request-id str str/trim not-empty)
@@ -522,6 +537,7 @@
                          (protocol-default protocol' :done/default nil))
         budget'      (or budget (protocol-default protocol' :budget/default nil))
         effects'     (or effects (protocol-default protocol' :effects/default nil))
+        requires'    (contracts/normalize-requires requires)
         input'       (if (map? input) input {:prompt (input->prompt input)})]
     (cond-> {:proto      proto'
              :trace      trace'
@@ -533,6 +549,7 @@
              :task       {:intent intent}
              :input      input'}
       (some? session-version) (assoc :session/version session-version)
+      (map? requires') (assoc-in [:task :requires] requires')
       (map? constraints') (assoc :constraints constraints')
       (map? done')        (assoc :done done')
       (map? budget')      (assoc :budget budget')
@@ -600,6 +617,7 @@
   `:value`, `:plan` or `:stream` depending on the configured parser."
   [runtime {:keys [role intent cap-id model system prompt input temperature
                    max-attempts result-parser context constraints done budget effects
+                   requires
                    request-id trace proto session-version resolver]
             :as opts}]
   (let [mode (llm-mode runtime)
@@ -629,6 +647,7 @@
                                         :done done
                                         :budget budget
                                         :effects effects
+                                        :requires requires
                                         :protocol protocol
                                         :request-id request-id
                                         :trace trace
@@ -669,6 +688,7 @@
                          :result {:type :value}})))
         run (contracts/invoke-with-contract invoke-fn request
                                             {:max-attempts (or max-attempts
+                                                               (intent-retry-max-attempts protocol intent)
                                                                (protocol-default protocol :retry/max-attempts 3)
                                                                3)
                                              :protocol protocol})]
@@ -734,6 +754,7 @@
                            :done (:done call-node)
                            :budget (:budget call-node)
                            :effects (:effects call-node)
+                           :requires (:requires call-node)
                            :temperature temp
                            :max-attempts (:max-attempts call-node)
                            :result-parser (:result-parser call-node)
@@ -813,6 +834,9 @@
    (let [effects-cfg (runtime-effects runtime)
          check-fns (runtime-check-fns runtime)
          judge-fn  (runtime-judge-fn runtime resolver opts)
+         protocol  (or (runtime-protocol runtime) {})
+         resolver' (cond-> (if (map? resolver) resolver {})
+                     (map? protocol) (assoc :protocol protocol))
          result (invoke-capability! runtime opts)
          rtype  (contracts/result-type-of result)
          workflow-env (cond-> {}
@@ -824,8 +848,8 @@
                       (contracts/result-plan-of result))
              run  (workflow/execute-plan
                    {:plan plan
-                    :resolver resolver
-                    :invoke-call (invoke-plan-call! runtime resolver)
+                    :resolver resolver'
+                    :invoke-call (invoke-plan-call! runtime resolver')
                     :invoke-tool (fn [tool-node env]
                                    (effects/invoke-tool! effects-cfg tool-node env))
                     :check-fns check-fns

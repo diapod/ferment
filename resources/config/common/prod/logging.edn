@@ -7,7 +7,13 @@
                           :timeout      [25 seconds]
                           :buffered-max 108}
 
- :ferment.logging/oplog {:auth #ref :ferment.oplog.auth/log}
+ :ferment.oplog.act/log {:db           #ref :ferment.db/main
+                         :table        :actlog
+                         :timeout      [15 seconds]
+                         :buffered-max 256}
+
+ :ferment.logging/oplog {:auth #ref :ferment.oplog.auth/log
+                         :act  #ref :ferment.oplog.act/log}
 
  ;; Logging to files
 

@@ -246,6 +246,68 @@
       (is (= [:llm/meta] @calls))
       (is (= {:text "meta"} (:emitted run))))))
 
+(deftest execute-plan-filters-candidates-by-requires-out-schema
+  (testing "CallNode :requires/:out-schema is a hard routing contract for candidate capabilities."
+    (let [calls (atom [])
+          run   (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :requires {:out-schema :res/text}
+                                  :dispatch {:candidates [:llm/solver :llm/voice]}
+                                  :as :answer}
+                                 {:op :emit
+                                  :input {:slot/id [:answer :out]}}]}
+                  :resolver {:caps/by-id
+                             {:llm/solver {:cap/id :llm/solver
+                                           :cap/intents #{:text/respond}
+                                           :cap/can-produce #{:value}
+                                           :cap/effects-allowed #{:none}
+                                           :io/in-schema :req/problem
+                                           :io/out-schema :res/problem}
+                              :llm/voice  {:cap/id :llm/voice
+                                           :cap/intents #{:text/respond}
+                                           :cap/can-produce #{:value}
+                                           :cap/effects-allowed #{:none}
+                                           :io/in-schema :req/text
+                                           :io/out-schema :res/text}}}
+                  :invoke-call
+                  (fn [call-node _env]
+                    (swap! calls conj (:cap/id call-node))
+                    {:result {:type :value
+                              :out {:text (name (:cap/id call-node))}}})})]
+      (is (:ok? run))
+      (is (= [:llm/voice] @calls))
+      (is (= {:text "voice"} (:emitted run))))))
+
+(deftest execute-plan-uses-policy-registry-for-retry-and-fallback
+  (testing "Per-intent policy registry drives retry/switch-on/fallback even without node dispatch overrides."
+    (let [calls (atom [])
+          run   (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :as :answer}
+                                 {:op :emit
+                                  :input {:slot/id [:answer :out]}}]}
+                  :resolver {:routing {:intent->cap {:text/respond :llm/voice-a}}
+                             :protocol {:policy/default {:retry {:same-cap-max 1
+                                                                 :fallback-max 1}
+                                                         :switch-on #{:eval/low-score}
+                                                         :fallback [:llm/voice-b]}
+                                        :policy/intents {:text/respond {:done {:must #{:schema-valid}
+                                                                               :score-min 1.0}
+                                                                        :checks [:schema-valid]}}
+                                        :result/types [:value]}}
+                  :invoke-call
+                  (fn [call-node _env]
+                    (swap! calls conj (:cap/id call-node))
+                    (if (= :llm/voice-a (:cap/id call-node))
+                      {:error {:type :eval/low-score}}
+                      {:result {:type :value
+                                :out {:text "ok"}}}))})]
+      (is (:ok? run))
+      (is (= [:llm/voice-a :llm/voice-a :llm/voice-b] @calls))
+      (is (= {:text "ok"} (:emitted run))))))
+
 (deftest execute-plan-rejects-capability-when-effects-not-allowed
   (testing "Routing rejects capability when node requires effects outside `:cap/effects-allowed`."
     (is (thrown-with-msg?
@@ -331,6 +393,15 @@
 (deftest execute-plan-runs-tool-node-through-runtime-invoker
   (testing "Tool node executes through :invoke-tool handler and exposes normalized slot output."
     (let [called (atom nil)
+          user   {:user/id 17
+                  :user/account-type :admin
+                  :user/roles #{:role/admin}}
+          roles-cfg {:enabled? true
+                     :authorize-default? false
+                     :anonymous-role :role/anonymous
+                     :logged-in-role :role/user
+                     :account-type->roles {:admin #{:role/admin}}
+                     :effects {:fs/write {:any #{:role/admin}}}}
           run (workflow/execute-plan
                {:plan {:nodes [{:op :tool
                                 :tool/id :fs/write-file
@@ -340,6 +411,8 @@
                                {:op :emit
                                 :input {:slot/id [:tool-res :out]}}]}
                 :resolver {}
+                :env {:auth/user user
+                      :roles/config roles-cfg}
                 :invoke-tool (fn [tool-node _env]
                                (reset! called tool-node)
                                {:result {:type :value
@@ -347,6 +420,9 @@
                                                :wrote? true}}})})]
       (is (:ok? run))
       (is (= :fs/write-file (:tool/id @called)))
+      (is (= 17 (get-in @called [:auth/user :user/id])))
+      (is (= roles-cfg (:roles/config @called)))
+      (is (= true (get-in @called [:auth/effects :ok?])))
       (is (= {:path "x.txt"
               :wrote? true}
              (:emitted run))))))

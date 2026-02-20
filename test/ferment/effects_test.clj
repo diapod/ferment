@@ -109,3 +109,33 @@
                         (ex-data e)))]
         (is (= :effects/scope-denied (:failure/type ex-data)))
         (is (= :host-not-allowed (:reason ex-data)))))))
+
+(deftest invoke-tool-enforces-role-based-effect-authorization
+  (testing "Tool invocation denies effect when role policy forbids requested effect."
+    (let [root (temp-dir)
+          cfg  {:fs/write {:enabled? true
+                           :root root
+                           :allow ["sandbox/"]}}
+          node {:tool/id :fs/write-file
+                :effects {:allowed #{:fs/write}}
+                :input {:path "sandbox/out.txt"
+                        :content "abc"
+                        :mkdirs? true}}
+          env  {:auth/user {:user/id 9
+                            :user/account-type :operator
+                            :user/roles #{:role/operator}}
+                :roles/config {:enabled? true
+                               :authorize-default? false
+                               :anonymous-role :role/anonymous
+                               :logged-in-role :role/user
+                               :account-type->roles {:operator #{:role/operator}
+                                                     :admin #{:role/admin}}
+                               :effects {:fs/write {:any #{:role/admin}}}}}
+          ex-data (try
+                    (effects/invoke-tool! cfg node env)
+                    nil
+                    (catch clojure.lang.ExceptionInfo e
+                      (ex-data e)))]
+      (is (= :auth/forbidden-effect (:failure/type ex-data)))
+      (is (= #{:fs/write} (:requested-effects ex-data)))
+      (is (= #{:fs/write} (:denied-effects ex-data))))))

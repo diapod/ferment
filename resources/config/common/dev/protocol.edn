@@ -1,7 +1,7 @@
 {
 
  :ferment.protocol/default
- {:quality/judge {:enabled? true
-                  :cap/id :llm/judge}}
+ {:policy/default {:judge {:enabled? true
+                           :cap/id :llm/judge}}}
 
 }

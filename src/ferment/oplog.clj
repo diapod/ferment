@@ -90,6 +90,15 @@
        (some-> config (get :ferment.logging/oplog) (get :auth))
        (get config :ferment.oplog.auth/log))))
 
+(defn act-config
+  "Returns default `/v1/act` operations logger configuration obtained from a system config."
+  ([]
+   (act-config app/state))
+  ([config]
+   (or (some-> config (get :oplog) (get :act))
+       (some-> config (get :ferment.logging/oplog) (get :act))
+       (get config :ferment.oplog.act/log))))
+
 (defn config
   "Returns default operations logger configuration obtained from a system config. Takes
   a subsystem name."
@@ -131,6 +140,13 @@
   ([cfg]
    (some-> (auth-config cfg) (get :fn/reporter))))
 
+(defn act-reporter
+  "Returns a reporter function of `/v1/act` logger."
+  ([]
+   (some-> (act-config) (get :fn/reporter)))
+  ([cfg]
+   (some-> (act-config cfg) (get :fn/reporter))))
+
 (defn logger
   "Retrieves operations logger function from a given `cfg` (via the given sub-name
   translated to a key using `config` function and then the `:fn/reporter` key) and
@@ -167,6 +183,18 @@
      (constantly nil)))
   ([cfg]
    (if-some [rep (auth-reporter cfg)]
+     (fn [& {:as message}] (rep message))
+     (constantly nil))))
+
+(defn act-logger
+  "Retrieves operations `/v1/act` logger function from the given `cfg` and
+  creates a wrapper for handling keyword arguments."
+  ([]
+   (if-some [rep (act-reporter)]
+     (fn [& {:as message}] (rep message))
+     (constantly nil)))
+  ([cfg]
+   (if-some [rep (act-reporter cfg)]
      (fn [& {:as message}] (rep message))
      (constantly nil))))
 

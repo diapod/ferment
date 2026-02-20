@@ -176,3 +176,98 @@
 
           (is (true? (session-store/del-all-vars! store "s-vars")))
           (is (= {} (session-store/get-vars store "s-vars" [:k1 :k2]))))))))
+
+(deftest session-vars-contract-enforces-key-namespace
+  (testing "Session vars reject keys outside configured namespace contract."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:keys/require-qualified? true
+                   :keys/allowed-namespaces #{"session"}
+                   :freeze/allow-write? true
+                   :freeze/allow-delete? true}})]
+      (session-store/ensure-session! store "s-ns")
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"namespace-qualified"
+           (session-store/put-var! store "s-ns" :k1 "v1")))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"not allowed"
+           (session-store/put-var! store "s-ns" :other/k2 "v2")))
+      (is (true? (session-store/put-var! store "s-ns" :session/k3 "v3")))
+      (is (= "v3" (session-store/get-var store "s-ns" :session/k3))))))
+
+(deftest session-vars-contract-enforces-freeze-thaw-policy
+  (testing "Session vars respect write/delete policy when session is frozen."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:keys/require-qualified? true
+                   :keys/allowed-namespaces #{"session"}
+                   :freeze/allow-write? false
+                   :freeze/allow-delete? false}})]
+      (session-store/ensure-session! store "s-freeze")
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"read-only while session is frozen"
+           (session-store/put-var! store "s-freeze" :session/a 1)))
+
+      (session-store/thaw-session! store "s-freeze" nil)
+      (is (true? (session-store/put-var! store "s-freeze" :session/a 1)))
+      (is (= 1 (session-store/get-var store "s-freeze" :session/a)))
+
+      (session-store/freeze-session! store "s-freeze" nil)
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"read-only while session is frozen"
+           (session-store/del-var! store "s-freeze" :session/a)))
+
+      (session-store/thaw-session! store "s-freeze" nil)
+      (is (true? (session-store/del-var! store "s-freeze" :session/a)))
+      (is (nil? (session-store/get-var store "s-freeze" :session/a))))))
+
+(deftest session-vars-contract-enforces-ttl
+  (testing "Session vars expire by TTL and are evicted lazily on read."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:keys/require-qualified? true
+                   :keys/allowed-namespaces #{"session"}
+                   :ttl/default-ms 100
+                   :ttl/max-ms 1000
+                   :freeze/allow-write? true
+                   :freeze/allow-delete? true}})]
+      (session-store/ensure-session! store "s-ttl")
+      (with-redefs [session-store/now-ms (constantly 1000)]
+        (is (true? (session-store/put-var! store "s-ttl" :session/ttl "ok"))))
+      (with-redefs [session-store/now-ms (constantly 1050)]
+        (is (= "ok" (session-store/get-var store "s-ttl" :session/ttl))))
+      (with-redefs [session-store/now-ms (constantly 1201)]
+        (is (nil? (session-store/get-var store "s-ttl" :session/ttl))))
+      (is (= {} (session-store/get-vars store "s-ttl" [:session/ttl]))))))
+
+(deftest session-vars-contract-enforces-limit
+  (testing "Session vars refuse writes above configured max-vars limit."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:keys/require-qualified? true
+                   :keys/allowed-namespaces #{"session"}
+                   :limits/max-vars 2
+                   :freeze/allow-write? true
+                   :freeze/allow-delete? true}})]
+      (session-store/ensure-session! store "s-limit")
+      (is (true? (session-store/put-var! store "s-limit" :session/a 1)))
+      (is (true? (session-store/put-var! store "s-limit" :session/b 2)))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"count exceeds"
+           (session-store/put-var! store "s-limit" :session/c 3)))
+      (is (true? (session-store/put-var! store "s-limit" :session/a 11)))
+      (is (= {:session/a 11 :session/b 2}
+             (session-store/get-vars store "s-limit" [:session/a :session/b]))))))

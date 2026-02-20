@@ -4,6 +4,10 @@
  :ferment.caps.registry/llm-voice
  {:cap/id        :llm/voice
   :cap/kind      :llm
+  :cap/version   "2026.02"
+  :cap/cost      {:latency-ms 1200}
+  :cap/limits    {:timeout-ms 15000}
+  :cap/tags      #{:voice :polish}
   :cap/intents   #{:text/respond}
   :cap/can-produce #{:value}
   :cap/effects-allowed #{:none}
@@ -16,6 +20,10 @@
  :ferment.caps.registry/llm-code
  {:cap/id        :llm/code
   :cap/kind      :llm
+  :cap/version   "2026.02"
+  :cap/cost      {:latency-ms 1800}
+  :cap/limits    {:timeout-ms 30000}
+  :cap/tags      #{:code :clojure}
   :cap/intents   #{:code/generate :code/patch :code/explain :code/review}
   :cap/can-produce #{:value :plan}
   :cap/effects-allowed #{:none}
@@ -28,6 +36,10 @@
  :ferment.caps.registry/llm-solver
  {:cap/id        :llm/solver
   :cap/kind      :llm
+  :cap/version   "2026.02"
+  :cap/cost      {:latency-ms 1500}
+  :cap/limits    {:timeout-ms 20000}
+  :cap/tags      #{:solver :general}
   :cap/intents   #{:problem/solve}
   :cap/can-produce #{:value :plan}
   :cap/effects-allowed #{:none}
@@ -40,6 +52,10 @@
  :ferment.caps.registry/llm-meta
  {:cap/id        :llm/meta
   :cap/kind      :llm
+  :cap/version   "2026.02"
+  :cap/cost      {:latency-ms 900}
+  :cap/limits    {:timeout-ms 12000}
+  :cap/tags      #{:router :meta}
   :cap/intents   #{:route/decide :context/summarize}
   :cap/can-produce #{:value :plan}
   :cap/effects-allowed #{:none}
@@ -52,6 +68,10 @@
  :ferment.caps.registry/llm-judge
  {:cap/id        :llm/judge
   :cap/kind      :llm
+  :cap/version   "2026.02"
+  :cap/cost      {:latency-ms 900}
+  :cap/limits    {:timeout-ms 12000}
+  :cap/tags      #{:judge :quality}
   :cap/intents   #{:eval/grade}
   :cap/can-produce #{:value}
   :cap/effects-allowed #{:none}
@@ -64,6 +84,10 @@
  :ferment.caps.registry/llm-mock
  {:cap/id        :llm/mock
   :cap/kind      :mock
+  :cap/version   "2026.02"
+  :cap/cost      {:latency-ms 1}
+  :cap/limits    {:timeout-ms 1000}
+  :cap/tags      #{:mock :test}
   :cap/intents   #{:route/decide :context/summarize :text/respond
                    :problem/solve
                    :code/generate :code/patch :code/explain :code/review
@@ -96,12 +120,7 @@
                 :code/explain      :llm/code
                 :code/review       :llm/code
                 :eval/grade        :llm/judge}
-  :policy      :quality-aware
-  :switch-on   #{:schema/invalid :format/drift :eval/low-score}
-  :retry       {:same-cap-max 1
-                :fallback-max 1}
-  :fallback    [:llm/solver :llm/code :llm/meta :llm/judge :llm/mock]
-  :checks      [:schema-valid :tests-pass]}
+  :policy      :quality-aware}
 
  ;; Runtime/profile policy knobs
  :ferment.caps/profiles
