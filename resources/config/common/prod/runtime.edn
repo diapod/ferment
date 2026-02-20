@@ -1,9 +1,26 @@
 {
  :ferment.runtime/default
  {:models   #ref :ferment/models
+  :router   #ref :ferment.router/default
   :resolver #ref :ferment.resolver/default
   :protocol #ref :ferment.protocol/default
+  :roles    #ref :ferment.roles/default
   :session  #ref :ferment.session/default
+  :effects
+  {:fs/write
+   {:enabled? true
+    :root "."
+    :allow ["src/" "test/" "resources/" "doc/" "dev/" "target/" "tmp/"]}
+   :process/run
+   {:enabled? true
+    :root "."
+    :allow-cwd ["."]
+    :allow-commands ["clojure" "git" "rg" "sed" "cat" "ls" "mkdir" "cp" "mv" "printf"]}
+   :net/http
+   {:enabled? false
+    :allow-schemes #{:https}
+    :allow-hosts []
+    :allow-ports []}}
   :oplog    #ref :ferment.logging/oplog}
 
  }

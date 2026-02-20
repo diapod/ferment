@@ -140,11 +140,16 @@
         opts' (if (map? opts) opts {})]
     (expire-hot-sessions! manager)
     (store/ensure-session! (:store manager) sid' opts')
-    (let [session (store/thaw-session!
+    (let [meta' (merge {:context/version
+                        (get-in manager [:context :context/version])}
+                       (if (map? (:session/meta opts'))
+                         (:session/meta opts')
+                         {}))
+          thaw-opts (assoc (dissoc opts' :session/meta) :session/meta meta')
+          session (store/thaw-session!
                    (:store manager)
                    sid'
-                   {:session/meta {:context/version
-                                   (get-in manager [:context :context/version])}})]
+                   thaw-opts)]
       (mark-hot! manager sid')
       (enforce-hot-limit! manager sid')
       session)))

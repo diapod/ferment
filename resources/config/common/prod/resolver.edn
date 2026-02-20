@@ -7,9 +7,6 @@
              #ref :ferment.caps.registry/llm-meta
              #ref :ferment.caps.registry/llm-judge
              #ref :ferment.caps.registry/llm-mock]
-  :protocol #ref :ferment.protocol/default
-  :routing  #ref :ferment.caps/routing
-  :profiles #ref :ferment.caps/profiles
-  :policy   :quality-aware}
+  :protocol #ref :ferment.protocol/default}
 
 }

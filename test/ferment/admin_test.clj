@@ -110,3 +110,73 @@
                (mapv :operation @logs)))
         (is (every? true? (map :success @logs)))
         (is (every? #(= :info (:level %)) @logs))))))
+
+(deftest role-admin-helpers-delegate-and-log
+  (testing "grant-role!, list-roles! and revoke-role! delegate to ferment.user and emit auth oplog."
+    (let [calls (atom [])
+          logs  (atom [])]
+      (with-redefs [app/state {:ferment.auth/setup :auth-source}
+                    oplog/auth-logger (fn [_cfg]
+                                        (fn [& {:as message}]
+                                          (swap! logs conj message)))
+                    user/grant-role! (fn [_auth selector role]
+                                       (swap! calls conj [:grant selector role])
+                                       {:ok? true
+                                        :granted? true
+                                        :role role
+                                        :user {:user/id 9}
+                                        :roles #{role}})
+                    user/list-roles! (fn [_auth selector]
+                                       (swap! calls conj [:list selector])
+                                       {:ok? true
+                                        :user {:user/id 9}
+                                        :roles #{:role/admin}})
+                    user/revoke-role! (fn [_auth selector role]
+                                        (swap! calls conj [:revoke selector role])
+                                        {:ok? true
+                                         :revoked? true
+                                         :role role
+                                         :user {:user/id 9}
+                                         :roles #{}})]
+        (is (:ok? (admin/grant-role! "user@example.com" :role/admin)))
+        (is (:ok? (admin/list-roles! "user@example.com")))
+        (is (:ok? (admin/revoke-role! "user@example.com" :role/admin)))
+        (is (= [[:grant "user@example.com" :role/admin]
+                [:list "user@example.com"]
+                [:revoke "user@example.com" :role/admin]]
+               @calls))
+        (is (= ["admin/grant-role" "admin/list-roles" "admin/revoke-role"]
+               (mapv :operation @logs)))))))
+
+(deftest role-dictionary-admin-helpers-delegate-and-log
+  (testing "create-role!, list-known-roles!, delete-role! delegate to ferment.user and emit auth oplog."
+    (let [calls (atom [])
+          logs  (atom [])]
+      (with-redefs [app/state {:ferment.auth/setup :auth-source}
+                    oplog/auth-logger (fn [_cfg]
+                                        (fn [& {:as message}]
+                                          (swap! logs conj message)))
+                    user/create-role! (fn
+                                        ([_auth role]
+                                         (swap! calls conj [:create role nil])
+                                         {:ok? true :created? true :role role})
+                                        ([_auth role description]
+                                         (swap! calls conj [:create role description])
+                                         {:ok? true :created? true :role role :description description}))
+                    user/list-known-roles! (fn [_auth]
+                                             (swap! calls conj [:list-known])
+                                             {:ok? true :roles [{:role :role/admin}]})
+                    user/delete-role! (fn [_auth role]
+                                        (swap! calls conj [:delete role])
+                                        {:ok? true :deleted? true :role role})]
+        (is (:ok? (admin/create-role! :role/researcher)))
+        (is (:ok? (admin/create-role! :role/researcher "Role used in diagnostics.")))
+        (is (:ok? (admin/list-known-roles!)))
+        (is (:ok? (admin/delete-role! :role/researcher)))
+        (is (= [[:create :role/researcher nil]
+                [:create :role/researcher "Role used in diagnostics."]
+                [:list-known]
+                [:delete :role/researcher]]
+               @calls))
+        (is (= ["admin/create-role" "admin/create-role" "admin/list-known-roles" "admin/delete-role"]
+               (mapv :operation @logs)))))))

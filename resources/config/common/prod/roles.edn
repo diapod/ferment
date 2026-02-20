@@ -1,0 +1,39 @@
+{
+ ;; Role policy for Ferment runtime.
+ ;; Current phase: lightweight RBAC driven by account type.
+
+ :ferment.roles/default
+ {:enabled?            true
+  :authorize-default?  true
+  :global-context      :!
+  :anonymous-role      :role/anonymous
+  :logged-in-role      :role/user
+  :account-type->roles {:system   #{:role/admin}
+                        :manager  #{:role/admin}
+                        :admin    #{:role/admin}
+                        :provider #{:role/operator}
+                        :operator #{:role/operator}
+                        :user     #{:role/user}}
+  :operations          {:http.v1/act                {:any #{:role/user :role/operator :role/admin}}
+                        :http.v1/session            {:any #{:role/user :role/operator :role/admin}}
+                        :admin/create-user          {:any #{:role/admin}}
+                        :admin/delete-user          {:any #{:role/admin}}
+                        :admin/set-password         {:any #{:role/admin}}
+                        :admin/lock-user            {:any #{:role/admin}}
+                        :admin/unlock-user          {:any #{:role/admin}}
+                        :admin/grant-role           {:any #{:role/admin}}
+                        :admin/revoke-role          {:any #{:role/admin}}
+                        :admin/list-roles           {:any #{:role/admin}}
+                        :admin/create-role          {:any #{:role/admin}}
+                        :admin/delete-role          {:any #{:role/admin}}
+                        :admin/list-known-roles     {:any #{:role/admin}}
+                        :admin/reset-login-attempts {:any #{:role/admin}}
+                        :admin/migrate-db           {:any #{:role/admin}}
+                        :admin/rollback-db          {:any #{:role/admin}}}
+  :effects             {:none        {:any #{:role/anonymous :role/user :role/operator :role/admin}}
+                        :fs/read     {:any #{:role/operator :role/admin}}
+                        :fs/write    {:any #{:role/admin}}
+                        :process/run {:any #{:role/admin}}
+                        :db/read     {:any #{:role/operator :role/admin}}
+                        :db/write    {:any #{:role/admin}}
+                        :net/http    {:any #{:role/operator :role/admin}}}}}

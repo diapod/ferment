@@ -20,7 +20,9 @@
   (str "SELECT users.id AS id, users.email AS email, users.account_type AS account_type,"
        " users.login_attempts AS login_attempts,"
        " users.locked AS locked, users.soft_locked AS soft_locked,"
-       " users.password AS intrinsic, password_suites.suite AS shared"
+       " users.password AS intrinsic, password_suites.suite AS shared,"
+       " COALESCE((SELECT GROUP_CONCAT(user_roles.role ORDER BY user_roles.role SEPARATOR ',')"
+       "            FROM user_roles WHERE user_roles.user_id = users.id), '') AS roles"
        " FROM users JOIN password_suites ON password_suites.id = users.password_suite_id"
        " WHERE users.email = ?"))
 
@@ -28,12 +30,39 @@
   [v]
   (some-> v str str/trim not-empty))
 
+(defn- now-ms
+  []
+  (System/currentTimeMillis))
+
 (defn- account-type-k
   [v]
   (cond
     (keyword? v) v
     (string? v) (some-> v trim-s keyword)
     :else nil))
+
+(defn- role-k
+  [v]
+  (cond
+    (keyword? v) v
+    (string? v) (let [s (trim-s v)]
+                  (when s
+                    (if (str/starts-with? s ":")
+                      (keyword (subs s 1))
+                      (keyword s))))
+    :else nil))
+
+(defn- parse-roles
+  [v]
+  (cond
+    (nil? v) #{}
+    (set? v) (into #{} (keep role-k) v)
+    (sequential? v) (into #{} (keep role-k) v)
+    (keyword? v) #{v}
+    (string? v) (->> (str/split v #",")
+                     (keep role-k)
+                     set)
+    :else #{}))
 
 (defn- wait-no-user!
   [auth-config]
@@ -46,15 +75,17 @@
 (defn- login-row->data
   [row]
   (when (map? row)
-    {:user/id                  (:id row)
-     :user/email               (:email row)
-     :user/account-type        (some-> (:account_type row) trim-s keyword)
-     :user/login-attempts      (:login_attempts row)
-     :auth/locked-at           (:locked row)
-     :auth/soft-locked-at      (:soft_locked row)
-     :auth/locked?             (boolean (or (:locked row) (:soft_locked row)))
-     :auth/password-intrinsic  (:intrinsic row)
-     :auth/password-shared     (:shared row)}))
+    (let [roles' (parse-roles (:roles row))]
+      (cond-> {:user/id                  (:id row)
+               :user/email               (:email row)
+               :user/account-type        (some-> (:account_type row) trim-s keyword)
+               :user/login-attempts      (:login_attempts row)
+               :auth/locked-at           (:locked row)
+               :auth/soft-locked-at      (:soft_locked row)
+               :auth/locked?             (boolean (or (:locked row) (:soft_locked row)))
+               :auth/password-intrinsic  (:intrinsic row)
+               :auth/password-shared     (:shared row)}
+        (seq roles') (assoc :user/roles roles')))))
 
 (defn- lock-state
   [login-data auth-config now]
@@ -107,17 +138,35 @@
   (or (some-> opts :session/id trim-s)
       (some-> opts :session-id trim-s)))
 
+(defn- session-principal
+  [user]
+  (let [roles' (->> (parse-roles (:user/roles user))
+                    sort
+                    vec)]
+    (cond-> {}
+      (some? (:user/id user)) (assoc :user/id (:user/id user))
+      (some? (:user/email user)) (assoc :user/email (:user/email user))
+      (some? (:user/account-type user)) (assoc :user/account-type (:user/account-type user))
+      (seq roles') (assoc :user/roles roles'))))
+
 (defn- open-auth-session
   [opts user]
   (let [sid      (session-id opts)
         service  (session-service opts)
+        principal (session-principal user)
+        ts       (long (now-ms))
         meta'    (if (map? (:session/meta opts)) (:session/meta opts) {})
         open-raw (if (map? (:session/options opts)) (:session/options opts) {})
         open-opts (assoc open-raw
                          :session/meta
-                         (merge {:source :auth/authenticate-password
-                                 :user/id (:user/id user)
-                                 :user/email (:user/email user)}
+                         (merge (cond-> {:source :auth/authenticate-password
+                                         :auth/principal principal
+                                         :auth/principal-at ts
+                                         :auth/principal-refreshed-at ts}
+                                  (some? (:user/id principal)) (assoc :user/id (:user/id principal))
+                                  (some? (:user/email principal)) (assoc :user/email (:user/email principal))
+                                  (some? (:user/account-type principal)) (assoc :user/account-type (:user/account-type principal))
+                                  (seq (:user/roles principal)) (assoc :user/roles (:user/roles principal)))
                                 meta'))]
     (when (and sid service)
       (try

@@ -265,15 +265,98 @@
     :else
     {:ok? true})))
 
+(defn- keyword-coll-of?
+  [v]
+  (and (keyword-coll? v)
+       (every? keyword? v)))
+
+(defn- nonneg-int?
+  [v]
+  (and (integer? v) (<= 0 v)))
+
+(defn- validate-route-decide-out
+  [out]
+  (let [allowed-top-keys #{:cap/id :dispatch :constraints :done :budget :effects}
+        unknown-top-keys (seq (remove allowed-top-keys (keys out)))
+        dispatch-map (if (map? (:dispatch out)) (:dispatch out) nil)
+        retry-map   (some-> dispatch-map :retry)
+        allowed-dispatch-keys #{:candidates :checks :switch-on :retry}
+        unknown-dispatch-keys (when dispatch-map
+                                (seq (remove allowed-dispatch-keys (keys dispatch-map))))]
+    (cond
+      (not (map? out))
+      {:ok? false
+       :reason :route/decide-out-not-map}
+
+      (seq unknown-top-keys)
+      {:ok? false
+       :reason :route/decide-unknown-keys}
+
+      (not (contains? out :cap/id))
+      {:ok? false
+       :reason :route/decide-target-missing}
+
+      (not (keyword? (:cap/id out)))
+      {:ok? false
+       :reason :route/decide-cap-not-keyword}
+
+      (and (contains? out :dispatch)
+           (not (map? (:dispatch out))))
+      {:ok? false
+       :reason :route/decide-dispatch-not-map}
+
+      (seq unknown-dispatch-keys)
+      {:ok? false
+       :reason :route/decide-dispatch-unknown-keys}
+
+      (and dispatch-map
+           (contains? dispatch-map :candidates)
+           (not (keyword-coll-of? (:candidates dispatch-map))))
+      {:ok? false
+       :reason :route/decide-candidates-not-keywords}
+
+      (and dispatch-map
+           (contains? dispatch-map :checks)
+           (not (keyword-coll-of? (:checks dispatch-map))))
+      {:ok? false
+       :reason :route/decide-checks-not-keywords}
+
+      (and dispatch-map
+           (contains? dispatch-map :switch-on)
+           (not (keyword-coll-of? (:switch-on dispatch-map))))
+      {:ok? false
+       :reason :route/decide-switch-on-not-keywords}
+
+      (and (some? retry-map) (not (map? retry-map)))
+      {:ok? false
+       :reason :route/decide-retry-not-map}
+
+      (and (map? retry-map)
+           (contains? retry-map :same-cap-max)
+           (not (nonneg-int? (:same-cap-max retry-map))))
+      {:ok? false
+       :reason :route/decide-retry-same-cap-max-not-nonneg-int}
+
+      (and (map? retry-map)
+           (contains? retry-map :fallback-max)
+           (not (nonneg-int? (:fallback-max retry-map))))
+      {:ok? false
+       :reason :route/decide-retry-fallback-max-not-nonneg-int}
+
+      :else
+      {:ok? true})))
+
 (defn- validate-intent-result-shape
   [protocol intent result]
   (let [judge-intent (or (get-in protocol [:quality/judge :intent])
                          :eval/grade)
-        contract     (or (get-in protocol [:intents intent :result/contract])
-                         {:type :value
-                          :required [:score]
-                          :score/range [0.0 1.0]})]
-    (if (= intent judge-intent)
+         contract     (or (get-in protocol [:intents intent :result/contract])
+                          {:type :value
+                           :required [:score]
+                           :score/range [0.0 1.0]})
+         contract-kind (:contract/kind contract)]
+    (cond
+      (= intent judge-intent)
       (cond
         (contains? result :error)
         {:ok? false
@@ -286,6 +369,24 @@
 
         :else
         (validate-eval-grade-out (result-out-of result) contract))
+
+      (and (= :route/decide intent)
+           (= :route/decide contract-kind))
+      (cond
+        (contains? result :error)
+        {:ok? false
+         :reason :route/decide-error-not-allowed}
+
+        (and (keyword? (:type contract))
+             (not= (:type contract) (result-type-of result)))
+        {:ok? false
+         :reason :route/decide-result-type-not-value
+         :result/type (result-type-of result)}
+
+        :else
+        (validate-route-decide-out (result-out-of result)))
+
+      :else
       {:ok? true})))
 
 (defn validate-result

@@ -8,26 +8,70 @@
                            :optional [:constraints :done :context :budget :effects]}
   :envelope/response      {:required-one-of [:result :error]}
   :intents                {:route/decide      {:in-schema :req/route
-                                               :out-schema :res/route}
+                                               :out-schema :res/route
+                                               :result/contract {:type :value
+                                                                 :contract/kind :route/decide}
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :score-min 1.0}
+                                                         :checks [:schema-valid]
+                                                         :judge {:enabled? false}}}
                            :context/summarize {:in-schema :req/context
-                                               :out-schema :res/context-summary}
+                                               :out-schema :res/context-summary
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :score-min 1.0}
+                                                         :checks [:schema-valid]
+                                                         :judge {}}}
                            :text/respond      {:in-schema :req/text
-                                               :out-schema :res/text}
+                                               :out-schema :res/text
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :should #{:no-hallucinated-apis}
+                                                                :score-min 0.8}
+                                                         :checks [:schema-valid :no-hallucinated-apis]
+                                                         :judge {}}}
                            :problem/solve     {:in-schema :req/problem
-                                               :out-schema :res/problem}
+                                               :out-schema :res/problem
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :should #{:no-hallucinated-apis}
+                                                                :score-min 0.8}
+                                                         :checks [:schema-valid :no-hallucinated-apis]
+                                                         :judge {}}}
                            :code/generate     {:in-schema :req/code
-                                               :out-schema :res/code}
+                                               :out-schema :res/code
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :should #{:tests-pass :no-hallucinated-apis}
+                                                                :score-min 0.8}
+                                                         :checks [:schema-valid :tests-pass]
+                                                         :judge {}}}
                            :code/patch        {:in-schema :req/code
-                                               :out-schema :res/patch+tests}
+                                               :out-schema :res/patch+tests
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :should #{:tests-pass :no-hallucinated-apis}
+                                                                :score-min 0.8}
+                                                         :checks [:schema-valid :tests-pass]
+                                                         :judge {}}}
                            :code/explain      {:in-schema :req/code
-                                               :out-schema :res/explanation}
+                                               :out-schema :res/explanation
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :should #{:tests-pass :no-hallucinated-apis}
+                                                                :score-min 0.8}
+                                                         :checks [:schema-valid :tests-pass]
+                                                         :judge {}}}
                            :code/review       {:in-schema :req/code
-                                               :out-schema :res/review}
+                                               :out-schema :res/review
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :should #{:tests-pass :no-hallucinated-apis}
+                                                                :score-min 0.8}
+                                                         :checks [:schema-valid :tests-pass]
+                                                         :judge {}}}
                            :eval/grade        {:in-schema :req/eval
                                                :out-schema :res/eval
                                                :result/contract {:type :value
                                                                  :required [:score]
-                                                                 :score/range [0.0 1.0]}}}
+                                                                 :score/range [0.0 1.0]}
+                                               :quality {:done {:must #{:schema-valid}
+                                                                :score-min 1.0}
+                                                         :checks [:schema-valid]
+                                                         :judge {:enabled? false}}}}
   :roles                  {:router {:allowed [:route :checks :budget]}
                            :solver {:allowed [:analysis :value :notes]}
                            :coder  {:allowed [:patch :tests :notes]}

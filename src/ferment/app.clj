@@ -13,6 +13,7 @@
             [ferment.system           :as               system]
             [ferment.logging          :as                  log]
             [ferment.env              :as                  env]
+            [ferment.router]
             [ferment.session]
             [tick.core                :as                  t]
             [io.randomseed.utils.map  :as                map]

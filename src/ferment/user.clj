@@ -53,6 +53,32 @@
 (def ^:private delete-user-by-id-sql
   "DELETE FROM users WHERE id = ?")
 
+(def ^:private select-user-roles-by-user-id-sql
+  "SELECT role FROM user_roles WHERE user_id = ? ORDER BY role")
+
+(def ^:private select-role-by-name-sql
+  "SELECT role FROM roles WHERE role = ? LIMIT 1")
+
+(def ^:private select-known-roles-sql
+  "SELECT role, description FROM roles ORDER BY role")
+
+(def ^:private insert-role-sql
+  "INSERT INTO roles (role, description) VALUES (?, ?)")
+
+(def ^:private delete-role-sql
+  "DELETE FROM roles WHERE role = ?")
+
+(def ^:private count-role-assignments-sql
+  "SELECT COUNT(*) AS n FROM user_roles WHERE role = ?")
+
+(def ^:private insert-user-role-sql
+  (str "INSERT INTO user_roles (user_id, role)"
+       " VALUES (?, ?)"
+       " ON DUPLICATE KEY UPDATE role = VALUES(role)"))
+
+(def ^:private delete-user-role-sql
+  "DELETE FROM user_roles WHERE user_id = ? AND role = ?")
+
 (def ^:private insert-suite-sql
   (str "INSERT INTO password_suites (suite)"
        " VALUES (?)"
@@ -159,6 +185,51 @@
 (defn- normalize-email
   [email]
   (email-to-db email))
+
+(defn- normalize-role-name
+  [role]
+  (cond
+    (keyword? role) (subs (str role) 1)
+    (string? role) (let [s (some-> role str/trim not-empty)]
+                     (when s
+                       (if (str/starts-with? s ":")
+                         (subs s 1)
+                         s)))
+    :else nil))
+
+(defn- normalize-role-keyword
+  [role]
+  (some-> role normalize-role-name keyword))
+
+(defn- normalize-role-description
+  [description]
+  (some-> description str str/trim not-empty))
+
+(defn- role-row-by-name
+  [connectable role-name]
+  (when-some [role' (normalize-role-name role-name)]
+    (db/execute-one! connectable [select-role-by-name-sql role'])))
+
+(defn- role-known?
+  [connectable role-name]
+  (boolean
+   (some-> (role-row-by-name connectable role-name)
+           :role)))
+
+(defn- role-assignment-count
+  [connectable role-name]
+  (long
+   (or (some-> (db/execute-one! connectable [count-role-assignments-sql role-name])
+               :n
+               safe-parse-long)
+       0)))
+
+(defn- role-row->public
+  [row]
+  (when-let [role-k (normalize-role-keyword (:role row))]
+    (cond-> {:role role-k}
+      (some? (normalize-role-description (:description row)))
+      (assoc :description (normalize-role-description (:description row))))))
 
 (defn- normalize-account-type
   [account-type]
@@ -684,9 +755,229 @@
           {:ok?   false
            :error :user/not-found})))))
 
+(defn list-roles!
+  "Returns effective explicit roles assigned to a user in `user_roles` table."
+  [auth-source selector]
+  (let [auth-config (resolve-auth-config auth-source nil)
+        db-src      (resolve-db auth-source nil auth-config)]
+    (cond
+      (nil? auth-config)
+      {:ok? false :error :auth/not-configured}
+
+      (nil? db-src)
+      {:ok? false :error :db/not-configured}
+
+      :else
+      (jdbc/with-transaction [tx db-src]
+        (if-some [user-row (get-user tx selector)]
+          (let [user-id (long (:id user-row))
+                roles   (->> (db/<exec! tx select-user-roles-by-user-id-sql
+                                        [:users/id user-id])
+                             (keep (fn [row]
+                                     (normalize-role-keyword (:role row))))
+                             set)]
+            {:ok? true
+             :user (user-identity user-row)
+             :roles roles})
+          {:ok? false
+           :error :user/not-found})))))
+
+(defn list-known-roles!
+  "Lists roles from dictionary table `roles`."
+  [auth-source]
+  (let [auth-config (resolve-auth-config auth-source nil)
+        db-src      (resolve-db auth-source nil auth-config)]
+    (cond
+      (nil? auth-config)
+      {:ok? false :error :auth/not-configured}
+
+      (nil? db-src)
+      {:ok? false :error :db/not-configured}
+
+      :else
+      {:ok? true
+       :roles (->> (db/execute! db-src [select-known-roles-sql])
+                   (keep role-row->public)
+                   vec)})))
+
+(defn create-role!
+  "Creates role in dictionary table `roles`. Operation is idempotent."
+  ([auth-source role]
+   (create-role! auth-source role nil))
+  ([auth-source role description]
+   (let [auth-config (resolve-auth-config auth-source nil)
+         db-src      (resolve-db auth-source nil auth-config)
+         role-name   (normalize-role-name role)
+         role-k      (normalize-role-keyword role)
+         desc'       (normalize-role-description description)]
+     (cond
+       (nil? role-name)
+       {:ok? false :error :role/invalid-role}
+
+       (nil? auth-config)
+       {:ok? false :error :auth/not-configured}
+
+       (nil? db-src)
+       {:ok? false :error :db/not-configured}
+
+       :else
+       (jdbc/with-transaction [tx db-src]
+         (if-some [existing (role-row-by-name tx role-name)]
+           (cond-> {:ok? true
+                    :created? false
+                    :already? true
+                    :role role-k}
+             (some? (normalize-role-description (:description existing)))
+             (assoc :description (normalize-role-description (:description existing))))
+           (let [result (db/execute! tx [insert-role-sql role-name desc'])
+                 n      (update-count result)]
+             (cond-> {:ok? (pos? n)
+                      :created? (pos? n)
+                      :role role-k}
+               (some? desc') (assoc :description desc')))))))))
+
+(defn delete-role!
+  "Deletes role from dictionary table `roles` if it is not assigned in `user_roles`."
+  [auth-source role]
+  (let [auth-config (resolve-auth-config auth-source nil)
+        db-src      (resolve-db auth-source nil auth-config)
+        role-name   (normalize-role-name role)
+        role-k      (normalize-role-keyword role)]
+    (cond
+      (nil? role-name)
+      {:ok? false :error :role/invalid-role}
+
+      (nil? auth-config)
+      {:ok? false :error :auth/not-configured}
+
+      (nil? db-src)
+      {:ok? false :error :db/not-configured}
+
+      :else
+      (jdbc/with-transaction [tx db-src]
+        (if-not (role-known? tx role-name)
+          {:ok? false
+           :error :role/not-found
+           :role role-k}
+          (let [assignments (role-assignment-count tx role-name)]
+            (if (pos? assignments)
+              {:ok? false
+               :error :role/in-use
+               :role role-k
+               :assignments assignments}
+              (let [result (db/execute! tx [delete-role-sql role-name])
+                    n      (update-count result)]
+                (if (pos? n)
+                  {:ok? true
+                   :deleted? true
+                   :role role-k}
+                  {:ok? false
+                   :error :role/not-found
+                   :role role-k})))))))))
+
+(defn grant-role!
+  "Grants explicit role to a user (`user_roles`). Operation is idempotent."
+  [auth-source selector role]
+  (let [auth-config (resolve-auth-config auth-source nil)
+        db-src      (resolve-db auth-source nil auth-config)
+        role-name   (normalize-role-name role)
+        role-k      (some-> role-name keyword)]
+    (cond
+      (nil? role-name)
+      {:ok? false :error :user/invalid-role}
+
+      (nil? auth-config)
+      {:ok? false :error :auth/not-configured}
+
+      (nil? db-src)
+      {:ok? false :error :db/not-configured}
+
+      :else
+      (jdbc/with-transaction [tx db-src]
+        (cond
+          (not (role-known? tx role-name))
+          {:ok? false
+           :error :user/unknown-role
+           :role role-k}
+
+          :else
+          (if-some [user-row (get-user tx selector)]
+            (let [user-id       (long (:id user-row))
+                  current-roles (->> (db/<exec! tx select-user-roles-by-user-id-sql
+                                                [:users/id user-id])
+                                     (keep (fn [row]
+                                             (normalize-role-keyword (:role row))))
+                                     set)
+                  already?      (contains? current-roles role-k)]
+              (when-not already?
+                (db/<exec! tx insert-user-role-sql
+                           [:users/id user-id]
+                           role-name))
+              {:ok? true
+               :granted? (not already?)
+               :already? already?
+               :role role-k
+               :roles (if already?
+                        current-roles
+                        (conj current-roles role-k))
+               :user (user-identity user-row)})
+            {:ok? false
+             :error :user/not-found}))))))
+
+(defn revoke-role!
+  "Revokes explicit role from a user (`user_roles`). Operation is idempotent."
+  [auth-source selector role]
+  (let [auth-config (resolve-auth-config auth-source nil)
+        db-src      (resolve-db auth-source nil auth-config)
+        role-name   (normalize-role-name role)
+        role-k      (some-> role-name keyword)]
+    (cond
+      (nil? role-name)
+      {:ok? false :error :user/invalid-role}
+
+      (nil? auth-config)
+      {:ok? false :error :auth/not-configured}
+
+      (nil? db-src)
+      {:ok? false :error :db/not-configured}
+
+      :else
+      (jdbc/with-transaction [tx db-src]
+        (cond
+          (not (role-known? tx role-name))
+          {:ok? false
+           :error :user/unknown-role
+           :role role-k}
+
+          :else
+          (if-some [user-row (get-user tx selector)]
+            (let [user-id       (long (:id user-row))
+                  current-roles (->> (db/<exec! tx select-user-roles-by-user-id-sql
+                                                [:users/id user-id])
+                                     (keep (fn [row]
+                                             (normalize-role-keyword (:role row))))
+                                     set)
+                  present?      (contains? current-roles role-k)]
+              (when present?
+                (db/<exec! tx delete-user-role-sql
+                           [:users/id user-id]
+                           role-name))
+              {:ok? true
+               :revoked? present?
+               :missing? (not present?)
+               :role role-k
+               :roles (if present?
+                        (disj current-roles role-k)
+                        current-roles)
+               :user (user-identity user-row)})
+            {:ok? false
+             :error :user/not-found}))))))
+
 (def update-password! change-password!)
 (def set-password!    change-password!)
 (def remove-user!     delete-user!)
 (def lock!            lock-user!)
 (def unlock!          unlock-user!)
 (def reset-login!     reset-login-attempts!)
+(def roles!           list-roles!)
+(def known-roles!     list-known-roles!)

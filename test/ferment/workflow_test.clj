@@ -150,6 +150,29 @@
       (is (= [:llm/voice-a :llm/voice-b] @calls))
       (is (= {:text "voice-b"} (:emitted run))))))
 
+(deftest execute-plan-applies-per-intent-quality-checks
+  (testing "Per-intent :quality/:checks are enforced as hard gates even when node does not provide :done."
+    (let [err (try
+                (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :dispatch {:candidates [:llm/voice]}
+                                  :as :answer}
+                                 {:op :emit :input {:slot/id [:answer :out]}}]}
+                  :resolver {:protocol {:intents {:text/respond
+                                                  {:quality {:checks [:tests-pass]
+                                                             :done {:score-min 1.0}}}}
+                                       :result/types [:value]}}
+                  :check-fns {:tests-pass (fn [_ _ _] false)}
+                  :invoke-call (fn [_ _]
+                                 {:result {:type :value
+                                           :out {:text "x"}}})})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :eval/low-score (get-in err [:outcome :failure/type])))
+      (is (false? (get-in err [:outcome :failure/recover?]))))))
+
 (deftest execute-plan-fails-on-invalid-result-without-switch-policy
   (testing "Invalid result fails fast when failure type is not declared in :switch-on."
     (let [err (try
@@ -244,6 +267,39 @@
              {:result {:type :value
                        :out {:text "should-not-run"}}})})))))
 
+(deftest execute-plan-rejects-node-when-auth-forbids-effects
+  (testing "Authenticated principal cannot execute call when effect policy denies requested effects."
+    (let [err (try
+                (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :code/patch
+                                  :effects {:allowed #{:fs/write}}
+                                  :dispatch {:candidates [:llm/code]}
+                                  :as :answer}]}
+                  :resolver {:caps/by-id
+                             {:llm/code {:cap/id :llm/code
+                                         :cap/intents #{:code/patch}
+                                         :cap/can-produce #{:value :plan}
+                                         :cap/effects-allowed #{:fs/write}}}}
+                  :env {:auth/user {:user/id 7
+                                    :user/account-type :user}
+                        :roles/config {:enabled? true
+                                       :authorize-default? false
+                                       :account-type->roles {:user #{:role/user}
+                                                             :manager #{:role/admin}}
+                                       :effects {:fs/write {:any #{:role/admin}}}}}
+                  :invoke-call
+                  (fn [_ _]
+                    {:result {:type :value
+                              :out {:text "should-not-run"}}})})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :auth/forbidden-effect (:error err)))
+      (is (= :auth/forbidden-effect (:failure/type err)))
+      (is (= #{:fs/write} (:requested-effects err)))
+      (is (= #{:fs/write} (:denied-effects err))))))
+
 (deftest execute-plan-emits-telemetry-for-retry-and-fallback
   (testing "Telemetry counts retry/fallback and call statuses."
     (let [calls (atom [])
@@ -271,3 +327,26 @@
       (is (= 0 (get-in run [:telemetry :calls/failed])))
       (is (= 1 (get-in run [:telemetry :calls/retries])))
       (is (= 1 (get-in run [:telemetry :calls/fallback-hops]))))))
+
+(deftest execute-plan-runs-tool-node-through-runtime-invoker
+  (testing "Tool node executes through :invoke-tool handler and exposes normalized slot output."
+    (let [called (atom nil)
+          run (workflow/execute-plan
+               {:plan {:nodes [{:op :tool
+                                :tool/id :fs/write-file
+                                :effects {:allowed #{:fs/write}}
+                                :input {:path "x.txt"}
+                                :as :tool-res}
+                               {:op :emit
+                                :input {:slot/id [:tool-res :out]}}]}
+                :resolver {}
+                :invoke-tool (fn [tool-node _env]
+                               (reset! called tool-node)
+                               {:result {:type :value
+                                         :out {:path "x.txt"
+                                               :wrote? true}}})})]
+      (is (:ok? run))
+      (is (= :fs/write-file (:tool/id @called)))
+      (is (= {:path "x.txt"
+              :wrote? true}
+             (:emitted run))))))

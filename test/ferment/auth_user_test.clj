@@ -1,5 +1,6 @@
 (ns ferment.auth-user-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [ferment.auth :as auth]
             [ferment.auth.user :as auth-user]
             [ferment.session :as session]
@@ -21,11 +22,13 @@
                                          :email "user@example.com"
                                          :account_type "system"
                                          :login_attempts 2
+                                         :roles "role/admin,role/reviewer"
                                          :shared "{\"x\":1}"
                                          :intrinsic "{\"y\":2}"})]
         (is (= {:user/id 7
                 :user/email "user@example.com"
                 :user/account-type :system
+                :user/roles #{:role/admin :role/reviewer}
                 :user/login-attempts 2
                 :auth/locked-at nil
                 :auth/soft-locked-at nil
@@ -34,10 +37,12 @@
                 :auth/password-shared "{\"x\":1}"}
                (auth-user/get-login-data :auth "user@example.com" :system)))
         (is (= :db (:db @seen)))
-        (is (= ["SELECT users.id AS id, users.email AS email, users.account_type AS account_type, users.login_attempts AS login_attempts, users.locked AS locked, users.soft_locked AS soft_locked, users.password AS intrinsic, password_suites.suite AS shared FROM users JOIN password_suites ON password_suites.id = users.password_suite_id WHERE users.email = ? AND users.account_type = ?"
-                "user@example.com"
-                "system"]
-               (:params @seen)))))))
+        (is (= "user@example.com" (second (:params @seen))))
+        (is (= "system" (nth (:params @seen) 2)))
+        (is (str/includes? (first (:params @seen))
+                           "COALESCE((SELECT GROUP_CONCAT(user_roles.role"))
+        (is (str/includes? (first (:params @seen))
+                           "WHERE users.email = ? AND users.account_type = ?"))))))
 
 (deftest authenticate-password-success
   (testing "authenticate-password returns user without password fields"
@@ -67,6 +72,7 @@
                                              {:user/id 11
                                               :user/email "s@f.io"
                                               :user/account-type :operator
+                                              :user/roles #{:role/operator :role/reviewer}
                                               :auth/locked? false
                                               :auth/password-shared "{}"
                                               :auth/password-intrinsic "{}"})
@@ -88,7 +94,8 @@
         (is (= true (:ok? result)))
         (is (= {:user/id 11
                 :user/email "s@f.io"
-                :user/account-type :operator}
+                :user/account-type :operator
+                :user/roles #{:role/operator :role/reviewer}}
                (:user result)))
         (is (= {:session/id "auth-s1"
                 :session/version 7
@@ -99,7 +106,13 @@
         (is (= "auth-s1" (:sid @seen-open)))
         (is (= :auth/authenticate-password
                (get-in @seen-open [:opts :session/meta :source])))
+        (is (= 11
+               (get-in @seen-open [:opts :session/meta :auth/principal :user/id])))
+        (is (integer? (get-in @seen-open [:opts :session/meta :auth/principal-at])))
+        (is (integer? (get-in @seen-open [:opts :session/meta :auth/principal-refreshed-at])))
         (is (= 11 (get-in @seen-open [:opts :session/meta :user/id])))
+        (is (= [:role/operator :role/reviewer]
+               (get-in @seen-open [:opts :session/meta :user/roles])))
         (is (= :test (get-in @seen-open [:opts :session/meta :origin])))))))
 
 (deftest authenticate-password-updates-login-counters

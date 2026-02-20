@@ -18,10 +18,12 @@
             [clojure.spec.gen.alpha          :as             gen]
             [cheshire.core                   :as            json]
             [orchestra.spec.test             :as              st]
+            [ferment.admin                   :as           admin]
             [ferment.caps                    :as            caps]
             [ferment.core                    :as            core]
             [ferment.http                    :as           fhttp]
             [ferment.model                   :as           model]
+            [ferment.runtime                 :as        runtime]
             [ferment.session                 :as         session]
             [ferment.session.store           :as   session-store]
             [ferment.system                  :as          system]
@@ -150,6 +152,15 @@
       (is (= {:cap/id :llm/code :x 2}
              (get-in initialized [:caps/by-id :llm/code]))))))
 
+(deftest router-config-references-routing-policy
+  (testing "Router config keeps routing/profiles/policy under dedicated branch."
+    (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/router.edn")
+          router (get cfg :ferment.router/default)]
+      (is (map? router))
+      (is (= :ferment.caps/routing (:routing router)))
+      (is (= :ferment.caps/profiles (:profiles router)))
+      (is (= :quality-aware (:policy router))))))
+
 (deftest caps-entry-hooks-normalize-capability-metadata
   (testing "Entry hooks normalize capability contract metadata."
     (let [entry {:cap/id :llm/meta
@@ -187,16 +198,42 @@
            :cap/can-produce #{:plan}})))))
 
 (deftest runtime-config-contains-core-runtime-branch
-  (testing "Runtime branch has refs to resolver/protocol/session/oplog and models aggregate."
+  (testing "Runtime branch has refs to router/resolver/protocol/session/oplog and models aggregate."
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/runtime.edn")
           runtime (get cfg :ferment.runtime/default)]
       (is (map? runtime))
+      (is (= :ferment.router/default (:router runtime)))
       (is (= :ferment.resolver/default (:resolver runtime)))
       (is (= :ferment.protocol/default (:protocol runtime)))
       (is (= :ferment.session/default (:session runtime)))
       (is (= :ferment.logging/oplog (:oplog runtime)))
       (is (= :ferment/models
              (:models runtime))))))
+
+(deftest runtime-branch-attaches-router-policy-to-resolver
+  (testing "Runtime init injects router routing/policy into resolver for workflow dispatch."
+    (let [state (runtime/init-runtime
+                 :ferment.runtime/default
+                 {:router {:routing {:intent->cap {:problem/solve :llm/solver}}
+                           :profiles {:default [:llm/solver]}
+                           :policy :quality-aware}
+                  :resolver {:caps/by-id {:llm/solver {:cap/id :llm/solver}}}})]
+      (is (= {:intent->cap {:problem/solve :llm/solver}}
+             (get-in state [:resolver :routing])))
+      (is (= {:default [:llm/solver]}
+             (get-in state [:resolver :profiles])))
+      (is (= :quality-aware
+             (get-in state [:resolver :policy]))))))
+
+(deftest runtime-branch-fails-on-router-capability-mismatch
+  (testing "Runtime init fails fast when router references capability missing in resolver registry."
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"unknown capability id"
+         (runtime/init-runtime
+          :ferment.runtime/default
+          {:router {:routing {:intent->cap {:problem/solve :llm/missing}}}
+           :resolver {:caps/by-id {:llm/solver {:cap/id :llm/solver}}}})))))
 
 (deftest http-config-references-models-aggregate
   (testing "HTTP branch has :ferment.http/default key and reference to :ferment/models."
@@ -233,7 +270,8 @@
     (let [captured (atom nil)
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}}
                               :result/types [:value]}
-                   :resolver {:routing {:intent->cap {:problem/solve :llm/solver}}}}
+                   :router {:routing {:intent->cap {:problem/solve :llm/solver}}}
+                   :resolver {}}
           request {:proto 1
                    :trace {:id "trace-1" :turn 7}
                    :task {:intent "problem/solve"}
@@ -250,7 +288,8 @@
                                 :out {:text "OK"}}})]
         (let [resp (fhttp/invoke-act runtime request)]
           (is (= 200 (:status resp)))
-          (is (= (:resolver runtime) (:resolver @captured)))
+          (is (= {:intent->cap {:problem/solve :llm/solver}}
+                 (get-in @captured [:resolver :routing])))
           (is (= :problem/solve (get-in @captured [:opts :intent])))
           (is (= :llm/solver (get-in @captured [:opts :cap-id])))
           (is (= :solver (get-in @captured [:opts :role])))
@@ -264,7 +303,8 @@
   (testing "/v1/act returns contract errors and missing routing as envelope error."
     (let [runtime {:protocol {:intents {:code/patch {:in-schema :req/code}}
                               :result/types [:value]}
-                   :resolver {:routing {:intent->cap {}}}}
+                   :router {:routing {:intent->cap {}}}
+                   :resolver {}}
           invalid-resp (fhttp/invoke-act runtime {:proto 1
                                                   :trace {:id "bad"}})
           unsupported-resp (fhttp/invoke-act runtime {:proto 1
@@ -282,7 +322,8 @@
   (testing "/v1/act returns session metadata when runtime has attached session service."
     (let [runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}}
                               :result/types [:value]}
-                   :resolver {:routing {:intent->cap {:problem/solve :llm/solver}}}
+                   :router {:routing {:intent->cap {:problem/solve :llm/solver}}}
+                   :resolver {}
                    :session {:get! (fn [sid]
                                      {:session/id sid
                                       :session/version 7
@@ -312,7 +353,8 @@
           called (atom nil)
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}}
                               :result/types [:value]}
-                   :resolver {:routing {:intent->cap {:problem/solve :llm/solver}}}}
+                   :router {:routing {:intent->cap {:problem/solve :llm/solver}}}
+                   :resolver {}}
           server-state (fhttp/init-http
                         :ferment.http/default
                         {:host "127.0.0.1"
@@ -344,7 +386,8 @@
                 bad-body (json/parse-string (:body bad-resp) true)]
             (is (= 200 (:status ok-resp)))
             (is (= :problem/solve (get-in @called [:opts :intent])))
-            (is (= (:resolver runtime) (:resolver @called)))
+            (is (= {:intent->cap {:problem/solve :llm/solver}}
+                   (get-in @called [:resolver :routing])))
             (is (= :llm/solver (get-in @called [:opts :cap-id])))
             (is (= "E2E-OK" (get-in ok-body [:result :out :text])))
             (is (= "http-trace-1" (get-in ok-body [:trace :id])))
@@ -392,12 +435,495 @@
           (is (= (:session runtime)
                  (get-in (first @auth-calls) [:opts :session/service]))))))))
 
+(deftest http-basic-auth-can-be-rejected-by-role-policy
+  (testing "authorize-request returns 403 when authenticated user has no required role."
+    (let [runtime {:session {:open! (fn [sid _opts] {:session/id sid})}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:operator #{:role/operator}}
+                           :operations {:http.v1/act {:any #{:role/admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :operator}}]
+      (with-redefs-fn
+        {#'ferment.http/parse-basic-credentials
+         (fn [_exchange]
+           {:login "diag@example.com"
+            :password "secret"})
+         #'ferment.http/report-auth!
+         (fn [& _] nil)
+         #'ferment.auth.user/authenticate-password
+         (fn [_source login _password _account-type _opts]
+           {:ok? true
+            :user {:user/id 12
+                   :user/email login
+                   :user/account-type :operator}})}
+        (fn []
+          (let [response (#'ferment.http/authorize-request runtime nil {:session/id "sid-payload"} :http.v1/act)]
+            (is (= 403 (:status response)))
+            (is (= :auth/forbidden (get-in response [:body :error])))))))))
+
+(deftest http-session-principal-allows-v1-act-without-basic-auth
+  (testing "authenticate-request may resolve principal from session for /v1/act when session-principal mode is enabled."
+    (let [opened*   (atom [])
+          auth-calls (atom 0)
+          now-ms    (System/currentTimeMillis)
+          runtime   {:session {:get! (fn [_sid]
+                                       {:session/id "sid-1"
+                                        :session/version 3
+                                        :session/state :hot
+                                        :session/frozen? false
+                                        :session/meta {:auth/principal {:user/id 51
+                                                                        :user/email "session@example.com"
+                                                                        :user/account-type :operator
+                                                                        :user/roles [:role/operator]}
+                                                       :auth/principal-refreshed-at (- now-ms 2000)}})
+                               :open! (fn [sid opts]
+                                        (swap! opened* conj {:sid sid :opts opts})
+                                        {:session/id sid
+                                         :session/version 4
+                                         :session/state :hot
+                                         :session/frozen? false})}
+                     :roles {:enabled? true
+                             :authorize-default? false
+                             :operations {:http.v1/act {:any #{:role/operator}}}}
+                     :auth {:enabled? true
+                            :source :auth/source
+                            :session-principal {:enabled? true
+                                                :operations #{:http.v1/act}
+                                                :ttl-ms 600000
+                                                :refresh-ms 1}}}]
+      (with-redefs-fn
+        {#'ferment.http/parse-basic-credentials
+         (fn [_exchange] nil)
+         #'ferment.http/report-auth!
+         (fn [& _] nil)
+         #'ferment.auth.user/authenticate-password
+         (fn [& _args]
+           (swap! auth-calls inc)
+           {:ok? false})}
+        (fn []
+          (let [authn (#'ferment.http/authenticate-request runtime nil {:session/id "sid-1"} :http.v1/act)]
+            (is (:ok? authn))
+            (is (= :http/session-principal (get-in authn [:auth :source])))
+            (is (= 51 (get-in authn [:auth :user :user/id])))
+            (is (= #{:role/operator}
+                   (set (get-in authn [:auth :user :user/roles]))))
+            (is (= "sid-1" (get-in authn [:auth :session :session/id])))
+            (is (zero? @auth-calls))
+            (is (= 1 (count @opened*)))
+            (is (= 51 (get-in (first @opened*) [:opts :session/meta :auth/principal :user/id])))))))))
+
+(deftest http-session-principal-respects-ttl
+  (testing "authenticate-request rejects stale session principal when TTL is exceeded."
+    (let [now-ms  (System/currentTimeMillis)
+          runtime {:session {:get! (fn [_sid]
+                                     {:session/id "sid-expired"
+                                      :session/meta {:auth/principal {:user/id 71
+                                                                      :user/email "expired@example.com"
+                                                                      :user/account-type :operator
+                                                                      :user/roles [:role/operator]}
+                                                     :auth/principal-refreshed-at (- now-ms 10000)}})}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :operations {:http.v1/act {:any #{:role/operator}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :session-principal {:enabled? true
+                                              :operations #{:http.v1/act}
+                                              :ttl-ms 100
+                                              :refresh-ms 1}}}]
+      (with-redefs-fn
+        {#'ferment.http/parse-basic-credentials
+         (fn [_exchange] nil)
+         #'ferment.http/report-auth!
+         (fn [& _] nil)}
+        (fn []
+          (let [authn (#'ferment.http/authenticate-request runtime nil {:session/id "sid-expired"} :http.v1/act)]
+            (is (false? (:ok? authn)))
+            (is (= 401 (get-in authn [:response :status])))
+            (is (= :auth/unauthorized
+                   (get-in authn [:response :body :error])))))))))
+
+(deftest http-v1-admin-rejects-operator-without-admin-role
+  (testing "/v1/admin returns 403 when authenticated user lacks admin role."
+    (let [port (free-port)
+          runtime {:models {}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:operator #{:role/operator}}
+                           :operations {:admin/create-user {:any #{:role/admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :operator}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (with-redefs-fn
+          {#'ferment.http/parse-basic-credentials
+           (fn [_exchange]
+             {:login "diag@example.com"
+              :password "secret"})
+           #'ferment.http/report-auth!
+           (fn [& _] nil)
+           #'ferment.auth.user/authenticate-password
+           (fn [_source login _password _account-type _opts]
+             {:ok? true
+              :user {:user/id 10
+                     :user/email login
+                     :user/account-type :operator}})}
+          (fn []
+            (let [resp (http-post-json url {:action "admin/create-user"
+                                            :email "new@example.com"
+                                            :password "secret"})
+                  body (json/parse-string (:body resp) true)]
+              (is (= 403 (:status resp)))
+              (is (= "auth/forbidden" (:error body))))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
+(deftest http-v1-admin-allows-manager-to-create-user
+  (testing "/v1/admin calls create-user when authenticated role policy allows operation."
+    (let [port (free-port)
+          called (atom nil)
+          runtime {:models {}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:manager #{:role/admin}}
+                           :operations {:admin/create-user {:any #{:role/admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :manager}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (with-redefs-fn
+          {#'ferment.http/parse-basic-credentials
+           (fn [_exchange]
+             {:login "admin@example.com"
+              :password "secret"})
+           #'ferment.http/report-auth!
+           (fn [& _] nil)
+           #'ferment.auth.user/authenticate-password
+           (fn [_source login _password _account-type _opts]
+             {:ok? true
+              :user {:user/id 11
+                     :user/email login
+                     :user/account-type :manager}})
+           #'ferment.admin/create-user!
+           (fn [email password account-type]
+             (reset! called {:email email
+                             :password password
+                             :account-type account-type})
+             {:ok? true
+              :created? true
+              :user {:user/id 77
+                     :user/email email
+                     :user/account-type (or account-type :user)}})}
+          (fn []
+            (let [resp (http-post-json url {:action :admin/create-user
+                                            :email "new@example.com"
+                                            :password "new-secret"
+                                            :account-type :operator})
+                  body (json/parse-string (:body resp) true)]
+              (is (= 200 (:status resp)))
+              (is (= true (:ok? body)))
+              (is (= "admin/create-user" (:action body)))
+              (is (= "new@example.com" (:email @called)))
+              (is (= "new-secret" (:password @called)))
+              (is (= :operator (:account-type @called))))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
+(deftest http-v1-admin-rejects-db-migration-without-role
+  (testing "/v1/admin returns 403 for :admin/migrate-db when role policy denies operation."
+    (let [port (free-port)
+          runtime {:models {}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:manager #{:role/admin}}
+                           :operations {:admin/create-user {:any #{:role/admin}}
+                                        :admin/migrate-db  {:any #{:role/infra-admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :manager}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (with-redefs-fn
+          {#'ferment.http/parse-basic-credentials
+           (fn [_exchange]
+             {:login "admin@example.com"
+              :password "secret"})
+           #'ferment.http/report-auth!
+           (fn [& _] nil)
+           #'ferment.auth.user/authenticate-password
+           (fn [_source login _password _account-type _opts]
+             {:ok? true
+              :user {:user/id 13
+                     :user/email login
+                     :user/account-type :manager}})
+           #'ferment.admin/migrate!
+           (fn [& _]
+             (throw (ex-info "Should not run migration on denied request." {})))}
+          (fn []
+            (let [resp (http-post-json url {:action "admin/migrate-db"})
+                  body (json/parse-string (:body resp) true)]
+              (is (= 403 (:status resp)))
+              (is (= "auth/forbidden" (:error body))))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
+(deftest http-v1-admin-allows-db-migrate-and-rollback
+  (testing "/v1/admin delegates migrate/rollback through admin wrappers when role policy allows operations."
+    (let [port (free-port)
+          migrated (atom [])
+          rolled-back (atom [])
+          runtime {:models {}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:manager #{:role/admin}}
+                           :operations {:admin/migrate-db {:any #{:role/admin}}
+                                        :admin/rollback-db {:any #{:role/admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :manager}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (with-redefs-fn
+          {#'ferment.http/parse-basic-credentials
+           (fn [_exchange]
+             {:login "admin@example.com"
+              :password "secret"})
+           #'ferment.http/report-auth!
+           (fn [& _] nil)
+           #'ferment.auth.user/authenticate-password
+           (fn [_source login _password _account-type _opts]
+             {:ok? true
+              :user {:user/id 14
+                     :user/email login
+                     :user/account-type :manager}})
+           #'ferment.admin/migrate!
+           (fn
+             ([] (swap! migrated conj :no-opts) {:ok? true :migrated? true})
+             ([opts] (swap! migrated conj opts) {:ok? true :migrated? true}))
+           #'ferment.admin/rollback!
+           (fn
+             ([] (swap! rolled-back conj :no-opts) {:ok? true :rolled-back? true})
+             ([opts] (swap! rolled-back conj [:opts opts]) {:ok? true :rolled-back? true})
+             ([opts amount-or-id] (swap! rolled-back conj [:opts+amount opts amount-or-id]) {:ok? true :rolled-back? true}))}
+          (fn []
+            (let [migrate-resp (http-post-json url {:action "admin/migrate-db"
+                                                    :opts {:migrators-key :ferment.db/migrators}})
+                  migrate-body (json/parse-string (:body migrate-resp) true)
+                  rollback-resp (http-post-json url {:action "admin/rollback-db"
+                                                     :amount 2})
+                  rollback-body (json/parse-string (:body rollback-resp) true)]
+              (is (= 200 (:status migrate-resp)))
+              (is (= true (:ok? migrate-body)))
+              (is (= true (:migrated? migrate-body)))
+              (is (= "admin/migrate-db" (:action migrate-body)))
+              (is (= {:migrators-key "ferment.db/migrators"}
+                     (first @migrated)))
+
+              (is (= 200 (:status rollback-resp)))
+              (is (= true (:ok? rollback-body)))
+              (is (= true (:rolled-back? rollback-body)))
+              (is (= "admin/rollback-db" (:action rollback-body)))
+              (is (= [:opts+amount nil 2]
+                     (first @rolled-back))))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
+(deftest http-v1-admin-allows-role-management-actions
+  (testing "/v1/admin delegates grant/list/revoke role actions when role policy allows operations."
+    (let [port (free-port)
+          granted (atom [])
+          revoked (atom [])
+          listed  (atom [])
+          runtime {:models {}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:manager #{:role/admin}}
+                           :operations {:admin/grant-role {:any #{:role/admin}}
+                                        :admin/list-roles {:any #{:role/admin}}
+                                        :admin/revoke-role {:any #{:role/admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :manager}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (with-redefs-fn
+          {#'ferment.http/parse-basic-credentials
+           (fn [_exchange]
+             {:login "admin@example.com"
+              :password "secret"})
+           #'ferment.http/report-auth!
+           (fn [& _] nil)
+           #'ferment.auth.user/authenticate-password
+           (fn [_source login _password _account-type _opts]
+             {:ok? true
+              :user {:user/id 15
+                     :user/email login
+                     :user/account-type :manager}})
+           #'ferment.admin/grant-role!
+           (fn [selector role]
+             (swap! granted conj [selector role])
+             {:ok? true
+              :granted? true
+              :role role
+              :user {:user/id 77}
+              :roles #{role}})
+           #'ferment.admin/list-roles!
+           (fn [selector]
+             (swap! listed conj selector)
+             {:ok? true
+              :user {:user/id 77}
+              :roles #{:role/admin :role/operator}})
+           #'ferment.admin/revoke-role!
+           (fn [selector role]
+             (swap! revoked conj [selector role])
+             {:ok? true
+              :revoked? true
+              :role role
+              :user {:user/id 77}
+              :roles #{:role/operator}})}
+          (fn []
+            (let [grant-resp (http-post-json url {:action "admin/grant-role"
+                                                  :email "u@example.com"
+                                                  :role "role/admin"})
+                  grant-body (json/parse-string (:body grant-resp) true)
+                  list-resp (http-post-json url {:action "admin/list-roles"
+                                                 :email "u@example.com"})
+                  list-body (json/parse-string (:body list-resp) true)
+                  revoke-resp (http-post-json url {:action "admin/revoke-role"
+                                                   :email "u@example.com"
+                                                   :role :role/admin})
+                  revoke-body (json/parse-string (:body revoke-resp) true)]
+              (is (= 200 (:status grant-resp)))
+              (is (= true (:ok? grant-body)))
+              (is (= "admin/grant-role" (:action grant-body)))
+              (is (= ["u@example.com" :role/admin]
+                     (first @granted)))
+
+              (is (= 200 (:status list-resp)))
+              (is (= true (:ok? list-body)))
+              (is (= "admin/list-roles" (:action list-body)))
+              (is (= "u@example.com" (first @listed)))
+
+              (is (= 200 (:status revoke-resp)))
+              (is (= true (:ok? revoke-body)))
+              (is (= "admin/revoke-role" (:action revoke-body)))
+              (is (= ["u@example.com" :role/admin]
+                     (first @revoked))))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
+(deftest http-v1-admin-allows-role-dictionary-actions
+  (testing "/v1/admin delegates create/list-known/delete role dictionary actions when role policy allows operations."
+    (let [port (free-port)
+          created (atom [])
+          deleted (atom [])
+          listed  (atom 0)
+          runtime {:models {}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:manager #{:role/admin}}
+                           :operations {:admin/create-role {:any #{:role/admin}}
+                                        :admin/list-known-roles {:any #{:role/admin}}
+                                        :admin/delete-role {:any #{:role/admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :manager}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (with-redefs-fn
+          {#'ferment.http/parse-basic-credentials
+           (fn [_exchange]
+             {:login "admin@example.com"
+              :password "secret"})
+           #'ferment.http/report-auth!
+           (fn [& _] nil)
+           #'ferment.auth.user/authenticate-password
+           (fn [_source login _password _account-type _opts]
+             {:ok? true
+              :user {:user/id 16
+                     :user/email login
+                     :user/account-type :manager}})
+           #'ferment.admin/create-role!
+           (fn
+             ([role]
+              (swap! created conj [role nil])
+              {:ok? true :created? true :role role})
+             ([role description]
+              (swap! created conj [role description])
+              {:ok? true :created? true :role role :description description}))
+           #'ferment.admin/list-known-roles!
+           (fn []
+             (swap! listed inc)
+             {:ok? true
+              :roles [{:role :role/admin}
+                      {:role :role/operator}]})
+           #'ferment.admin/delete-role!
+           (fn [role]
+             (swap! deleted conj role)
+             {:ok? true :deleted? true :role role})}
+          (fn []
+            (let [create-resp (http-post-json url {:action "admin/create-role"
+                                                   :role "role/researcher"
+                                                   :description "Diagnostic role"})
+                  create-body (json/parse-string (:body create-resp) true)
+                  list-resp (http-post-json url {:action "admin/list-known-roles"})
+                  list-body (json/parse-string (:body list-resp) true)
+                  delete-resp (http-post-json url {:action "admin/delete-role"
+                                                   :role :role/researcher})
+                  delete-body (json/parse-string (:body delete-resp) true)]
+              (is (= 200 (:status create-resp)))
+              (is (= true (:ok? create-body)))
+              (is (= "admin/create-role" (:action create-body)))
+              (is (= [:role/researcher "Diagnostic role"]
+                     (first @created)))
+
+              (is (= 200 (:status list-resp)))
+              (is (= true (:ok? list-body)))
+              (is (= "admin/list-known-roles" (:action list-body)))
+              (is (= 1 @listed))
+
+              (is (= 200 (:status delete-resp)))
+              (is (= true (:ok? delete-body)))
+              (is (= "admin/delete-role" (:action delete-body)))
+              (is (= :role/researcher (first @deleted))))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
 (deftest http-v1-act-collects-telemetry-and-exposes-diag-endpoint
   (testing "HTTP bridge aggregates telemetry for /v1/act and exposes it via /diag/telemetry."
     (let [port (free-port)
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}}
                               :result/types [:value]}
-                   :resolver {:routing {:intent->cap {:problem/solve :llm/solver}}}}
+                   :router {:routing {:intent->cap {:problem/solve :llm/solver}}}
+                   :resolver {}}
           server-state (fhttp/init-http
                         :ferment.http/default
                         {:host "127.0.0.1"
@@ -497,8 +1023,9 @@
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
                                         :text/respond  {:in-schema :req/text}}
                               :result/types [:value :plan]}
-                   :resolver {:routing {:intent->cap {:problem/solve :llm/solver
-                                                      :text/respond  :llm/voice}}}}
+                   :router {:routing {:intent->cap {:problem/solve :llm/solver
+                                                    :text/respond  :llm/voice}}}
+                   :resolver {}}
           request {:proto 1
                    :trace {:id "plan-trace-1"}
                    :task {:intent "problem/solve"}
@@ -536,11 +1063,12 @@
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
                                         :text/respond  {:in-schema :req/text}}
                               :result/types [:value :plan :error]}
-                   :resolver {:routing {:intent->cap {:problem/solve :llm/solver
-                                                      :text/respond  :llm/solver}
-                                        :switch-on #{:eval/low-score}
-                                        :retry {:same-cap-max 0
-                                                :fallback-max 1}}}}
+                   :router {:routing {:intent->cap {:problem/solve :llm/solver
+                                                    :text/respond  :llm/solver}
+                                      :switch-on #{:eval/low-score}
+                                      :retry {:same-cap-max 0
+                                              :fallback-max 1}}}
+                   :resolver {}}
           request {:proto 1
                    :trace {:id "fallback-trace-1"}
                    :task {:intent "problem/solve"}

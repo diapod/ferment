@@ -15,8 +15,11 @@
             [ferment.middleware.remote-ip :as remote-ip]
             [ferment.model :as model]
             [ferment.oplog :as oplog]
+            [ferment.roles :as roles]
+            [ferment.router :as router]
             [ferment.session :as session]
             [ferment.system :as system]
+            [ferment.admin :as admin]
             [ferment.workflow :as workflow]
             [io.randomseed.utils.ip :as ip])
 
@@ -42,6 +45,18 @@
       (int port)
       12002)))
 
+(defn- parse-non-negative-long
+  [v]
+  (let [n (cond
+            (integer? v) (long v)
+            (number? v) (long v)
+            (string? v) (try
+                          (Long/parseLong (str/trim v))
+                          (catch Throwable _ nil))
+            :else nil)]
+    (when (and (some? n) (not (neg? n)))
+      n)))
+
 (defn- normalize-endpoint
   [v]
   (when-some [endpoint (trim-s v)]
@@ -59,6 +74,27 @@
                       (keyword (subs s 1))
                       (keyword s))))
     :else nil))
+
+(defn- keyword-set
+  [v]
+  (cond
+    (set? v) (into #{} (keep keywordish) v)
+    (sequential? v) (into #{} (keep keywordish) v)
+    (some? v) (if-some [k (keywordish v)] #{k} #{})
+    :else #{}))
+
+(defn- auth-user-public
+  [user]
+  (when (map? user)
+    (let [roles' (->> (keyword-set (or (:user/roles user)
+                                       (:roles user)))
+                      sort
+                      vec)]
+      (cond-> {}
+        (some? (:user/id user)) (assoc :user/id (:user/id user))
+        (some? (:user/email user)) (assoc :user/email (:user/email user))
+        (some? (:user/account-type user)) (assoc :user/account-type (:user/account-type user))
+        (seq roles') (assoc :user/roles roles')))))
 
 (defn- runtime-config
   [runtime]
@@ -106,6 +142,15 @@
               (set? v) (into #{} (keep keywordish) v)
               (sequential? v) (into [] (keep keywordish) v)
               :else v))
+          (->bool
+            [v]
+            (cond
+              (boolean? v) v
+              (number? v) (not (zero? (long v)))
+              (string? v) (contains? #{"1" "true" "yes" "on"}
+                                     (-> v str/trim str/lower-case))
+              (nil? v) nil
+              :else (boolean v)))
           (->int
             [v default]
             (cond
@@ -115,17 +160,37 @@
                              (Integer/parseInt (str/trim v))
                              (catch Throwable _ default))
               :else default))
+          (normalize-routing
+            [routing]
+            (let [routing' (if (map? routing) routing {})
+                  intent   (keywordish (:intent routing'))
+                  cap-id   (keywordish (:cap/id routing'))
+                  meta?    (->bool (:meta? routing'))
+                  strict?  (->bool (:strict? routing'))
+                  force?   (->bool (:force? routing'))]
+              (cond-> routing'
+                (keyword? intent) (assoc :intent intent)
+                (keyword? cap-id) (assoc :cap/id cap-id)
+                (some? meta?) (assoc :meta? meta?)
+                (some? strict?) (assoc :strict? strict?)
+                (some? force?) (assoc :force? force?))))
           (normalize-top
             [request]
             (let [intent (or (some-> request :task :intent keywordish)
                              (some-> request :intent keywordish))
                   cap-id (or (some-> request :task :cap/id keywordish)
                              (some-> request :cap/id keywordish))
-                  role   (keywordish (:role request))]
+                  role   (keywordish (:role request))
+                  response-type (or (some-> request :response/type keywordish)
+                                    (some-> request :response :type keywordish))
+                  stream? (or (->bool (:stream? request))
+                              (->bool (get-in request [:response :stream?])))]
               (cond-> request
                 (keyword? intent) (assoc-in [:task :intent] intent)
                 (keyword? cap-id) (assoc-in [:task :cap/id] cap-id)
                 (keyword? role) (assoc :role role)
+                (keyword? response-type) (assoc :response/type response-type)
+                (some? stream?) (assoc :stream? stream?)
                 (contains? request :proto) (update :proto ->int 1)
                 (contains? request :done)
                 (-> (update-in [:done :must] ->keyword-coll)
@@ -135,7 +200,9 @@
                 (contains? request :budget)
                 (update-in [:budget :max-roundtrips] ->int nil)
                 (contains? request :constraints)
-                (update-in [:constraints :language] #(or (keywordish %) %)))))]
+                (update-in [:constraints :language] #(or (keywordish %) %))
+                (contains? request :routing)
+                (update :routing normalize-routing))))]
     (cond
       (and (map? payload) (map? (:task payload)))
       (normalize-top payload)
@@ -209,6 +276,12 @@
          :errors 0
          :status {}
          :error-types {}
+         :routing {:route/decide-hit 0
+                   :route/decide-continue 0
+                   :route/decide-final 0
+                   :route/fail-open 0
+                   :route/fail-closed 0
+                   :route/strict 0}
          :latency-ms {:count 0
                       :sum 0.0
                       :max 0.0}}
@@ -221,26 +294,30 @@
     (when (keyword? err-type) err-type)))
 
 (defn- record-act-telemetry!
-  [telemetry response latency-ms]
-  (when (instance? clojure.lang.IAtom telemetry)
-    (let [status (or (:status response) 500)
-          body   (:body response)
-          ok?    (< (int status) 400)
-          err-k  (telemetry-error-type body)
-          wf-telemetry (get-in body [:result :plan/run :telemetry])]
-      (swap! telemetry
-             (fn [state]
-               (-> (merge-telemetry-counters (default-telemetry) state)
-                   (update-in [:act :requests] (fnil inc 0))
-                   (update-in [:act :status status] (fnil inc 0))
-                   (update-in [:act :latency-ms :count] (fnil inc 0))
-                   (update-in [:act :latency-ms :sum] (fnil + 0.0) latency-ms)
-                   (update-in [:act :latency-ms :max] (fnil max 0.0) latency-ms)
-                   (update-in [:act (if ok? :ok :errors)] (fnil inc 0))
-                   (cond-> (keyword? err-k)
-                     (update-in [:act :error-types err-k] (fnil inc 0)))
-                   (cond-> (map? wf-telemetry)
-                     (update :workflow merge-telemetry-counters wf-telemetry))))))))
+  ([telemetry response latency-ms]
+   (record-act-telemetry! telemetry response latency-ms nil))
+  ([telemetry response latency-ms routing-telemetry]
+   (when (instance? clojure.lang.IAtom telemetry)
+     (let [status (or (:status response) 500)
+           body   (:body response)
+           ok?    (< (int status) 400)
+           err-k  (telemetry-error-type body)
+           wf-telemetry (get-in body [:result :plan/run :telemetry])]
+       (swap! telemetry
+              (fn [state]
+                (-> (merge-telemetry-counters (default-telemetry) state)
+                    (update-in [:act :requests] (fnil inc 0))
+                    (update-in [:act :status status] (fnil inc 0))
+                    (update-in [:act :latency-ms :count] (fnil inc 0))
+                    (update-in [:act :latency-ms :sum] (fnil + 0.0) latency-ms)
+                    (update-in [:act :latency-ms :max] (fnil max 0.0) latency-ms)
+                    (update-in [:act (if ok? :ok :errors)] (fnil inc 0))
+                    (cond-> (keyword? err-k)
+                      (update-in [:act :error-types err-k] (fnil inc 0)))
+                    (cond-> (map? wf-telemetry)
+                      (update :workflow merge-telemetry-counters wf-telemetry))
+                    (cond-> (map? routing-telemetry)
+                      (update-in [:act :routing] merge-telemetry-counters routing-telemetry)))))))))
 
 (defn- telemetry-snapshot
   [telemetry]
@@ -261,36 +338,323 @@
        {:intent  (get-in request [:task :intent])
         :effects (:effects request)})))
 
+(defn- effective-resolver
+  [runtime]
+  (let [resolver (or (:resolver runtime) {})
+        routing  (router/resolver-routing runtime resolver)
+        router-cfg (if (map? (:router runtime)) (:router runtime) {})]
+    (cond-> resolver
+      (map? routing) (assoc :routing routing)
+      (contains? router-cfg :profiles) (assoc :profiles (:profiles router-cfg))
+      (contains? router-cfg :policy) (assoc :policy (:policy router-cfg)))))
+
 (defn- positive-int
   [v]
   (when (and (integer? v) (pos? v))
     (int v)))
 
 (defn- act-request->invoke-opts
-  [request cap-id]
+  [runtime request cap-id]
   (let [intent (get-in request [:task :intent])
-        budget (:budget request)]
-    (cond-> {:role        (or (:role request)
-                              (cap-id->role cap-id intent))
-             :intent      intent
-             :cap-id      cap-id
-             :input       (:input request)
-             :context     (:context request)
-             :constraints (:constraints request)
-             :done        (:done request)
-             :budget      budget
-             :effects     (:effects request)
-             :request-id  (:request/id request)
-             :trace       (:trace request)
-             :proto       (:proto request)
-             :session-id  (:session/id request)
+        budget (:budget request)
+        auth-user (auth-user-public (:auth/user request))
+        auth-source-k (or (some-> (:auth/source request) keywordish)
+                          (some-> (get-in request [:auth :source]) keywordish)
+                          :http/basic)
+        base-context (if (map? (:context request)) (:context request) {})
+        context' (cond-> base-context
+                   (map? auth-user) (assoc :auth/user auth-user))
+        session-meta (when (map? auth-user)
+                       (cond-> {:auth/source auth-source-k}
+                         (some? (:user/id auth-user)) (assoc :user/id (:user/id auth-user))
+                         (some? (:user/email auth-user)) (assoc :user/email (:user/email auth-user))
+                         (some? (:user/account-type auth-user)) (assoc :user/account-type (:user/account-type auth-user))
+                         (seq (:user/roles auth-user)) (assoc :user/roles (:user/roles auth-user))))]
+    (cond-> {:role            (or (:role request)
+                                  (cap-id->role cap-id intent))
+             :intent          intent
+             :cap-id          cap-id
+             :input           (:input request)
+             :context         context'
+             :constraints     (:constraints request)
+             :done            (:done request)
+             :budget          budget
+             :effects         (:effects request)
+             :request-id      (:request/id request)
+             :trace           (:trace request)
+             :proto           (:proto request)
+             :session-id      (:session/id request)
              :session-version (:session/version request)}
       (some? (:model request)) (assoc :model (:model request))
       (some? (get-in request [:task :model])) (assoc :model (get-in request [:task :model]))
+      (keyword? (:response/type request)) (assoc :response/type (:response/type request))
+      (contains? request :stream?) (assoc :stream? (boolean (:stream? request)))
       (some? (positive-int (:max-roundtrips budget)))
       (assoc :max-attempts (positive-int (:max-roundtrips budget)))
       (some? (:temperature budget))
-      (assoc :temperature (:temperature budget)))))
+      (assoc :temperature (:temperature budget))
+      (map? auth-user) (assoc :auth/user auth-user)
+      (map? (:roles runtime)) (assoc :roles (:roles runtime))
+      (map? session-meta) (assoc :session/meta session-meta))))
+
+(defn- keyword-vec
+  [v]
+  (->> (cond
+         (set? v) v
+         (sequential? v) v
+         (some? v) [v]
+         :else [])
+       (keep keywordish)
+       vec))
+
+(defn- nonneg-int
+  [v]
+  (when (and (integer? v) (<= 0 v))
+    v))
+
+(defn- normalize-retry-policy
+  [retry-map]
+  (let [same-cap-max (nonneg-int (:same-cap-max retry-map))
+        fallback-max (nonneg-int (:fallback-max retry-map))]
+    (cond-> {}
+      (some? same-cap-max) (assoc :same-cap-max same-cap-max)
+      (some? fallback-max) (assoc :fallback-max fallback-max))))
+
+(defn- routing-config
+  [request]
+  (if (map? (:routing request))
+    (:routing request)
+    {}))
+
+(defn- meta-routing-enabled?
+  [runtime request]
+  (let [cfg (routing-config request)]
+    (if (contains? cfg :meta?)
+      (boolean (:meta? cfg))
+      (= :meta-decider (get-in runtime [:router :policy])))))
+
+(defn- meta-routing-strict?
+  [request]
+  (boolean (:strict? (routing-config request))))
+
+(defn- meta-routing-force?
+  [request]
+  (boolean (:force? (routing-config request))))
+
+(defn- meta-routing-intent
+  [request]
+  (or (some-> (routing-config request) :intent keywordish)
+      :route/decide))
+
+(defn- meta-routing-cap-id
+  [runtime resolver request route-intent]
+  (or (some-> (routing-config request) :cap/id keywordish)
+      (some-> resolver :routing :intent->cap (get route-intent))
+      (some-> (router/resolver-routing runtime resolver) :intent->cap (get route-intent))
+      (when (= :route/decide route-intent) :llm/meta)))
+
+(defn- routing-decision?
+  [out]
+  (and (map? out)
+       (keyword? (:cap/id out))))
+
+(defn- routing-decision-candidates
+  [decision]
+  (let [primary (keywordish (:cap/id decision))
+        route-cands (keyword-vec (get-in decision [:dispatch :candidates]))]
+    (->> (concat (when (keyword? primary) [primary]) route-cands)
+         distinct
+         vec)))
+
+(defn- merge-routing-decision
+  [request decision]
+  (let [force?       (meta-routing-force? request)
+        explicit-cap (keyword? (get-in request [:task :cap/id]))
+        primary-cap  (keywordish (:cap/id decision))
+        candidates   (routing-decision-candidates decision)
+        chosen-cap   (or primary-cap
+                         (first candidates))
+        dispatch-in  (if (map? (:dispatch decision)) (:dispatch decision) {})
+        switch-on    (keyword-vec (:switch-on dispatch-in))
+        checks       (keyword-vec (:checks dispatch-in))
+        retry        (normalize-retry-policy
+                      (if (map? (:retry dispatch-in)) (:retry dispatch-in) {}))
+        route-done   (if (map? (:done decision)) (:done decision) nil)
+        route-constraints (if (map? (:constraints decision)) (:constraints decision) nil)
+        route-budget (if (map? (:budget decision)) (:budget decision) nil)
+        route-effects (if (map? (:effects decision)) (:effects decision) nil)
+        dispatch     (cond-> {}
+                       (seq candidates) (assoc :candidates candidates)
+                       (seq switch-on) (assoc :switch-on (set switch-on))
+                       (seq checks) (assoc :checks checks)
+                       (seq retry) (assoc :retry retry))]
+    (cond-> request
+      (and (keyword? chosen-cap)
+           (or force? (not explicit-cap)))
+      (assoc-in [:task :cap/id] chosen-cap)
+
+      (map? route-done)
+      (update :done #(merge (if (map? %) % {}) route-done))
+
+      (map? route-constraints)
+      (update :constraints #(merge (if (map? %) % {}) route-constraints))
+
+      (map? route-budget)
+      (update :budget #(merge (if (map? %) % {}) route-budget))
+
+      (map? route-effects)
+      (update :effects #(merge (if (map? %) % {}) route-effects))
+
+      (seq dispatch)
+      (assoc :dispatch dispatch)
+
+      true
+      (assoc-in [:routing :decision] (cond-> {}
+                                       (keyword? chosen-cap) (assoc :cap/id chosen-cap)
+                                       (seq dispatch) (assoc :dispatch dispatch))))))
+
+(defn- route-decider-opts
+  [runtime resolver request cap-id intent]
+  (let [route-role (router/resolve-role runtime resolver cap-id intent)]
+    {:role route-role
+     :intent intent
+     :cap-id cap-id
+     :input {:request request
+             :resolver {:routing (:routing resolver)}}
+     :context (merge {:route/for-intent (get-in request [:task :intent])}
+                     (if (map? (:context request)) (:context request) {}))
+     :constraints (:constraints request)
+     :budget (:budget request)
+     :request-id (:request/id request)
+     :trace (:trace request)
+     :proto (:proto request)
+     :session-id (:session/id request)
+     :session-version (:session/version request)
+     :auth/user (:auth/user request)
+     :roles (:roles runtime)
+     :resolver resolver}))
+
+(defn- maybe-apply-meta-routing
+  [runtime resolver request]
+  (let [route-intent (meta-routing-intent request)
+        strict?      (meta-routing-strict? request)
+        enabled?     (meta-routing-enabled? runtime request)]
+    (cond
+      (not enabled?)
+      {:request request
+       :mode :none
+       :enabled? false
+       :strict? strict?
+       :attempted? false
+       :reason :meta-disabled}
+
+      (= route-intent (get-in request [:task :intent]))
+      {:request request
+       :mode :none
+       :enabled? true
+       :strict? strict?
+       :attempted? false
+       :reason :same-intent}
+
+      :else
+      (let [cap-id (meta-routing-cap-id runtime resolver request route-intent)]
+        (if-not (keyword? cap-id)
+          (if strict?
+            {:mode :error
+             :status 502
+             :request request
+             :enabled? true
+             :strict? true
+             :attempted? false
+             :reason :fail-closed
+             :body (error-envelope request
+                                   :route/decide-failed
+                                   "Meta routing is enabled, but route capability could not be resolved."
+                                   {:route/intent route-intent}
+                                   true)}
+            {:request request
+             :mode :none
+             :enabled? true
+             :strict? false
+             :attempted? false
+             :reason :fail-open})
+          (try
+            (let [route-response (core/execute-capability!
+                                  runtime
+                                  resolver
+                                  (route-decider-opts runtime resolver request cap-id route-intent))
+                  route-out (contracts/result-out-of route-response)]
+              (if (routing-decision? route-out)
+                {:request (merge-routing-decision request route-out)
+                 :mode :continue
+                 :enabled? true
+                 :strict? strict?
+                 :attempted? true
+                 :reason :continue
+                 :route-response route-response}
+                {:request request
+                 :mode :final
+                 :enabled? true
+                 :strict? strict?
+                 :attempted? true
+                 :reason :final
+                 :response route-response}))
+            (catch clojure.lang.ExceptionInfo e
+              (if strict?
+                {:mode :error
+                 :status 502
+                 :request request
+                 :enabled? true
+                 :strict? true
+                 :attempted? true
+                 :reason :fail-closed
+                 :body (error-envelope request
+                                       :route/decide-failed
+                                       (.getMessage e)
+                                       (select-keys (or (ex-data e) {})
+                                                    [:error :reason :failure/type])
+                                       true)}
+                {:request request
+                 :mode :none
+                 :enabled? true
+                 :strict? false
+                 :attempted? true
+                 :reason :fail-open}))
+            (catch Throwable t
+              (if strict?
+                {:mode :error
+                 :status 502
+                 :request request
+                 :enabled? true
+                 :strict? true
+                 :attempted? true
+                 :reason :fail-closed
+                 :body (error-envelope request
+                                       :route/decide-failed
+                                       (.getMessage t)
+                                       nil
+                                       true)}
+                {:request request
+                 :mode :none
+                 :enabled? true
+                 :strict? false
+                 :attempted? true
+                 :reason :fail-open}))))))))
+
+(defn- routing-telemetry-counters
+  [meta-step]
+  (let [step (if (map? meta-step) meta-step {})
+        mode (:mode step)
+        reason (:reason step)
+        attempted? (true? (:attempted? step))
+        strict? (true? (:strict? step))]
+    (cond-> {}
+      attempted? (update :route/decide-hit (fnil inc 0))
+      (= :continue mode) (update :route/decide-continue (fnil inc 0))
+      (= :final mode) (update :route/decide-final (fnil inc 0))
+      (= :fail-open reason) (update :route/fail-open (fnil inc 0))
+      (= :fail-closed reason) (update :route/fail-closed (fnil inc 0))
+      strict? (update :route/strict (fnil inc 0)))))
 
 (defn invoke-act
   "Runs canonical `/v1/act` request through contract validation and core capability flow.
@@ -298,13 +662,38 @@
   Returns:
   - `{:status <http-status> :body <canonical-response-envelope>}`"
   ([runtime payload]
-   (invoke-act runtime payload nil))
+   (invoke-act runtime payload nil nil))
   ([runtime payload telemetry]
+   (invoke-act runtime payload telemetry nil))
+  ([runtime payload telemetry auth]
    (let [started-at (now-nanos)
-         request  (coerce-act-request payload)
+         auth-user (some-> auth :user auth-user-public)
+         auth-source-k (some-> auth :source keywordish)
+         auth-session (when (map? (:session auth))
+                        (:session auth))
+         auth-session-id (or (some-> auth-session :session/id trim-s)
+                             (some-> auth-session :id trim-s))
+         request0  (coerce-act-request payload)
+         request   (cond-> request0
+                     (map? auth-user) (assoc :auth/user auth-user)
+                     (keyword? auth-source-k) (assoc :auth/source auth-source-k)
+                     (and auth-session-id
+                          (nil? (:session/id request0)))
+                     (assoc :session/id auth-session-id))
          protocol (or (:protocol runtime) {})
-         resolver (or (:resolver runtime) {})
+         resolver (effective-resolver runtime)
          req-check (contracts/validate-request protocol request)
+         meta-step (when (:ok? req-check)
+                     (maybe-apply-meta-routing runtime resolver request))
+         route-mode (or (:mode meta-step) :none)
+         request* (or (:request meta-step) request)
+         routed? (not= request request*)
+         post-route-check (cond
+                            (not (:ok? req-check)) req-check
+                            (#{:error :final} route-mode) {:ok? true}
+                            routed? (contracts/validate-request protocol request*)
+                            :else req-check)
+         route-telemetry (routing-telemetry-counters meta-step)
          response
          (cond
            (not (map? request))
@@ -319,52 +708,127 @@
                                     "Request does not satisfy protocol contract."
                                     (select-keys req-check [:reason :intent]))}
 
+           (= :error route-mode)
+           {:status (or (:status meta-step) 502)
+            :body   (or (:body meta-step)
+                        (error-envelope request
+                                        :route/decide-failed
+                                        "Meta routing failed."
+                                        nil
+                                        true))}
+
+           (= :final route-mode)
+           {:status 200
+            :body   (or (:response meta-step)
+                        (error-envelope request
+                                        :route/decide-failed
+                                        "Meta routing returned invalid response."
+                                        nil
+                                        true))}
+
+           (not (:ok? post-route-check))
+           (if routed?
+             {:status 502
+              :body   (error-envelope request*
+                                      :route/decide-failed
+                                      "Meta routing returned invalid request mutations."
+                                      (select-keys post-route-check [:reason :intent])
+                                      true)}
+             {:status 400
+              :body   (error-envelope request*
+                                      :input/invalid
+                                      "Request does not satisfy protocol contract."
+                                      (select-keys post-route-check [:reason :intent]))})
+
            :else
-           (let [cap-id (resolve-cap-id resolver request)]
+           (let [cap-id (resolve-cap-id resolver request*)]
              (if-not (keyword? cap-id)
                {:status 422
-                :body   (error-envelope request
+                :body   (error-envelope request*
                                         :unsupported/intent
                                         "No capability can handle the requested intent."
-                                        {:intent (get-in request [:task :intent])})}
+                                        {:intent (get-in request* [:task :intent])})}
                (try
                  {:status 200
                   :body   (core/execute-capability!
                            runtime
                            resolver
-                           (act-request->invoke-opts request cap-id))}
+                           (act-request->invoke-opts runtime request* cap-id))}
                  (catch clojure.lang.ExceptionInfo e
                    (let [data (or (ex-data e) {})
-                         reason (:error data)]
+                         reason (or (:error data)
+                                    (:failure/type data))]
                      (case reason
                        :invalid-request
                        {:status 400
-                        :body   (error-envelope request
+                        :body   (error-envelope request*
                                                 :input/invalid
                                                 (.getMessage e)
                                                 (select-keys data [:reason :intent]))}
 
                        :invalid-result-after-retries
-                       {:status 502
-                        :body   (error-envelope request
-                                                :schema/invalid
+                        {:status 502
+                         :body   (error-envelope request*
+                                                 :schema/invalid
+                                                 (.getMessage e)
+                                                 (select-keys data [:attempts :last-check])
+                                                 true)}
+
+                       :auth/forbidden-effect
+                       {:status 403
+                        :body   (error-envelope request*
+                                                :auth/forbidden-effect
                                                 (.getMessage e)
-                                                (select-keys data [:attempts :last-check])
-                                                true)}
+                                                (select-keys data [:requested-effects
+                                                                   :denied-effects
+                                                                   :failure/type]))}
+
+                       :effects/scope-denied
+                       {:status 403
+                        :body   (error-envelope request*
+                                                :effects/scope-denied
+                                                (.getMessage e)
+                                                (select-keys data [:effect
+                                                                   :reason
+                                                                   :path
+                                                                   :cwd
+                                                                   :url
+                                                                   :allow
+                                                                   :allow-cwd
+                                                                   :allow-hosts
+                                                                   :allow-ports
+                                                                   :allow-schemes]))}
+
+                       :effects/invalid-input
+                       {:status 400
+                        :body   (error-envelope request*
+                                                :effects/invalid-input
+                                                (.getMessage e)
+                                                (select-keys data [:reason
+                                                                   :tool/id
+                                                                   :required-effect
+                                                                   :requested-effects]))}
+
+                       :effects/unsupported-tool
+                       {:status 422
+                        :body   (error-envelope request*
+                                                :effects/unsupported-tool
+                                                (.getMessage e)
+                                                (select-keys data [:tool/id :known-tools]))}
 
                        {:status 502
-                        :body   (error-envelope request
+                        :body   (error-envelope request*
                                                 :runtime/invoke-failed
                                                 (.getMessage e)
                                                 (select-keys data [:error :reason]))})))
                  (catch Throwable t
                    {:status 500
-                    :body   (error-envelope request
+                    :body   (error-envelope request*
                                             :runtime/internal
                                             (.getMessage t))})))))
          elapsed-ms (nanos->millis started-at)
-         sid        (or (some-> (:session/id request) trim-s)
-                        (some-> (:session-id request) trim-s))
+         sid        (or (some-> (:session/id request*) trim-s)
+                        (some-> (:session-id request*) trim-s))
          session-state
          (when sid
            (let [service (when (map? runtime) (:session runtime))]
@@ -387,7 +851,7 @@
                               (map? session-view))
                        (update response :body merge session-view)
                        response)]
-     (record-act-telemetry! telemetry response' elapsed-ms)
+     (record-act-telemetry! telemetry response' elapsed-ms route-telemetry)
      response')))
 
 (def ^:private session-public-keys
@@ -516,6 +980,212 @@
                                      :session/thaw :session/freeze
                                      :session/list}}}})))
 
+(def ^:private admin-action-aliases
+  {:create-user            :admin/create-user
+   :create-role            :admin/create-role
+   :delete-user            :admin/delete-user
+   :delete-role            :admin/delete-role
+   :set-password           :admin/set-password
+   :lock-user              :admin/lock-user
+   :unlock-user            :admin/unlock-user
+   :grant-role             :admin/grant-role
+   :revoke-role            :admin/revoke-role
+   :list-roles             :admin/list-roles
+   :list-known-roles       :admin/list-known-roles
+   :migrate-db             :admin/migrate-db
+   :rollback-db            :admin/rollback-db
+   :reset-login-attempts   :admin/reset-login-attempts
+   :reset-login            :admin/reset-login-attempts})
+
+(def ^:private admin-supported-actions
+  #{:admin/create-user
+    :admin/create-role
+    :admin/delete-user
+    :admin/delete-role
+    :admin/set-password
+    :admin/lock-user
+    :admin/unlock-user
+    :admin/grant-role
+    :admin/revoke-role
+    :admin/list-roles
+    :admin/list-known-roles
+    :admin/migrate-db
+    :admin/rollback-db
+    :admin/reset-login-attempts})
+
+(defn- normalize-admin-action
+  [v]
+  (when-some [action (keywordish v)]
+    (let [canonical (or (get admin-action-aliases action)
+                        action)]
+      (when (contains? admin-supported-actions canonical)
+        canonical))))
+
+(defn- payload-params
+  [payload]
+  (let [payload' (if (map? payload) payload {})
+        params   (if (map? (:params payload')) (:params payload') {})]
+    (merge payload' params)))
+
+(defn- selector-from-payload
+  [payload]
+  (cond
+    (contains? payload :selector) (:selector payload)
+    (contains? payload :id)       (:id payload)
+    (contains? payload :user/id)  (:user/id payload)
+    (contains? payload :email)    (:email payload)
+    (contains? payload :user/email) (:user/email payload)
+    :else nil))
+
+(defn- admin-result-status
+  [result]
+  (if (and (map? result) (:ok? result))
+    200
+    (case (:error result)
+      :input/invalid          400
+      :user/invalid-lock-kind 400
+      :user/not-found         404
+      :user/already-exists    409
+      :user/invalid-role      400
+      :user/unknown-role      422
+      :role/invalid-role      400
+      :role/not-found         404
+      :role/in-use            409
+      :auth/not-configured    500
+      :db/not-configured      500
+      400)))
+
+(defn- invoke-admin-action
+  [runtime action payload]
+  (let [params     (payload-params payload)
+        selector   (selector-from-payload params)
+        email      (or (trim-s (:email params))
+                       (trim-s (:user/email params)))
+        password   (or (trim-s (:password params))
+                       (trim-s (:new-password params)))
+        role       (or (some-> (:role params) keywordish)
+                       (some-> (:user/role params) keywordish))
+        account-type (or (some-> (:account-type params) keywordish)
+                         (some-> (:user/account-type params) keywordish))]
+    (case action
+      :admin/create-user
+      (if (and email password)
+        (if account-type
+          (admin/create-user! email password account-type)
+          (admin/create-user! email password))
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required keys: :email and :password."})
+
+      :admin/create-role
+      (if (keyword? role)
+        (if-some [description (trim-s (:description params))]
+          (admin/create-role! role description)
+          (admin/create-role! role))
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required key: :role."})
+
+      :admin/delete-user
+      (if (some? selector)
+        (admin/delete-user! selector)
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required selector: :selector or :id or :email."})
+
+      :admin/delete-role
+      (if (keyword? role)
+        (admin/delete-role! role)
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required key: :role."})
+
+      :admin/set-password
+      (if (and (some? selector) password)
+        (if account-type
+          (admin/set-password! selector password account-type)
+          (admin/set-password! selector password))
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required keys: selector and :password (or :new-password)."})
+
+      :admin/lock-user
+      (if (some? selector)
+        (if (contains? params :lock-kind)
+          (admin/lock-user! selector (:lock-kind params))
+          (admin/lock-user! selector))
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required selector: :selector or :id or :email."})
+
+      :admin/unlock-user
+      (if (some? selector)
+        (admin/unlock-user! selector)
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required selector: :selector or :id or :email."})
+
+      :admin/grant-role
+      (if (and (some? selector) (keyword? role))
+        (admin/grant-role! selector role)
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required keys: selector and :role."})
+
+      :admin/revoke-role
+      (if (and (some? selector) (keyword? role))
+        (admin/revoke-role! selector role)
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required keys: selector and :role."})
+
+      :admin/list-roles
+      (if (some? selector)
+        (admin/list-roles! selector)
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required selector: :selector or :id or :email."})
+
+      :admin/list-known-roles
+      (admin/list-known-roles!)
+
+      :admin/reset-login-attempts
+      (if (some? selector)
+        (admin/reset-login-attempts! selector)
+        {:ok? false
+         :error :input/invalid
+         :message "Missing required selector: :selector or :id or :email."})
+
+      :admin/migrate-db
+      (let [opts (if (map? (:opts params)) (:opts params) nil)]
+        (if opts
+          (admin/migrate! opts)
+          (admin/migrate!)))
+
+      :admin/rollback-db
+      (let [opts (if (map? (:opts params)) (:opts params) nil)
+            amount-or-id (or (:amount-or-id params)
+                             (:amount params)
+                             (:migration-id params))]
+        (cond
+          (and opts (some? amount-or-id))
+          (admin/rollback! opts amount-or-id)
+
+          (some? amount-or-id)
+          (admin/rollback! nil amount-or-id)
+
+          opts
+          (admin/rollback! opts)
+
+          :else
+          (admin/rollback!)))
+
+      {:ok? false
+       :error :input/invalid
+       :message "Unsupported admin action."
+       :details {:action action
+                 :supported admin-supported-actions}})))
+
 (defn model-http-routes
   "Builds endpoint routing table from initialized `:models` map.
 
@@ -607,15 +1277,39 @@
   [runtime]
   (get-in runtime [:auth :source]))
 
+(def ^:private default-session-principal-operations
+  #{:http.v1/act})
+
+(defn- auth-session-principal-config
+  [runtime]
+  (let [cfg (if (map? (get-in runtime [:auth :session-principal]))
+              (get-in runtime [:auth :session-principal])
+              {})
+        operations (keyword-set (:operations cfg))]
+    {:enabled?   (true? (:enabled? cfg))
+     :operations (if (seq operations)
+                   operations
+                   default-session-principal-operations)
+     :ttl-ms     (or (parse-non-negative-long (:ttl-ms cfg)) 1800000)
+     :refresh-ms (or (parse-non-negative-long (:refresh-ms cfg)) 300000)}))
+
+(defn- auth-session-principal-enabled?
+  [runtime operation]
+  (let [{:keys [enabled? operations]} (auth-session-principal-config runtime)
+        op (keywordish operation)]
+    (and enabled?
+         (keyword? op)
+         (contains? operations op))))
+
 (defn- auth-session-service
   [runtime]
   (let [svc (when (map? runtime) (:session runtime))]
-    (when (and (map? svc) (fn? (:open! svc)))
+    (when (map? svc)
       svc)))
 
 (defn- session-id-from-header
   [^HttpExchange exchange]
-  (let [headers (.getRequestHeaders exchange)]
+  (let [headers (some-> exchange (.getRequestHeaders))]
     (or (some-> headers (.getFirst "X-Session-Id") trim-s)
         (some-> headers (.getFirst "Session-Id") trim-s))))
 
@@ -662,7 +1356,8 @@
 
 (defn- parse-basic-credentials
   [^HttpExchange exchange]
-  (when-some [header (some-> (.getRequestHeaders exchange)
+  (when-some [header (some-> exchange
+                             (.getRequestHeaders)
                              (.getFirst "Authorization")
                              trim-s)]
     (let [[scheme token] (str/split header #"\s+" 2)]
@@ -689,6 +1384,14 @@
           :message (or (trim-s message)
                        "Authentication required.")}})
 
+(defn- forbidden-response
+  [message]
+  {:status 403
+   :body {:ok? false
+          :error :auth/forbidden
+          :message (or (trim-s message)
+                       "Access forbidden.")}})
+
 (defn- auth-config-error-response
   []
   {:status 500
@@ -696,48 +1399,265 @@
           :error :auth/not-configured
           :message "HTTP authentication enabled, but auth source is missing."}})
 
-(defn- authorize-request
-  ([runtime exchange]
-   (authorize-request runtime exchange nil))
-  ([runtime exchange payload]
-  (when (auth-enabled? runtime)
-    (if-not (some? (auth-source runtime))
-      (do
-        (report-auth! runtime exchange
-                      {:operation :auth/http-basic
-                       :success false
-                       :level :error
-                       :message "HTTP auth enabled, but auth source is missing."})
-        (auth-config-error-response))
-      (if-some [{:keys [login password]} (parse-basic-credentials exchange)]
-        (let [result (auth-user/authenticate-password
-                      (auth-source runtime)
-                      login
-                      password
-                      (auth-account-type runtime)
-                      (auth-options runtime exchange payload))]
-          (if (:ok? result)
+(defn- auth-session-config-error-response
+  []
+  {:status 500
+   :body {:ok? false
+          :error :auth/not-configured
+          :message "Session principal auth enabled, but session service is missing."}})
+
+(defn- session-principal-meta
+  [session-state]
+  (let [meta (when (map? session-state)
+               (:session/meta session-state))]
+    (if (map? meta) meta {})))
+
+(defn- session-principal-user
+  [session-state]
+  (let [meta      (session-principal-meta session-state)
+        principal (if (map? (:auth/principal meta))
+                    (:auth/principal meta)
+                    meta)
+        user      (auth-user-public principal)]
+    (when (and (map? user)
+               (or (some? (:user/id user))
+                   (some? (:user/email user))))
+      user)))
+
+(defn- session-principal-refreshed-at-ms
+  [session-state]
+  (let [meta (session-principal-meta session-state)]
+    (or (parse-non-negative-long (:auth/principal-refreshed-at meta))
+        (parse-non-negative-long (:auth/principal-at meta)))))
+
+(defn- session-principal-fresh?
+  [ttl-ms refreshed-at-ms now-ms]
+  (or (<= (long (or ttl-ms 0)) 0)
+      (and (some? refreshed-at-ms)
+           (<= (- now-ms refreshed-at-ms) ttl-ms))))
+
+(defn- session-principal-meta-update
+  [user now-ms]
+  (let [user' (auth-user-public user)
+        ts    (long now-ms)]
+    (cond-> {:auth/principal user'
+             :auth/principal-at ts
+             :auth/principal-refreshed-at ts}
+      (some? (:user/id user')) (assoc :user/id (:user/id user'))
+      (some? (:user/email user')) (assoc :user/email (:user/email user'))
+      (some? (:user/account-type user')) (assoc :user/account-type (:user/account-type user'))
+      (seq (:user/roles user')) (assoc :user/roles (:user/roles user')))))
+
+(defn- refresh-session-principal
+  [runtime sid session-state user]
+  (let [cfg         (auth-session-principal-config runtime)
+        refresh-ms  (long (or (:refresh-ms cfg) 0))
+        refreshed-at (session-principal-refreshed-at-ms session-state)
+        now         (System/currentTimeMillis)
+        due?        (and (pos? refresh-ms)
+                         (or (nil? refreshed-at)
+                             (>= (- now refreshed-at) refresh-ms)))
+        service     (auth-session-service runtime)
+        existing-meta (session-principal-meta session-state)]
+    (if (and due?
+             sid
+             (map? service)
+             (fn? (:open! service)))
+      (or (try
+            (session/open! service sid {:session/meta (merge existing-meta
+                                                             (session-principal-meta-update user now))})
+            (catch Throwable _ nil))
+          session-state)
+      session-state)))
+
+(defn- authenticate-request-via-basic
+  [runtime exchange payload operation basic-credentials]
+  (if-not (some? (auth-source runtime))
+    (do
+      (report-auth! runtime exchange
+                    {:operation :auth/http-basic
+                     :success false
+                     :level :error
+                     :message "HTTP auth enabled, but auth source is missing."})
+      {:ok? false
+       :response (auth-config-error-response)})
+    (let [{:keys [login password]} basic-credentials
+          result (auth-user/authenticate-password
+                  (auth-source runtime)
+                  login
+                  password
+                  (auth-account-type runtime)
+                  (auth-options runtime exchange payload))]
+      (if (:ok? result)
+        (let [user      (when (map? result) (:user result))
+              user'     (auth-user-public user)
+              allowed?  (roles/allowed? (:roles runtime) operation user')]
+          (if allowed?
             (do
               (report-auth! runtime exchange
                             {:operation :auth/http-basic
                              :success true
                              :user-id (get-in result [:user :user/id])
                              :message "HTTP basic auth accepted."})
-              nil)
+              {:ok? true
+               :auth (cond-> {:source :http/basic}
+                       (map? user') (assoc :user user')
+                       (map? (:session result)) (assoc :session (:session result)))})
             (do
               (report-auth! runtime exchange
                             {:operation :auth/http-basic
                              :success false
                              :level :warning
-                             :message (str "HTTP basic auth rejected: " (or (:error result) :unknown))})
-              (unauthorized-response runtime "Invalid credentials."))))
+                             :user-id (get-in result [:user :user/id])
+                             :message (str "HTTP auth forbidden for operation "
+                                           (or operation :unknown) ".")})
+              {:ok? false
+               :response (forbidden-response "Missing required role for this operation.")})))
         (do
           (report-auth! runtime exchange
                         {:operation :auth/http-basic
                          :success false
+                         :level :warning
+                         :message (str "HTTP basic auth rejected: " (or (:error result) :unknown))})
+          {:ok? false
+           :response (unauthorized-response runtime "Invalid credentials.")})))))
+
+(defn- authenticate-request-via-session-principal
+  [runtime exchange payload operation]
+  (let [cfg      (auth-session-principal-config runtime)
+        sid      (auth-session-id exchange payload)
+        service  (auth-session-service runtime)]
+    (cond
+      (nil? sid)
+      (do
+        (report-auth! runtime exchange
+                      {:operation :auth/http-session
+                       :success false
+                       :level :notice
+                       :message "Missing session id for session principal auth."})
+        {:ok? false
+         :response (unauthorized-response runtime "Missing session id.")})
+
+      (not (and (map? service) (fn? (:get! service))))
+      (do
+        (report-auth! runtime exchange
+                      {:operation :auth/http-session
+                       :success false
+                       :level :error
+                       :message "Session principal auth enabled, but session service is missing."})
+        {:ok? false
+         :response (auth-session-config-error-response)})
+
+      :else
+      (if-some [session-state (try
+                                (session/get! service sid)
+                                (catch Throwable _ nil))]
+        (let [user            (session-principal-user session-state)
+              now-ms          (System/currentTimeMillis)
+              refreshed-at-ms (session-principal-refreshed-at-ms session-state)
+              fresh?          (session-principal-fresh? (:ttl-ms cfg)
+                                                       refreshed-at-ms
+                                                       now-ms)]
+          (cond
+            (nil? user)
+            (do
+              (report-auth! runtime exchange
+                            {:operation :auth/http-session
+                             :success false
+                             :level :warning
+                             :message "Session principal is missing."})
+              {:ok? false
+               :response (unauthorized-response runtime "Session has no principal.")})
+
+            (not fresh?)
+            (do
+              (report-auth! runtime exchange
+                            {:operation :auth/http-session
+                             :success false
+                             :level :notice
+                             :user-id (:user/id user)
+                             :message "Session principal expired."})
+              {:ok? false
+               :response (unauthorized-response runtime "Session principal expired. Re-authenticate with Basic Auth.")})
+
+            :else
+            (let [allowed?       (roles/allowed? (:roles runtime) operation user)
+                  session-state' (refresh-session-principal runtime sid session-state user)]
+              (if allowed?
+                (do
+                  (report-auth! runtime exchange
+                                {:operation :auth/http-session
+                                 :success true
+                                 :user-id (:user/id user)
+                                 :message "Session principal auth accepted."})
+                  {:ok? true
+                   :auth {:source :http/session-principal
+                          :user user
+                          :session (cond-> {:session/id sid}
+                                     (map? session-state')
+                                     (merge (select-keys session-state'
+                                                         [:session/version
+                                                          :session/state
+                                                          :session/frozen?
+                                                          :session/updated-at
+                                                          :session/last-access-at
+                                                          :session/frozen-at
+                                                          :session/thawed-at])))}})
+                (do
+                  (report-auth! runtime exchange
+                                {:operation :auth/http-session
+                                 :success false
+                                 :level :warning
+                                 :user-id (:user/id user)
+                                 :message (str "Session auth forbidden for operation "
+                                               (or operation :unknown) ".")})
+                  {:ok? false
+                   :response (forbidden-response "Missing required role for this operation.")})))))
+        (do
+          (report-auth! runtime exchange
+                        {:operation :auth/http-session
+                         :success false
                          :level :notice
-                         :message "Missing or invalid Authorization header."})
-          (unauthorized-response runtime "Missing or invalid Authorization header.")))))))
+                         :message "Session not found for session principal auth."})
+          {:ok? false
+           :response (unauthorized-response runtime "Session not found.")})))))
+
+(defn- authenticate-request
+  ([runtime exchange]
+   (authenticate-request runtime exchange nil nil))
+  ([runtime exchange payload]
+   (authenticate-request runtime exchange payload nil))
+  ([runtime exchange payload operation]
+   (if-not (auth-enabled? runtime)
+     {:ok? true}
+     (let [basic-credentials (parse-basic-credentials exchange)
+           session-principal? (auth-session-principal-enabled? runtime operation)]
+       (cond
+         (map? basic-credentials)
+         (authenticate-request-via-basic runtime exchange payload operation basic-credentials)
+
+         session-principal?
+         (authenticate-request-via-session-principal runtime exchange payload operation)
+
+         :else
+         (do
+           (report-auth! runtime exchange
+                         {:operation :auth/http-basic
+                          :success false
+                          :level :notice
+                          :message "Missing or invalid Authorization header."})
+           {:ok? false
+            :response (unauthorized-response runtime "Missing or invalid Authorization header.")}))))))
+
+(defn- authorize-request
+  ([runtime exchange]
+   (authorize-request runtime exchange nil nil))
+  ([runtime exchange payload]
+   (authorize-request runtime exchange payload nil))
+  ([runtime exchange payload operation]
+   (let [authn (authenticate-request runtime exchange payload operation)]
+     (when-not (:ok? authn)
+       (:response authn)))))
 
 (defn- write-response!
   ([^HttpExchange exchange status ^String body]
@@ -804,12 +1724,14 @@
                                             {:allowed ["POST"]})))
           (let [ctype         (content-type exchange)
                 body-str      (read-body exchange)
-                auth-payload  (safe-decode-request-body body-str ctype)]
-            (if-some [{:keys [status body headers]} (authorize-request runtime exchange auth-payload)]
-              (write-response! exchange status (encode-response body) headers)
+                auth-payload  (safe-decode-request-body body-str ctype)
+                authn         (authenticate-request runtime exchange auth-payload :http.v1/act)]
+            (if-not (:ok? authn)
+              (let [{:keys [status body headers]} (:response authn)]
+                (write-response! exchange status (encode-response body) headers))
               (try
                 (let [payload (decode-request-body body-str ctype)
-                      {:keys [status body]} (invoke-act runtime payload telemetry)]
+                      {:keys [status body]} (invoke-act runtime payload telemetry (:auth authn))]
                   (write-response! exchange status (encode-response body)))
                 (catch Throwable t
                   (write-response! exchange
@@ -848,7 +1770,7 @@
           (let [ctype         (content-type exchange)
                 body-str      (read-body exchange)
                 auth-payload  (safe-decode-request-body body-str ctype)]
-            (if-some [{:keys [status body headers]} (authorize-request runtime exchange auth-payload)]
+            (if-some [{:keys [status body headers]} (authorize-request runtime exchange auth-payload :http.v1/session)]
               (write-response! exchange status (encode-response body) headers)
               (try
                 (let [payload (decode-request-body body-str ctype)
@@ -860,6 +1782,55 @@
                                    (encode-response {:ok? false
                                                      :error :runtime/internal
                                                      :message (.getMessage t)})))))))))))
+
+(defn- admin-handler
+  [runtime]
+  (reify HttpHandler
+    (handle [_ exchange]
+      (let [method (some-> (.getRequestMethod exchange) str/upper-case)]
+        (if (not= "POST" method)
+          (write-response! exchange
+                           405
+                           (encode-response {:ok? false
+                                             :error :method-not-allowed
+                                             :allowed ["POST"]}))
+          (let [ctype        (content-type exchange)
+                body-str     (read-body exchange)
+                auth-payload (safe-decode-request-body body-str ctype)
+                action       (normalize-admin-action (:action auth-payload))]
+            (if-not action
+              (write-response! exchange
+                               400
+                               (encode-response {:ok? false
+                                                 :error :input/invalid
+                                                 :message "Unsupported or missing admin action."
+                                                 :details {:action (:action auth-payload)
+                                                           :supported admin-supported-actions}}))
+              (if-some [{:keys [status body headers]}
+                        (authorize-request runtime exchange auth-payload action)]
+                (do
+                  (when (= 403 status)
+                    (report-auth! runtime exchange
+                                  {:operation action
+                                   :success false
+                                   :level :warning
+                                   :message "Admin operation rejected by role policy."}))
+                  (write-response! exchange status (encode-response body) headers))
+                (try
+                  (let [result (invoke-admin-action runtime action auth-payload)
+                        status (admin-result-status result)
+                        body   (assoc (if (map? result)
+                                        result
+                                        {:ok? false
+                                         :error :runtime/invalid-result})
+                                      :action action)]
+                    (write-response! exchange status (encode-response body)))
+                  (catch Throwable t
+                    (write-response! exchange
+                                     500
+                                     (encode-response {:ok? false
+                                                       :error :runtime/internal
+                                                       :message (.getMessage t)}))))))))))))
 
 (defn- health-handler
   [route-count]
@@ -885,10 +1856,7 @@
       (assoc :models (system/ref :ferment/models))
 
       (not (contains? cfg :runtime))
-      (assoc :runtime (system/ref :ferment.runtime/default))
-
-      (not (contains? cfg :auth))
-      (assoc :auth {:enabled? false}))))
+      (assoc :runtime (system/ref :ferment.runtime/default)))))
 
 (defn init-http
   "Initializes HTTP bridge for model runtime workers."
@@ -913,6 +1881,7 @@
         (assoc public-model-routes
                "/v1/act" {:type :protocol-act}
                "/v1/session" {:type :session-bridge}
+               "/v1/admin" {:type :admin}
                "/health" {:type :health}
                "/routes" {:type :routes}
                "/diag/telemetry" {:type :diag-telemetry})
@@ -922,6 +1891,7 @@
       (.createContext server endpoint (invoke-handler route)))
     (.createContext server "/v1/act" (act-handler runtime telemetry))
     (.createContext server "/v1/session" (session-handler runtime))
+    (.createContext server "/v1/admin" (admin-handler runtime))
     (.createContext server "/health" (health-handler (count public-routes)))
     (.createContext server "/routes" (routes-handler public-routes))
     (.createContext server "/diag/telemetry" (telemetry-handler telemetry))

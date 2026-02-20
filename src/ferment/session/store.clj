@@ -356,16 +356,24 @@
                            (assoc :session/state :hot
                                   :session/frozen? false))))))
 
+(defn- merge-session-meta
+  [session opts]
+  (let [meta' (when (map? (:session/meta opts))
+                (:session/meta opts))]
+    (if (map? meta')
+      (update session :session/meta (fnil merge {}) meta')
+      session)))
+
 (defn freeze-session!
   [store sid opts]
   (let [opts' (if (map? opts) opts {})]
     (update-session! store sid
                      (fn [session]
                        (-> session
+                           (merge-session-meta opts')
                            (merge (select-keys opts'
                                                [:session/summary
-                                                :session/snapshot
-                                                :session/meta]))
+                                                :session/snapshot]))
                            (assoc :session/state :warm
                                   :session/frozen? true
                                   :session/frozen-at (now-iso)))))))
@@ -376,10 +384,10 @@
     (update-session! store sid
                      (fn [session]
                        (-> session
+                           (merge-session-meta opts')
                            (merge (select-keys opts'
                                                [:session/summary
-                                                :session/snapshot
-                                                :session/meta]))
+                                                :session/snapshot]))
                            (assoc :session/state :hot
                                   :session/frozen? false
                                   :session/thawed-at (now-iso)))))))

@@ -3,14 +3,14 @@
 {
 
  :ferment.auth.pwd/settings.strong {:wait        0.2
-                                        :wait-random [0 0.3]
-                                        :wait-nouser 0.2
-                                        :suite       #ref :ferment.auth.pwd/suite.strong}
+                                    :wait-random [0 0.3]
+                                    :wait-nouser 0.2
+                                    :suite       #ref :ferment.auth.pwd/suite.strong}
 
  :ferment.auth.pwd/settings.simple {:wait        0.2
-                                        :wait-random [0 0.3]
-                                        :wait-nouser 0.2
-                                        :suite       #ref :ferment.auth.pwd/suite.simple}
+                                    :wait-random [0 0.3]
+                                    :wait-nouser 0.2
+                                    :suite       #ref :ferment.auth.pwd/suite.simple}
 
  :ferment.auth.pwd/suite.strong
  [{:name        :scrypt
@@ -31,30 +31,31 @@
    :salt-length  16
    :salt-charset "abcdefghijklmnopqrstuvwzyxABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-."}]
 
- :ferment.auth/strong {:db                            #ref :ferment.db/main
-                           :passwords                 #ref :ferment.auth.pwd/settings.strong
-                           :account-types             [:system :manager]
-                           :locking/max-attempts      8             ; max failed attempts before soft-lock
-                           :locking/lock-wait         [300 seconds] ; minutes to wait for unlock after soft-lock
-                           :locking/fail-expires      [1 minute]    ; time for 1 failed attempt to be forgotten
-                           :registration/expires      [15 minutes]  ; time for registration after providing correct code/token
-                           :confirmation/expires      [15 minutes]  ; time for a confirmation code/token to expire
-                           :confirmation/max-attempts 3             ; max confirmation messages to be sent for the same code/token
-                           }
+ :ferment.auth/strong {:db                        #ref :ferment.db/main
+                       :passwords                 #ref :ferment.auth.pwd/settings.strong
+                       :account-types             [:system :manager]
+                       :locking/max-attempts      8             ; max failed attempts before soft-lock
+                       :locking/lock-wait         [300 seconds] ; minutes to wait for unlock after soft-lock
+                       :locking/fail-expires      [1 minute]    ; time for 1 failed attempt to be forgotten
+                       :registration/expires      [15 minutes]  ; time for registration after providing correct code/token
+                       :confirmation/expires      [15 minutes]  ; time for a confirmation code/token to expire
+                       :confirmation/max-attempts 3             ; max confirmation messages to be sent for the same code/token
+                       }
 
  :ferment.auth/simple {:passwords                 #ref :ferment.auth.pwd/settings.simple
-                           :account-types             [:provider :user]
-                           :locking/max-attempts      10           ; max failed attempts before soft-lock
-                           :locking/lock-wait         [10 minutes] ; minutes to wait for unlock after soft-lock
-                           :locking/fail-expires      [1 minute]   ; time for 1 failed attempt to be forgotten
-                           :registration/expires      [15 minutes] ; time for registration after providing correct code/token
-                           :confirmation/expires      [15 minutes] ; time for confirmation code/token to expire
-                           :confirmation/max-attempts 3            ; max confirmation messages to be sent for the same code/token
-                           }
+                       :account-types             [:provider :user]
+                       :locking/max-attempts      10           ; max failed attempts before soft-lock
+                       :locking/lock-wait         [10 minutes] ; minutes to wait for unlock after soft-lock
+                       :locking/fail-expires      [1 minute]   ; time for 1 failed attempt to be forgotten
+                       :registration/expires      [15 minutes] ; time for registration after providing correct code/token
+                       :confirmation/expires      [15 minutes] ; time for confirmation code/token to expire
+                       :confirmation/max-attempts 3            ; max confirmation messages to be sent for the same code/token
+                       }
 
  ;; Main authentication configuration
 
  :ferment.auth/setup {:db           #ref :ferment.db/main
-                          :default-type :user
-                          :types        [#ref :ferment.auth/strong
-                                         #ref :ferment.auth/simple]}}
+                      :default-type :user
+                      :types        [#ref :ferment.auth/strong
+                                     #ref :ferment.auth/simple]}
+ }

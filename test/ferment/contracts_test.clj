@@ -29,6 +29,12 @@
              (get-in protocol [:envelope/response :required-one-of])))
       (is (contains? (:intents protocol) :code/patch))
       (is (contains? (:intents protocol) :text/respond))
+      (is (= :route/decide
+             (get-in protocol [:intents :route/decide :result/contract :contract/kind])))
+      (is (= #{:schema-valid}
+             (get-in protocol [:intents :route/decide :quality :done :must])))
+      (is (= [:schema-valid :no-hallucinated-apis]
+             (get-in protocol [:intents :text/respond :quality :checks])))
       (is (contains? (:error/catalog protocol) :schema/invalid))
       (is (= :builtin/schema-valid
              (get-in protocol [:quality/checks :schema-valid])))
@@ -186,6 +192,72 @@
       (is (:ok? (contracts/validate-result protocol :text/respond
                                            {:result {:type :value
                                                      :out {:text "ok"}}}))))))
+
+(deftest route-decide-result-contract-is-enforced
+  (testing "Intent :route/decide requires canonical route decision payload with keyword target and valid dispatch policy."
+    (let [protocol {:intents {:route/decide {:result/contract {:type :value
+                                                               :contract/kind :route/decide}}}
+                    :result/types [:value :error]}
+          ok-flat {:result {:type :value
+                            :out {:cap/id :llm/solver
+                                  :dispatch {:checks [:schema-valid]
+                                             :retry {:same-cap-max 1
+                                                     :fallback-max 1}}}}}
+          ok-nested {:result {:type :value
+                              :out {:cap/id :llm/voice
+                                    :dispatch {:candidates [:llm/voice :llm/solver]
+                                               :switch-on #{:schema/invalid}}}}}
+          missing-target {:result {:type :value
+                                   :out {:dispatch {:checks [:schema-valid]}}}}
+          bad-cap-type {:result {:type :value
+                                 :out {:cap/id "llm/solver"}}}
+          bad-candidates {:result {:type :value
+                                   :out {:cap/id :llm/solver
+                                         :dispatch {:candidates ["llm/voice"]}}}}
+          bad-retry {:result {:type :value
+                              :out {:cap/id :llm/solver
+                                    :dispatch {:retry {:same-cap-max -1}}}}}
+          bad-alias {:result {:type :value
+                              :out {:cap-id :llm/solver}}}
+          error-result {:error {:type :runtime/invoke-failed}}]
+      (is (:ok? (contracts/validate-result protocol :route/decide ok-flat)))
+      (is (:ok? (contracts/validate-result protocol :route/decide ok-nested)))
+      (is (= :route/decide-target-missing
+             (:reason (contracts/validate-result protocol :route/decide missing-target))))
+      (is (= :route/decide-cap-not-keyword
+             (:reason (contracts/validate-result protocol :route/decide bad-cap-type))))
+      (is (= :route/decide-candidates-not-keywords
+             (:reason (contracts/validate-result protocol :route/decide bad-candidates))))
+      (is (= :route/decide-retry-same-cap-max-not-nonneg-int
+             (:reason (contracts/validate-result protocol :route/decide bad-retry))))
+      (is (= :route/decide-unknown-keys
+             (:reason (contracts/validate-result protocol :route/decide bad-alias))))
+      (is (= :route/decide-error-not-allowed
+             (:reason (contracts/validate-result protocol :route/decide error-result)))))))
+
+(deftest invoke-with-contract-enforces-route-decide-shape
+  (testing "invoke-with-contract retries :route/decide until decision payload is valid."
+    (let [request {:proto 1
+                   :trace {:id "trace-route"}
+                   :task {:intent :route/decide}
+                   :input {:prompt "route this"}}
+          protocol {:intents {:route/decide {:result/contract {:type :value
+                                                               :contract/kind :route/decide}}}
+                    :result/types [:value :error]}
+          calls (atom 0)
+          invoke (fn [_request _attempt]
+                   (let [n (swap! calls inc)]
+                     (if (= n 1)
+                       {:result {:type :value
+                                 :out {:text "invalid"}}}
+                       {:result {:type :value
+                                 :out {:cap/id :llm/solver}}})))]
+      (let [result (contracts/invoke-with-contract invoke request
+                                                   {:max-attempts 3
+                                                    :protocol protocol})]
+        (is (:ok? result))
+        (is (= 2 (:attempt result)))
+        (is (= 2 @calls))))))
 
 (deftest invoke-with-contract-enforces-eval-grade-shape
   (testing "invoke-with-contract retries :eval/grade when result does not satisfy score contract."

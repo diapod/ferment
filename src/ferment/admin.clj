@@ -99,18 +99,77 @@
   (run-admin-op "admin/reset-login-attempts"
                 #(user/reset-login-attempts! (auth-source) selector)))
 
+(defn grant-role!
+  "Grants explicit role to user via auth source from current app state."
+  [selector role]
+  (run-admin-op "admin/grant-role"
+                #(user/grant-role! (auth-source) selector role)))
+
+(defn revoke-role!
+  "Revokes explicit role from user via auth source from current app state."
+  [selector role]
+  (run-admin-op "admin/revoke-role"
+                #(user/revoke-role! (auth-source) selector role)))
+
+(defn list-roles!
+  "Lists explicit user roles via auth source from current app state."
+  [selector]
+  (run-admin-op "admin/list-roles"
+                #(user/list-roles! (auth-source) selector)))
+
+(defn list-known-roles!
+  "Lists role dictionary entries via auth source from current app state."
+  []
+  (run-admin-op "admin/list-known-roles"
+                #(user/list-known-roles! (auth-source))))
+
+(defn create-role!
+  "Creates role dictionary entry via auth source from current app state."
+  ([role]
+   (run-admin-op "admin/create-role"
+                 #(user/create-role! (auth-source) role)))
+  ([role description]
+   (run-admin-op "admin/create-role"
+                 #(user/create-role! (auth-source) role description))))
+
+(defn delete-role!
+  "Deletes role dictionary entry via auth source from current app state."
+  [role]
+  (run-admin-op "admin/delete-role"
+                #(user/delete-role! (auth-source) role)))
+
 (defn migrate!
   "Runs DB migrations via `ferment.db/migrate!`."
   ([]
-   (db/migrate!))
+   (run-admin-op "admin/migrate-db"
+                 (fn []
+                   (db/migrate!)
+                   {:ok? true
+                    :migrated? true})))
   ([opts]
-   (db/migrate! opts)))
+   (run-admin-op "admin/migrate-db"
+                 (fn []
+                   (db/migrate! opts)
+                   {:ok? true
+                    :migrated? true}))))
 
 (defn rollback!
   "Rolls back DB migrations via `ferment.db/rollback!`."
   ([]
-   (db/rollback!))
+   (run-admin-op "admin/rollback-db"
+                 (fn []
+                   (db/rollback!)
+                   {:ok? true
+                    :rolled-back? true})))
   ([opts]
-   (db/rollback! opts))
+   (run-admin-op "admin/rollback-db"
+                 (fn []
+                   (db/rollback! opts)
+                   {:ok? true
+                    :rolled-back? true})))
   ([opts amount-or-id]
-   (db/rollback! opts amount-or-id)))
+   (run-admin-op "admin/rollback-db"
+                 (fn []
+                   (db/rollback! opts amount-or-id)
+                   {:ok? true
+                    :rolled-back? true}))))

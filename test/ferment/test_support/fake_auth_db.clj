@@ -1,12 +1,23 @@
 (ns ferment.test-support.fake-auth-db
   "Shared fake JDBC backend for user/auth tests."
-  (:require [tick.core :as t]))
+  (:require [clojure.string :as str]
+            [tick.core :as t]))
 
 (defn make-db
   []
   {:users* (atom {})
    :suites* (atom {})
    :suites-id* (atom {})
+   :roles* (atom #{"role/anonymous"
+                   "role/user"
+                   "role/operator"
+                   "role/admin"
+                   "role/infra-admin"
+                   "role/reviewer"
+                   "role/db-writer"
+                   "role/auditor"
+                   "role/suspended"})
+   :user-roles* (atom {})
    :last-id* (atom 0)})
 
 (defn- next-id!
@@ -26,7 +37,7 @@
   "SELECT id FROM users WHERE email = ? LIMIT 1")
 
 (def ^:private login-select-sql
-  "SELECT users.id AS id, users.email AS email, users.account_type AS account_type, users.login_attempts AS login_attempts, users.locked AS locked, users.soft_locked AS soft_locked, users.password AS intrinsic, password_suites.suite AS shared FROM users JOIN password_suites ON password_suites.id = users.password_suite_id WHERE users.email = ?")
+  "SELECT users.id AS id, users.email AS email, users.account_type AS account_type, users.login_attempts AS login_attempts, users.locked AS locked, users.soft_locked AS soft_locked, users.password AS intrinsic, password_suites.suite AS shared, COALESCE((SELECT GROUP_CONCAT(user_roles.role ORDER BY user_roles.role SEPARATOR ',')            FROM user_roles WHERE user_roles.user_id = users.id), '') AS roles FROM users JOIN password_suites ON password_suites.id = users.password_suite_id WHERE users.email = ?")
 
 (def ^:private login-select-by-account-sql
   (str login-select-sql " AND users.account_type = ?"))
@@ -58,6 +69,30 @@
 (def ^:private hard-lock-user-by-id-sql
   "UPDATE users SET locked = CURRENT_TIMESTAMP(6) WHERE id = ?")
 
+(def ^:private select-user-roles-by-user-id-sql
+  "SELECT role FROM user_roles WHERE user_id = ? ORDER BY role")
+
+(def ^:private select-role-by-name-sql
+  "SELECT role FROM roles WHERE role = ? LIMIT 1")
+
+(def ^:private select-known-roles-sql
+  "SELECT role, description FROM roles ORDER BY role")
+
+(def ^:private insert-role-sql
+  "INSERT INTO roles (role, description) VALUES (?, ?)")
+
+(def ^:private delete-role-sql
+  "DELETE FROM roles WHERE role = ?")
+
+(def ^:private count-role-assignments-sql
+  "SELECT COUNT(*) AS n FROM user_roles WHERE role = ?")
+
+(def ^:private insert-user-role-sql
+  "INSERT INTO user_roles (user_id, role) VALUES (?, ?) ON DUPLICATE KEY UPDATE role = VALUES(role)")
+
+(def ^:private delete-user-role-sql
+  "DELETE FROM user_roles WHERE user_id = ? AND role = ?")
+
 (defn- find-user-by-email
   [db email]
   (some (fn [[_ row]]
@@ -65,9 +100,23 @@
             row))
         @(:users* db)))
 
+(defn- user-roles
+  [db user-id]
+  (->> (get @(:user-roles* db) user-id)
+       (keep (fn [v]
+               (cond
+                 (keyword? v) (subs (str v) 1)
+                 (string? v) v
+                 :else nil)))
+       distinct
+       sort
+       vec))
+
 (defn- login-row
   [db row]
   (when (map? row)
+    (let [roles (->> (user-roles db (:id row))
+                     (str/join ","))]
     {:id (:id row)
      :email (:email row)
      :account_type (:account_type row)
@@ -75,7 +124,8 @@
      :locked (:locked row)
      :soft_locked (:soft_locked row)
      :intrinsic (:password row)
-     :shared (get @(:suites-id* db) (:password_suite_id row))}))
+     :shared (get @(:suites-id* db) (:password_suite_id row))
+     :roles roles})))
 
 (defn execute-one!
   [db _connectable query & _opts]
@@ -106,6 +156,27 @@
                            (= account-type (:account_type row)))
                   (login-row db row)))
               @(:users* db)))
+
+      (= sql select-user-roles-by-user-id-sql)
+      (let [user-id (long (second query))]
+        (mapv (fn [role]
+                {:role role})
+              (user-roles db user-id)))
+
+      (= sql select-role-by-name-sql)
+      (let [role (second query)]
+        (when (contains? @(:roles* db) role)
+          {:role role}))
+
+      (= sql count-role-assignments-sql)
+      (let [role (second query)
+            n (->> @(:user-roles* db)
+                   vals
+                   (mapcat seq)
+                   (map #(if (keyword? %) (subs (str %) 1) (str %)))
+                   (filter #(= role %))
+                   count)]
+        {:n n})
 
       :else
       (throw (ex-info "Unexpected SQL in fake execute-one!."
@@ -157,6 +228,7 @@
         (if (contains? @(:users* db) id)
           (do
             (swap! (:users* db) dissoc id)
+            (swap! (:user-roles* db) dissoc id)
             [{:next.jdbc/update-count 1}])
           [{:next.jdbc/update-count 0}]))
 
@@ -213,6 +285,67 @@
             (swap! (:users* db) assoc id
                    (assoc row :locked (t/now)))
             [{:next.jdbc/update-count 1}])
+          [{:next.jdbc/update-count 0}]))
+
+      (= sql select-user-roles-by-user-id-sql)
+      (let [user-id (long (second query))]
+        (mapv (fn [role]
+                {:role role})
+              (user-roles db user-id)))
+
+      (= sql select-known-roles-sql)
+      (->> @(:roles* db)
+           sort
+           (mapv (fn [role] {:role role
+                             :description nil})))
+
+      (= sql insert-role-sql)
+      (let [[_ role _description] query
+            existed? (contains? @(:roles* db) role)]
+        (when-not existed?
+          (swap! (:roles* db) conj role))
+        [{:next.jdbc/update-count (if existed? 0 1)}])
+
+      (= sql delete-role-sql)
+      (let [role (second query)
+            existed? (contains? @(:roles* db) role)]
+        (when existed?
+          (swap! (:roles* db) disj role))
+        [{:next.jdbc/update-count (if existed? 1 0)}])
+
+      (= sql insert-user-role-sql)
+      (let [user-id (long (second query))
+            role    (nth query 2)
+            role'   (cond
+                      (keyword? role) (subs (str role) 1)
+                      (string? role) role
+                      :else nil)]
+        (if (and (contains? @(:users* db) user-id)
+                 role'
+                 (contains? @(:roles* db) role'))
+          (let [before (set (user-roles db user-id))]
+            (swap! (:user-roles* db) update user-id (fnil conj #{}) role')
+            (let [after (set (user-roles db user-id))]
+              [{:next.jdbc/update-count (if (= before after) 0 1)}]))
+          [{:next.jdbc/update-count 0}]))
+
+      (= sql delete-user-role-sql)
+      (let [user-id (long (second query))
+            role    (nth query 2)
+            role'   (cond
+                      (keyword? role) (subs (str role) 1)
+                      (string? role) role
+                      :else nil)
+            before  (set (user-roles db user-id))]
+        (if (and role' (seq before))
+          (do
+            (swap! (:user-roles* db) update user-id
+                   (fn [current]
+                     (->> current
+                          (remove #(= role' (if (keyword? %) (subs (str %) 1) (str %))))
+                          set)))
+            (let [after (set (user-roles db user-id))]
+              [{:next.jdbc/update-count (if (= before after) 0 1)}]))
           [{:next.jdbc/update-count 0}]))
 
       :else

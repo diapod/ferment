@@ -8,6 +8,7 @@
     ferment.core-test
 
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.java.io :as io]
             [ferment.contracts :as contracts]
             [ferment.core :as core]
             [ferment.model :as model]
@@ -249,6 +250,39 @@
         (is (= :value (contracts/result-type-of result)))
         (is (= "VOICE:hej" (get-in result [:result :out :text])))))))
 
+(deftest execute-capability-runs-tool-node-with-runtime-effects
+  (testing "execute-capability! runs :tool plan nodes through scoped runtime effect handler."
+    (let [root (str (java.nio.file.Files/createTempDirectory
+                     "ferment-core-tool"
+                     (make-array java.nio.file.attribute.FileAttribute 0)))
+          runtime {:effects {:fs/write {:enabled? true
+                                        :root root
+                                        :allow ["sandbox/"]}}}
+          plan {:nodes [{:op :tool
+                         :tool/id :fs/write-file
+                         :effects {:allowed #{:fs/write}}
+                         :input {:path "sandbox/tool.txt"
+                                 :content "tool-ok"
+                                 :mkdirs? true}
+                         :as :write}
+                        {:op :emit
+                         :input {:slot/id [:write :out]}}]}]
+      (with-redefs [core/invoke-capability!
+                    (fn [_runtime _opts]
+                      {:result {:type :plan
+                                :plan plan}})]
+        (let [result (core/execute-capability!
+                      runtime
+                      {}
+                      {:role :router
+                       :intent :route/decide
+                       :cap-id :llm/meta
+                       :input {:prompt "plan"}})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= true (get-in result [:result :out :wrote?])))
+          (is (= "tool-ok"
+                 (slurp (io/file root "sandbox/tool.txt")))))))))
+
 (deftest execute-capability-uses-configured-checks-and-judge-capability
   (testing "execute-capability! passes protocol check-fns and triggers judge capability (:eval/grade)."
     (let [calls (atom [])
@@ -385,6 +419,109 @@
         (is (= {:allowed #{:none}}
                (get-in @captured [:request :effects])))
         (is (= 5 (get-in @captured [:opts :max-attempts]))))))
+
+(deftest invoke-capability-prefers-intent-done-policy-over-global-default
+  (testing "Intent-level quality/:done is used when explicit request :done is not provided."
+    (let [captured (atom nil)
+          protocol {:retry/max-attempts 3
+                    :intents {:text/respond {:in-schema :req/text
+                                             :quality {:done {:must #{:schema-valid}
+                                                              :score-min 1.0}}}}
+                    :done/default {:must #{:schema-valid}
+                                   :should #{:tests-pass}
+                                   :score-min 0.8}
+                    :result/types [:value]}
+          runtime {:protocol protocol}]
+      (with-redefs [contracts/invoke-with-contract
+                    (fn [_invoke-fn request _opts]
+                      (reset! captured request)
+                      {:ok? true
+                       :result {:result {:type :value
+                                         :out {:text "ok"}}}})]
+        (core/invoke-capability!
+         runtime
+         {:role :voice
+          :intent :text/respond
+          :cap-id :llm/voice
+          :model "voice-model"
+          :prompt "hej"})
+        (is (= {:must #{:schema-valid}
+                :score-min 1.0}
+               (:done @captured)))))))
+
+(deftest execute-capability-respects-per-intent-judge-policy
+  (testing "Intent-level quality/:judge may disable judge even with global judge enabled."
+    (let [calls (atom [])
+          runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
+                                        :text/respond {:in-schema :req/text
+                                                       :quality {:judge {:enabled? false}}}
+                                        :eval/grade {:in-schema :req/eval}}
+                              :result/types [:value :plan :error]
+                              :quality/judge {:enabled? true
+                                              :intent :eval/grade
+                                              :cap/id :llm/judge
+                                              :role :router
+                                              :max-attempts 1}}
+                   :resolver {:routing {:intent->cap {:eval/grade :llm/judge}}}}]
+      (with-redefs [core/invoke-capability!
+                    (fn [_runtime opts]
+                      (swap! calls conj (:intent opts))
+                      (case (:intent opts)
+                        :problem/solve {:result {:type :plan
+                                                 :plan {:nodes []}}}
+                        :eval/grade {:result {:type :value
+                                              :out {:score 0.2}}}
+                        {:result {:type :value
+                                  :out {:text "ok"}}}))
+                    workflow/execute-plan
+                    (fn [{:keys [judge-fn]}]
+                      {:ok? true
+                       :emitted {:judge-out (judge-fn {:intent :text/respond
+                                                       :cap/id :llm/voice}
+                                                      {}
+                                                      {:result {:type :value
+                                                                :out {:text "x"}}})}})]
+        (let [result (core/execute-capability!
+                      runtime
+                      (:resolver runtime)
+                      {:role :solver
+                       :intent :problem/solve
+                       :cap-id :llm/solver
+                       :input {:prompt "diag"}})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (nil? (get-in result [:result :out :judge-out])))
+          (is (= [:problem/solve] @calls)))))))
+
+(deftest invoke-capability-supports-stream-response-mode
+  (testing "invoke-capability! can return canonical :stream result when response mode requests streaming."
+    (let [runtime {:protocol {:intents {:text/respond {:in-schema :req/text}}
+                              :result/types [:value :stream]}}]
+      (with-redefs [core/ollama-generate!
+                    (fn [_]
+                      {:response "chunk-1"})]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice
+                       :model "voice-model"
+                       :prompt "hej"
+                       :response/type :stream
+                       :max-attempts 1})]
+          (is (= :stream (contracts/result-type-of result)))
+          (is (= :delta (get-in result [:result :stream 0 :event])))
+          (is (= "chunk-1" (get-in result [:result :stream 0 :text]))))))))
+
+(deftest execute-capability-passes-stream-result-through
+  (testing "execute-capability! returns :stream result unchanged (no plan materialization)."
+    (with-redefs [core/invoke-capability!
+                  (fn [_runtime _opts]
+                    {:result {:type :stream
+                              :stream [{:seq 0 :event :delta :text "s-1"}
+                                       {:seq 1 :event :done}]}})]
+      (let [result (core/execute-capability! nil {} {:intent :text/respond})]
+        (is (= :stream (contracts/result-type-of result)))
+        (is (= "s-1" (get-in result [:result :stream 0 :text])))))))
 
 (deftest invoke-capability-uses-request-overrides-and-rejects-unsupported-intent
   (testing "Request override replaces defaults, and unsupported intent fails before model invocation."

@@ -5,7 +5,9 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [ferment.contracts :as contracts]
+            [ferment.effects :as effects]
             [ferment.model :as model]
+            [ferment.router :as router]
             [ferment.session :as session]
             [ferment.workflow :as workflow]
             [ferment.system :as system])
@@ -39,12 +41,43 @@
   [runtime]
   (some-> (runtime-config runtime) :protocol))
 
+(defn- runtime-effects
+  [runtime]
+  (or (some-> (runtime-config runtime) :effects)
+      {}))
+
 (declare input->prompt find-text llm-profile judge-score-from-output)
 
 (defn- protocol-default
   [protocol k fallback]
   (let [v (get protocol k ::missing)]
     (if (identical? ::missing v) fallback v)))
+
+(defn- intent-config
+  [protocol intent]
+  (if (and (map? protocol) (keyword? intent))
+    (let [cfg (get-in protocol [:intents intent])]
+      (if (map? cfg) cfg {}))
+    {}))
+
+(defn- intent-quality-config
+  [protocol intent]
+  (let [cfg (some-> (intent-config protocol intent) :quality)]
+    (if (map? cfg) cfg {})))
+
+(defn- intent-default-done
+  [protocol intent]
+  (let [done-cfg (:done (intent-quality-config protocol intent))]
+    (if (map? done-cfg) done-cfg nil)))
+
+(defn- intent-judge-config
+  [protocol intent]
+  (let [global-cfg (if (map? (:quality/judge protocol))
+                     (:quality/judge protocol)
+                     {})
+        intent-cfg (let [cfg (:judge (intent-quality-config protocol intent))]
+                     (if (map? cfg) cfg {}))]
+    (merge global-cfg intent-cfg)))
 
 (defn- parse-double-safe
   [v]
@@ -53,6 +86,17 @@
     (string? v) (try
                   (Double/parseDouble (str/trim v))
                   (catch Throwable _ nil))
+    :else nil))
+
+(defn- keywordish
+  [v]
+  (cond
+    (keyword? v) v
+    (string? v) (let [s (some-> v str/trim not-empty)]
+                  (when s
+                    (if (str/starts-with? s ":")
+                      (keyword (subs s 1))
+                      (keyword s))))
     :else nil))
 
 (defn- parse-structured-text
@@ -160,6 +204,14 @@
   [runtime]
   (some-> (runtime-config runtime) :session))
 
+(defn- keyword-set
+  [v]
+  (cond
+    (set? v) (into #{} (filter keyword?) v)
+    (sequential? v) (into #{} (filter keyword?) v)
+    (keyword? v) #{v}
+    :else #{}))
+
 (defn- resolve-session-id
   [runtime opts]
   (or (:session/id opts)
@@ -168,14 +220,36 @@
       (get-in opts [:input :session/id])
       (str "session/" (llm-profile runtime))))
 
+(defn- auth-user-session-meta
+  [auth-user]
+  (let [roles' (->> (keyword-set (or (:user/roles auth-user)
+                                     (:roles auth-user)))
+                    sort
+                    vec)]
+    (cond-> {}
+      (some? (:user/id auth-user)) (assoc :user/id (:user/id auth-user))
+      (some? (:user/email auth-user)) (assoc :user/email (:user/email auth-user))
+      (some? (:user/account-type auth-user)) (assoc :user/account-type (:user/account-type auth-user))
+      (seq roles') (assoc :user/roles roles'))))
+
 (defn- open-runtime-session!
   [runtime opts]
   (let [service (or (:session/service opts)
                     (runtime-session runtime))
-        sid     (resolve-session-id runtime opts)]
+        sid     (resolve-session-id runtime opts)
+        auth-user (when (map? (:auth/user opts))
+                    (:auth/user opts))
+        meta-from-opts (if (map? (:session/meta opts))
+                         (:session/meta opts)
+                         {})
+        meta'   (merge {:source :core/invoke-capability}
+                       (if (map? auth-user)
+                         (auth-user-session-meta auth-user)
+                         {})
+                       meta-from-opts)]
     (when (and (map? service) sid)
       {:service service
-       :state   (session/open! service sid {:session/meta {:source :core/invoke-capability}})
+       :state   (session/open! service sid {:session/meta meta'})
        :id      sid})))
 
 (defn- append-session-turn-safe!
@@ -290,47 +364,6 @@
         ec  (.waitFor p)]
     {:exit ec :out out :err err}))
 
-(defn- resolver-config
-  [runtime resolver]
-  (or resolver
-      (some-> (runtime-config runtime) :resolver)))
-
-(defn- resolver-routing
-  [runtime resolver]
-  (or (some-> (resolver-config runtime resolver) :routing)
-      {}))
-
-(defn- resolver-capability
-  [runtime resolver cap-id]
-  (let [resolver' (resolver-config runtime resolver)]
-    (or (some-> resolver' :caps/by-id (get cap-id))
-        (some (fn [cap]
-                (when (= cap-id (:cap/id cap))
-                  cap))
-              (:caps resolver')))))
-
-(defn- default-model-key-by-intent
-  [intent]
-  (cond
-    (= :text/respond intent)
-    :ferment.model/voice
-
-    (#{:code/generate :code/patch :code/explain :code/review} intent)
-    :ferment.model/coding
-
-    (#{:route/decide :context/summarize :eval/grade} intent)
-    :ferment.model/meta
-
-    :else
-    :ferment.model/solver))
-
-(defn- resolve-model-key
-  [runtime resolver cap-id intent]
-  (or (some-> (resolver-capability runtime resolver cap-id) :dispatch/model-key)
-      (some-> (resolver-routing runtime resolver) :cap->model-key (get cap-id))
-      (some-> (resolver-routing runtime resolver) :intent->model-key (get intent))
-      (default-model-key-by-intent intent)))
-
 (defn- model-id-by-key
   [runtime model-k]
   (case model-k
@@ -344,7 +377,7 @@
 
 (defn- model-runtime-cfg
   [runtime resolver cap-id intent]
-  (let [model-k (resolve-model-key runtime resolver cap-id intent)]
+  (let [model-k (router/resolve-model-key runtime resolver cap-id intent)]
     (some-> (model/model-entry runtime model-k)
             :runtime)))
 
@@ -398,7 +431,7 @@
   (if (= :mock mode)
     {:response (mock-llm-response {:prompt (compose-prompt system prompt)})
      :raw {:mode :mock}}
-    (let [model-k (resolve-model-key runtime resolver cap-id intent)
+    (let [model-k (router/resolve-model-key runtime resolver cap-id intent)
           invoke-response (when model-k
                             (model/invoke-model!
                              runtime
@@ -443,6 +476,7 @@
 
 (defn- build-request
   [runtime {:keys [role intent cap-id input context constraints done budget effects protocol
+                   auth-user
                    session-id session-version session-state request-id trace proto]}]
   (let [request-id (or (some-> request-id str str/trim not-empty)
                        (str (java.util.UUID/randomUUID)))
@@ -465,12 +499,27 @@
                                     :session/frozen? (:session/frozen? session-state)}
                              (contains? session-state :session/summary)
                              (assoc :session/summary (:session/summary session-state))))
+        auth-fragment
+        (when (map? auth-user)
+          (let [roles' (->> (keyword-set (or (:user/roles auth-user)
+                                             (:roles auth-user)))
+                            sort
+                            vec)]
+            {:auth/user
+             (cond-> {}
+               (some? (:user/id auth-user)) (assoc :id (:user/id auth-user))
+               (some? (:user/email auth-user)) (assoc :email (:user/email auth-user))
+               (some? (:user/account-type auth-user)) (assoc :account-type (:user/account-type auth-user))
+               (seq roles') (assoc :roles roles'))}))
         context'   (merge {:profile (keyword (llm-profile runtime))
                            :mode    (llm-mode runtime)}
                           (if (map? session-fragment) session-fragment {})
+                          (if (map? auth-fragment) auth-fragment {})
                           (if (map? context) context {}))
         constraints' (or constraints (protocol-default protocol' :constraints/default nil))
-        done'        (or done (protocol-default protocol' :done/default nil))
+        done'        (or done
+                         (intent-default-done protocol' intent)
+                         (protocol-default protocol' :done/default nil))
         budget'      (or budget (protocol-default protocol' :budget/default nil))
         effects'     (or effects (protocol-default protocol' :effects/default nil))
         input'       (if (map? input) input {:prompt (input->prompt input)})]
@@ -497,6 +546,28 @@
             :out   {:text text}
             :usage {:mode mode}}})
 
+(defn- default-stream-result-parser
+  [text {:keys [request mode]}]
+  {:proto 1
+   :trace (:trace request)
+   :result {:type :stream
+            :stream [{:seq 0
+                      :event :delta
+                      :text text}
+                     {:seq 1
+                      :event :done}]
+            :usage {:mode mode}}})
+
+(defn- stream-response-mode?
+  [opts]
+  (let [response-type (or (keywordish (:response/type opts))
+                          (keywordish (get-in opts [:response :type]))
+                          (keywordish (:result/type opts))
+                          (keywordish (:result-type opts)))]
+    (or (= :stream response-type)
+        (true? (:stream? opts))
+        (true? (get-in opts [:response :stream?])))))
+
 (defn- judge-result-parser
   [text {:keys [request mode]}]
   (let [parsed (parse-structured-text text)
@@ -512,21 +583,6 @@
      :result {:type  :value
               :out   out-map
               :usage {:mode mode}}}))
-
-(defn- intent->role
-  [intent]
-  (case intent
-    :problem/solve :solver
-    (:code/generate :code/patch :code/explain :code/review) :coder
-    (:route/decide :context/summarize :eval/grade) :router
-    :voice))
-
-(defn- resolve-role
-  [runtime resolver cap-id intent]
-  (or (some-> (resolver-capability runtime resolver cap-id) :dispatch/role)
-      (some-> (resolver-routing runtime resolver) :cap->role (get cap-id))
-      (some-> (resolver-routing runtime resolver) :intent->role (get intent))
-      (intent->role intent)))
 
 (defn- input->prompt
   [input]
@@ -548,7 +604,11 @@
             :as opts}]
   (let [mode (llm-mode runtime)
         protocol (runtime-protocol runtime)
-        resolver' (resolver-config runtime resolver)
+        parser (or result-parser
+                   (when (stream-response-mode? opts)
+                     default-stream-result-parser)
+                   default-result-parser)
+        resolver' (router/resolver-config runtime resolver)
         input' (if (map? input)
                  input
                  {:prompt (or prompt "")})
@@ -573,6 +633,7 @@
                                         :request-id request-id
                                         :trace trace
                                         :proto proto
+                                        :auth-user (:auth/user opts)
                                         :session-id session-id
                                         :session-version (or session-version
                                                              (:session/version session-state))
@@ -596,7 +657,7 @@
                                                     :mode mode})
                           text (:response result)]
                       (if (and (string? text) (not (str/blank? text)))
-                        ((or result-parser default-result-parser)
+                        (parser
                          text
                          {:request request*
                           :mode mode
@@ -643,13 +704,13 @@
 
 (defn- invoke-plan-call!
   [runtime resolver]
-  (fn [call-node _env]
+  (fn [call-node env]
     (let [intent  (:intent call-node)
           cap-id  (or (:cap/id call-node)
                       (workflow/resolve-capability-id resolver call-node))
-          role    (or (:role call-node) (resolve-role runtime resolver cap-id intent))
+          role    (or (:role call-node) (router/resolve-role runtime resolver cap-id intent))
           prompt  (input->prompt (:input call-node))
-          model-k (resolve-model-key runtime resolver cap-id intent)
+          model-k (router/resolve-model-key runtime resolver cap-id intent)
           model   (or (:model call-node)
                       (model-id-by-key runtime model-k))
           system  (:system call-node)
@@ -676,6 +737,8 @@
                            :temperature temp
                            :max-attempts (:max-attempts call-node)
                            :result-parser (:result-parser call-node)
+                           :auth/user (:auth/user env)
+                           :roles (:roles/config env)
                            :resolver resolver}))))
 
 (defn- judge-score-from-output
@@ -692,20 +755,23 @@
 
 (defn- runtime-judge-fn
   [runtime resolver parent-opts]
-  (let [protocol   (or (runtime-protocol runtime) {})
-        judge-cfg  (or (:quality/judge protocol) {})
-        enabled?   (boolean (:enabled? judge-cfg))
-        judge-intent (or (:intent judge-cfg) :eval/grade)
-        judge-cap  (or (:cap/id judge-cfg)
-                       (some-> resolver :routing :intent->cap (get judge-intent))
-                       :llm/judge)
-        judge-role (or (:role judge-cfg) :router)
-        score-path (:score-path judge-cfg)
-        max-attempts (or (:max-attempts judge-cfg) 1)]
-    (when enabled?
-      (fn [call-node env result]
-        (when-not (or (= judge-intent (:intent call-node))
-                      (= judge-cap (:cap/id call-node)))
+  (let [protocol (or (runtime-protocol runtime) {})]
+    (fn [call-node env result]
+      (let [intent       (:intent call-node)
+            judge-cfg    (intent-judge-config protocol intent)
+            enabled?     (boolean (:enabled? judge-cfg))
+            judge-intent (or (:intent judge-cfg) :eval/grade)
+            judge-cap    (or (:cap/id judge-cfg)
+                             (some-> (router/resolver-routing runtime resolver)
+                                     :intent->cap
+                                     (get judge-intent))
+                             :llm/judge)
+            judge-role   (or (:role judge-cfg) :router)
+            score-path   (:score-path judge-cfg)
+            max-attempts (or (:max-attempts judge-cfg) 1)]
+        (when (and enabled?
+                   (not (or (= judge-intent intent)
+                            (= judge-cap (:cap/id call-node)))))
           (try
             (let [judge-result (invoke-capability!
                                 runtime
@@ -716,10 +782,12 @@
                                          :task/result result
                                          :task/done (:done call-node)
                                          :task/env env}
-                                 :context {:judge/for-intent (:intent call-node)
+                                 :context {:judge/for-intent intent
                                            :judge/for-cap (:cap/id call-node)}
                                  :max-attempts max-attempts
                                  :result-parser judge-result-parser
+                                 :auth/user (:auth/user parent-opts)
+                                 :roles (:roles parent-opts)
                                  :session/id (:session/id parent-opts)})
                   out (contracts/result-out-of judge-result)
                   score (judge-score-from-output out score-path)]
@@ -742,10 +810,15 @@
   ([runtime opts]
    (execute-capability! runtime nil opts))
   ([runtime resolver opts]
-   (let [check-fns (runtime-check-fns runtime)
+   (let [effects-cfg (runtime-effects runtime)
+         check-fns (runtime-check-fns runtime)
          judge-fn  (runtime-judge-fn runtime resolver opts)
          result (invoke-capability! runtime opts)
-         rtype  (contracts/result-type-of result)]
+         rtype  (contracts/result-type-of result)
+         workflow-env (cond-> {}
+                        (map? (:workflow/env opts)) (merge (:workflow/env opts))
+                        (map? (:auth/user opts)) (assoc :auth/user (:auth/user opts))
+                        (map? (:roles opts)) (assoc :roles/config (:roles opts)))]
      (if (= :plan rtype)
        (let [plan (or (contracts/materialize-plan-result result)
                       (contracts/result-plan-of result))
@@ -753,8 +826,11 @@
                    {:plan plan
                     :resolver resolver
                     :invoke-call (invoke-plan-call! runtime resolver)
+                    :invoke-tool (fn [tool-node env]
+                                   (effects/invoke-tool! effects-cfg tool-node env))
                     :check-fns check-fns
-                    :judge-fn judge-fn})
+                    :judge-fn judge-fn
+                    :env workflow-env})
              out  (emitted->out (:emitted run))]
          (assoc result
                 :result {:type :value

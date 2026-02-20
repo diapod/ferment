@@ -2,5 +2,9 @@
                         :port   12002
                         :models #ref :ferment/models
                         :auth   {:enabled? false
-                                 :realm    "ferment"}}
+                                 :realm    "ferment"
+                                 :session-principal {:enabled?   true
+                                                     :operations #{:http.v1/act}
+                                                     :ttl-ms     1800000
+                                                     :refresh-ms 300000}}}
  }

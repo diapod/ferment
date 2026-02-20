@@ -7,7 +7,8 @@
     ferment.workflow
 
   (:require [clojure.walk :as walk]
-            [ferment.contracts :as contracts]))
+            [ferment.contracts :as contracts]
+            [ferment.roles :as roles]))
 
 (def ^:private default-retry-policy
   {:same-cap-max 0
@@ -30,6 +31,47 @@
   [node]
   (keyword-set (or (:effects/allowed node)
                    (get-in node [:effects :allowed]))))
+
+(defn- auth-user
+  [env]
+  (let [env' (if (map? env) env {})]
+    (or (when (map? (:auth/user env'))
+          (:auth/user env'))
+        (when (map? (get-in env' [:workflow/auth :user]))
+          (get-in env' [:workflow/auth :user])))))
+
+(defn- roles-config
+  [resolver env]
+  (let [env'      (if (map? env) env {})
+        resolver' (if (map? resolver) resolver {})]
+    (or (when (map? (:roles/config env'))
+          (:roles/config env'))
+        (when (map? (:roles env'))
+          (:roles env'))
+        (when (map? (:roles resolver'))
+          (:roles resolver')))))
+
+(defn- enforce-effects-authorization!
+  [resolver call-node env]
+  (let [req-effects  (requested-effects call-node)
+        user         (auth-user env)
+        roles-cfg    (roles-config resolver env)]
+    (when (and (seq req-effects)
+               (map? user)
+               (map? roles-cfg))
+      (let [authz (roles/authorize-effects roles-cfg req-effects user)]
+        (when-not (:ok? authz)
+          (throw (ex-info "Call node requested effects forbidden for authenticated principal."
+                          {:error :auth/forbidden-effect
+                           :failure/type :auth/forbidden-effect
+                           :retryable? false
+                           :node call-node
+                           :requested-effects req-effects
+                           :denied-effects (:denied authz)
+                           :user (select-keys user [:user/id
+                                                    :user/email
+                                                    :user/account-type
+                                                    :user/roles])})))))))
 
 (defn- cap-supports-intent?
   [cap intent]
@@ -150,6 +192,13 @@
    :out (contracts/result-out-of result)
    :error (:error result)})
 
+(defn- normalize-tool-result
+  [tool-id result]
+  {:tool/id tool-id
+   :result result
+   :out (contracts/result-out-of result)
+   :error (:error result)})
+
 (defn- nonneg-int
   [v default]
   (if (and (int? v) (<= 0 v))
@@ -215,12 +264,41 @@
     (map? judge-out)    (some-> (:score judge-out) double)
     :else nil))
 
+(defn- intent-quality
+  [protocol intent]
+  (let [cfg (when (and (map? protocol) (keyword? intent))
+              (get-in protocol [:intents intent :quality]))]
+    (if (map? cfg) cfg {})))
+
+(defn- done-score-min
+  [v]
+  (if (number? v) (double v) 0.0))
+
+(defn- effective-done
+  [protocol call-node]
+  (let [intent         (:intent call-node)
+        quality        (intent-quality protocol intent)
+        default-done   (if (map? (:done/default protocol))
+                         (:done/default protocol)
+                         {})
+        quality-done   (if (map? (:done quality)) (:done quality) {})
+        node-done      (if (map? (:done call-node)) (:done call-node) {})
+        merged-done    (merge default-done quality-done node-done)
+        quality-checks (keyword-set (:checks quality))
+        dispatch-checks (keyword-set (get-in call-node [:dispatch :checks]))
+        must-keys      (into (keyword-set (:must merged-done))
+                             (concat quality-checks dispatch-checks))
+        should-keys    (keyword-set (:should merged-done))]
+    (cond-> merged-done
+      true (assoc :must must-keys
+                  :should should-keys))))
+
 (defn- evaluate-done
-  [call-node env result check-fns judge-fn]
-  (let [done         (or (:done call-node) {})
+  [protocol call-node env result check-fns judge-fn]
+  (let [done         (effective-done protocol call-node)
         must-keys    (set (or (:must done) #{}))
         should-keys  (set (or (:should done) #{}))
-        score-min    (double (or (:score-min done) 0.0))
+        score-min    (done-score-min (:score-min done))
         must-results (mapv #(run-check % call-node env result check-fns) must-keys)
         should-results (mapv #(run-check % call-node env result check-fns) should-keys)
         must-failed  (->> must-results (remove :ok?) (mapv :check))
@@ -298,19 +376,21 @@
   "Executes minimal plan AST with ops:
   - `:let`
   - `:call`
+  - `:tool`
   - `:emit`
 
   Input map:
   - `:plan`       plan map with `:nodes`
   - `:resolver`   routing map
   - `:invoke-call` fn of `[call-node env] -> canonical result envelope`
+  - `:invoke-tool` fn of `[tool-node env] -> canonical result envelope`
   - `:env`        optional initial environment map
 
   Returns:
   - `{:ok? true, :env ..., :emitted ...}`"
-  [{:keys [plan resolver invoke-call check-fns judge-fn env telemetry]
+  [{:keys [plan resolver invoke-call invoke-tool check-fns judge-fn env telemetry]
     :or   {env {}}}]
-  (let [nodes (vec (:nodes plan))
+  (let [nodes      (vec (:nodes plan))
         telemetry* (telemetry-atom telemetry)
         protocol   (or (:protocol resolver) {})]
     (loop [idx 0
@@ -336,13 +416,14 @@
                 (recur (inc idx) env' emitted))
 
               :call
-              (let [base-node     (update node :input contracts/materialize-plan env)
-                    retry-policy  (resolve-retry-policy resolver base-node)
-                    switch-on     (resolve-switch-on resolver base-node)
-                    candidates0   (resolve-candidates resolver base-node)
-                    rejected      (-> candidates0 meta :routing/rejected)
-                    candidates    (vec (take (inc (:fallback-max retry-policy))
-                                             candidates0))]
+              (let [base-node    (update node :input contracts/materialize-plan env)
+                    _            (enforce-effects-authorization! resolver base-node env)
+                    retry-policy (resolve-retry-policy resolver base-node)
+                    switch-on    (resolve-switch-on resolver base-node)
+                    candidates0  (resolve-candidates resolver base-node)
+                    rejected     (-> candidates0 meta :routing/rejected)
+                    candidates   (vec (take (inc (:fallback-max retry-policy))
+                                            candidates0))]
                 (telemetry-inc! telemetry* :calls/total)
                 (when-not (seq candidates)
                   (throw (ex-info "Unable to resolve capability candidates for call node"
@@ -374,17 +455,18 @@
                                     (let [result (invoke-call candidate-node env)
                                           _ (when (> attempt 1)
                                               (telemetry-inc! telemetry* :calls/retries))
-                                          rtype  (contracts/result-type-of result)
-                                          run*   (when (= :plan rtype)
-                                                   (let [sub-plan (or (contracts/materialize-plan-result result)
-                                                                      (contracts/result-plan-of result))]
-                                                     (execute-plan {:plan sub-plan
-                                                                    :resolver resolver
-                                                                    :invoke-call invoke-call
-                                                                    :check-fns check-fns
-                                                                    :judge-fn judge-fn
-                                                                    :env env
-                                                                    :telemetry telemetry*})))
+                                          rtype (contracts/result-type-of result)
+                                          run* (when (= :plan rtype)
+                                                 (let [sub-plan (or (contracts/materialize-plan-result result)
+                                                                    (contracts/result-plan-of result))]
+                                                   (execute-plan {:plan sub-plan
+                                                                  :resolver resolver
+                                                                  :invoke-call invoke-call
+                                                                  :invoke-tool invoke-tool
+                                                                  :check-fns check-fns
+                                                                  :judge-fn judge-fn
+                                                                  :env env
+                                                                  :telemetry telemetry*})))
                                           slot-val (if run*
                                                      (assoc (normalize-call-result cap-id result)
                                                             :out (:emitted run*)
@@ -394,7 +476,7 @@
                                                           {:result {:type :value
                                                                     :out (:emitted run*)}}
                                                           result)
-                                          done-eval (evaluate-done candidate-node env verify-result check-fns judge-fn)
+                                          done-eval (evaluate-done protocol candidate-node env verify-result check-fns judge-fn)
                                           _ (when (number? (:judge/score done-eval))
                                               (telemetry-inc! telemetry* :quality/judge-used))
                                           failure-type (call-failure-type protocol candidate-node result done-eval)
@@ -446,6 +528,103 @@
                                          :retry-policy retry-policy
                                          :candidates candidates
                                          :rejected-candidates rejected})))))))
+
+              :tool
+              (let [base-node      (update node :input contracts/materialize-plan env)
+                    tool-id        (:tool/id base-node)
+                    req-effects    (requested-effects base-node)
+                    allow-failure? (true? (get-in base-node [:dispatch :allow-failure?]))]
+                (when-not (keyword? tool-id)
+                  (throw (ex-info "Tool node requires :tool/id keyword."
+                                  {:node node
+                                   :error :effects/invalid-input
+                                   :failure/type :effects/invalid-input})))
+                (when-not (seq req-effects)
+                  (throw (ex-info "Tool node must declare requested effects in :effects/:allowed."
+                                  {:node node
+                                   :tool/id tool-id
+                                   :error :effects/not-declared
+                                   :failure/type :effects/not-declared
+                                   :retryable? false})))
+                (when-not (fn? invoke-tool)
+                  (throw (ex-info "Workflow runtime is missing :invoke-tool handler."
+                                  {:node node
+                                   :tool/id tool-id
+                                   :error :effects/runtime-missing
+                                   :failure/type :effects/runtime-missing
+                                   :retryable? false})))
+                (enforce-effects-authorization! resolver base-node env)
+                (telemetry-inc! telemetry* :calls/total)
+                (let [outcome
+                      (try
+                        (let [raw-result (invoke-tool base-node env)
+                              result (if (and (map? raw-result)
+                                              (or (contains? raw-result :result)
+                                                  (contains? raw-result :error)))
+                                       raw-result
+                                       {:result {:type :value
+                                                 :out (cond
+                                                        (map? raw-result) raw-result
+                                                        (string? raw-result) {:text raw-result}
+                                                        (nil? raw-result) {}
+                                                        :else {:value raw-result})}})
+                              done-eval (evaluate-done protocol base-node env result check-fns judge-fn)
+                              _ (when (number? (:judge/score done-eval))
+                                  (telemetry-inc! telemetry* :quality/judge-used))
+                              failure-type (call-failure-type protocol base-node result done-eval)
+                              failed? (keyword? failure-type)
+                              slot-val (normalize-tool-result tool-id result)]
+                          {:ok? (not failed?)
+                           :tool/id tool-id
+                           :result result
+                           :slot-val slot-val
+                           :done/eval done-eval
+                           :failure/type failure-type
+                           :failure/recover? false})
+                        (catch clojure.lang.ExceptionInfo e
+                          (let [data (or (ex-data e) {})
+                                failure-type (or (:failure/type data)
+                                                 (:error data)
+                                                 :effects/runtime-failed)
+                                slot-val {:tool/id tool-id
+                                          :error (:error data)
+                                          :details data}]
+                            {:ok? false
+                             :tool/id tool-id
+                             :slot-val slot-val
+                             :failure/type failure-type
+                             :failure/recover? false
+                             :details data}))
+                        (catch Throwable t
+                          {:ok? false
+                           :tool/id tool-id
+                           :slot-val {:tool/id tool-id
+                                      :error :effects/runtime-failed
+                                      :message (.getMessage t)}
+                           :failure/type :effects/runtime-failed
+                           :failure/recover? false
+                           :details {:message (.getMessage t)}}))]
+                  (if (:ok? outcome)
+                    (do
+                      (telemetry-inc! telemetry* :calls/succeeded)
+                      (let [env' (if (keyword? (:as node))
+                                   (assoc env (:as node) (:slot-val outcome))
+                                   env)]
+                        (recur (inc idx) env' emitted)))
+                    (do
+                      (telemetry-inc! telemetry* :calls/failed)
+                      (when (keyword? (:failure/type outcome))
+                        (telemetry-inc-in! telemetry* [:calls/failure-types (:failure/type outcome)]))
+                      (if allow-failure?
+                        (let [env' (if (keyword? (:as node))
+                                     (assoc env (:as node) (:slot-val outcome))
+                                     env)]
+                          (recur (inc idx) env' emitted))
+                        (throw (ex-info "Tool node execution failed"
+                                        (merge {:node node
+                                                :outcome outcome}
+                                               (when (map? (:details outcome))
+                                                 (:details outcome))))))))))
 
               :emit
               (let [output (materialize-emit-input (:input node) env)]

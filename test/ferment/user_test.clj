@@ -107,6 +107,102 @@
             (is (false? (:ok? result)))
             (is (= :user/invalid-lock-kind (:error result)))))))))
 
+(deftest grant-list-and-revoke-role-flow
+  (let [fake (fake-db/make-db)]
+    (with-redefs [jdbc/transact (fn [connectable f _opts] (f connectable))
+                  jdbc/execute! (partial fake-db/execute! fake)
+                  jdbc/execute-one! (partial fake-db/execute-one! fake)
+                  auth/config (fn
+                                ([_] {:id :ferment.auth/simple
+                                      :account-types {:default-name "user"}})
+                                ([_ _] {:id :ferment.auth/simple
+                                        :account-types {:default-name "user"}}))
+                  auth/db (fn
+                            ([_] ::db)
+                            ([_ _] ::db))
+                  auth/make-password-json (fn [_plain _]
+                                            {:shared "{\"algo\":\"pbkdf2\"}"
+                                             :intrinsic "{\"password\":\"x\"}"})]
+      (let [created (user/create-user! ::auth "roles@example.com" "sekret" :user)
+            user-id (get-in created [:user :user/id])]
+        (is (:ok? created))
+        (testing "grant-role! rejects roles outside dictionary"
+          (let [unknown (user/grant-role! ::auth user-id :role/not-in-dictionary)]
+            (is (false? (:ok? unknown)))
+            (is (= :user/unknown-role (:error unknown)))
+            (is (= :role/not-in-dictionary (:role unknown)))))
+        (testing "grant-role! is idempotent"
+          (let [grant-1 (user/grant-role! ::auth user-id :role/admin)
+                grant-2 (user/grant-role! ::auth user-id :role/admin)]
+            (is (:ok? grant-1))
+            (is (true? (:granted? grant-1)))
+            (is (= :role/admin (:role grant-1)))
+            (is (:ok? grant-2))
+            (is (false? (:granted? grant-2)))
+            (is (true? (:already? grant-2)))))
+        (testing "list-roles! returns explicit assignments"
+          (let [listed (user/list-roles! ::auth "roles@example.com")]
+            (is (:ok? listed))
+            (is (= #{:role/admin} (:roles listed)))))
+        (testing "revoke-role! is idempotent"
+          (let [revoke-1 (user/revoke-role! ::auth user-id :role/admin)
+                revoke-2 (user/revoke-role! ::auth user-id :role/admin)]
+            (is (:ok? revoke-1))
+            (is (true? (:revoked? revoke-1)))
+            (is (empty? (:roles revoke-1)))
+            (is (:ok? revoke-2))
+            (is (false? (:revoked? revoke-2)))
+            (is (true? (:missing? revoke-2)))))))))
+
+(deftest role-dictionary-management-flow
+  (let [fake (fake-db/make-db)]
+    (with-redefs [jdbc/transact (fn [connectable f _opts] (f connectable))
+                  jdbc/execute! (partial fake-db/execute! fake)
+                  jdbc/execute-one! (partial fake-db/execute-one! fake)
+                  auth/config (fn
+                                ([_] {:id :ferment.auth/simple
+                                      :account-types {:default-name "user"}})
+                                ([_ _] {:id :ferment.auth/simple
+                                        :account-types {:default-name "user"}}))
+                  auth/db (fn
+                            ([_] ::db)
+                            ([_ _] ::db))
+                  auth/make-password-json (fn [_plain _]
+                                            {:shared "{\"algo\":\"pbkdf2\"}"
+                                             :intrinsic "{\"password\":\"x\"}"})]
+      (testing "list-known-roles! exposes seeded dictionary"
+        (let [listed (user/list-known-roles! ::auth)]
+          (is (:ok? listed))
+          (is (seq (:roles listed)))
+          (is (contains? (set (map :role (:roles listed))) :role/admin))))
+
+      (testing "create-role! is idempotent"
+        (let [create-1 (user/create-role! ::auth :role/researcher)
+              create-2 (user/create-role! ::auth :role/researcher)]
+          (is (:ok? create-1))
+          (is (true? (:created? create-1)))
+          (is (= :role/researcher (:role create-1)))
+          (is (:ok? create-2))
+          (is (false? (:created? create-2)))
+          (is (true? (:already? create-2)))))
+
+      (testing "delete-role! blocks removal of assigned role and allows removing unassigned role"
+        (let [created (user/create-user! ::auth "dictionary@example.com" "sekret" :user)
+              user-id (get-in created [:user :user/id])]
+          (is (:ok? created))
+          (is (:ok? (user/grant-role! ::auth user-id :role/researcher)))
+          (let [in-use (user/delete-role! ::auth :role/researcher)]
+            (is (false? (:ok? in-use)))
+            (is (= :role/in-use (:error in-use)))
+            (is (= 1 (:assignments in-use))))
+          (is (:ok? (user/revoke-role! ::auth user-id :role/researcher)))
+          (let [deleted (user/delete-role! ::auth :role/researcher)
+                missing (user/delete-role! ::auth :role/researcher)]
+            (is (:ok? deleted))
+            (is (true? (:deleted? deleted)))
+            (is (false? (:ok? missing)))
+            (is (= :role/not-found (:error missing)))))))))
+
 (deftest users-coercions-are-registered
   (testing "coercions for :users work for key columns"
     (is (= "test@example.com"
