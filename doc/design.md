@@ -81,7 +81,7 @@ Wymaganie: bez I/O i bez zależności od konkretnego dostawcy.
 Wymaganie: logika sterowania bez bezpośredniego `curl`/procesów.
 
 ### 5.3. Warstwa adapterów (integration)
-- adaptery LLM (Ollama, MLX, docelowo OpenAI),
+- adaptery LLM (aktualnie głównie MLX server przez HTTP; opcjonalnie fallback command/stdin),
 - adaptery non-LLM (narzędzia systemowe, solvery),
 - adapter konfiguracji i środowiska.
 
@@ -97,70 +97,95 @@ Wymaganie: cienka warstwa spinająca pozostałe.
 ## 6. Mapa modułów (obecna i docelowa)
 
 Obecne klocki:
-- `ferment.core` – podstawowy pipeline rozmowy i wywołania Ollama,
-- `ferment.mlx` – adapter HTTP dla MLX + wrapper chat/generate,
+- `ferment.core` – kontraktowe wywołania capability (`invoke-with-contract`, `execute-capability!`), routing meta/solver/voice i wykonanie planów,
+- `ferment.workflow` – evaluator IR (`:let`, `:call`, `:emit`, rekurencyjne `:plan`) z retry/fallback/checks,
+- `ferment.router`, `ferment.resolver`, `ferment.contracts`, `ferment.protocol` – routing, registry capability i walidacja request/response,
+- `ferment.model` – runtime modeli (proces, HTTP invoke, sesyjne workery, freeze/thaw/TTL),
+- `ferment.http` – bridge HTTP (`/v1/act`, `/v1/session`, `/v1/admin`, `/health`, `/routes`, `/diag/telemetry`),
+- `ferment.session`, `ferment.session.store` – sesje i pamięć robocza (session vars, polityki, backend DB),
 - `ferment.system`, `ferment.env`, `ferment.env.file`, `ferment.readers` – konfiguracja i lifecycle usług,
-- `ferment.utils*` – funkcje pomocnicze.
+- `ferment.db`, `ferment.auth*`, `ferment.roles`, `ferment.effects`, `ferment.oplog*` – warstwy DB/Auth/RBAC/efekty/audit.
 
 Docelowe pączki:
-- `ferment.protocols` – kontrakty capability i runtime,
+- `ferment.contracts` + `ferment.protocol` – kontrakty capability, envelope i polityki jakości,
 - `ferment.router` – routing intencji i polityk jakości,
 - `ferment.workflow` – wykonanie planu kroków (IR eval/apply),
 - `ferment.adapters.*` – dostawcy modeli i narzędzia,
 - `ferment.memory` – stan sesji, kontekst, cache,
 - `ferment.telemetry` – logi strukturalne, metryki, trace-id.
 
-### 6.1. Stan implementacji (2026-02-15)
+### 6.1. Stan implementacji (2026-02-22)
 
 W systemie działa już podział na gałęzie konfiguracyjne Integranta:
-- `:ferment.runtime/default` – runtime input dla orkiestratora (`config` z wartościami env + refs do resolver/protocol),
-- `:ferment.core/default` – usługa core (`:solver!`, `:voice!`, `:respond!`) inicjalizowana z runtime.
-- `:ferment.model/*` – selektory modeli (`profile`, `solver`, `voice`) rozwiązywane na etapie konfiguracji.
+- `:ferment.runtime/default` – runtime input dla orkiestratora (refs do `:router`, `:resolver`, `:protocol`, `:roles`, `:session`, `:oplog`, `:models`, plus scope efektów),
+- `:ferment.core/default` – usługa core (`:invoke!`, `:solver!`, `:voice!`, `:respond!`) inicjalizowana z runtime,
+- `:ferment.model.defaults/*`, `:ferment.model.id/*`, `:ferment.model.runtime/*`, `:ferment.model/*`, `:ferment/models` – pełna konfiguracja doboru i runtime modeli.
 
 Aktualny bootstrap:
 - produkcyjny: `ferment.app/start!` (ładuje `resources/config/common/prod` + `resources/config/local/prod`),
 - developerski: `ferment.app/start-dev!` (ładuje `prod` i następnie nakłada `dev`; `dev` nadpisuje gałęzie),
-- administracyjny: `ferment.app/start-admin!` (ładuje `prod` i następnie nakłada `admin`).
+- administracyjny: `ferment.app/start-admin!` (ładuje `prod` i następnie nakłada `admin`),
+- testowy: `ferment.app/start-test!` (ładuje `prod` i następnie nakłada `test`),
+- smoke-live: `ferment.app/start-test-live!` (ładuje `prod` i następnie nakłada `test-live`).
 
 Konwencja profili:
-- profile aplikacji: `:prod`, `:dev`, `:admin`,
+- profile aplikacji: `:prod`, `:dev`, `:admin`, `:test`, `:test-live`,
 - zmienna `FERMENT_PROFILE` jest traktowana pomocniczo (np. dla skryptów shellowych), a profil runtime pozostaje również dostępny w `:ferment.app/properties`.
 
 Cel praktyczny:
-- utrzymać czytelny, warstwowy model konfiguracji (`common` + `local`, `prod` + overlay środowiskowy) bez rozjazdu między konfiguracją aplikacji i narzędziami shellowymi.
+- utrzymać czytelny, warstwowy model konfiguracji (`common` + `local`, `prod` + overlay środowiskowy), z deterministycznym ładowaniem plików (scan bez rekursji + deduplikacja po kolejności źródeł) i bez rozjazdu między aplikacją a skryptami shellowymi.
 
 ## 7. Kontrakty danych (v1)
 
 ### 7.1. Wejście
 ```clojure
-{:session/id "..."
- :request/id "..."
- :messages   [{:role "user" :content "..."}]
- :context    {:lang "pl" :mode :chat}
- :opts       {:temperature 0.4 :max-tokens 512}}
+{:proto 1
+ :trace {:id "demo-1"}
+ :task  {:intent :text/respond
+         ;; opcjonalnie:
+         ;; :cap/id :llm/voice
+         ;; :requires {:type :value :out-schema :res/text}
+         }
+ :input {:prompt "Wyjaśnij ACID w dwóch zdaniach."}
+ :context {}
+ :constraints {:language :pl}
+ :done {:must #{:schema-valid}}
+ :budget {:max-roundtrips 3}
+ :effects {:allowed #{:none}}}
 ```
 
 ### 7.2. Plan orkiestracji
 ```clojure
-{:request/id "..."
- :intent     :coding|:chat|:analysis
- :requires   {:out/schema :res/patch+tests
-              :quality/must [:schema-valid :tests-pass]}
- :dispatch   {:candidates [:llm/coder-a :llm/coder-b :solver/non-llm-x]
-              :policy     :quality-aware}
- :steps      [{:op :build-prompt}
-              {:op :call-capability}
-              {:op :postprocess}]}
+{:id "plan-1"
+ :nodes [{:op :call
+          :as :solver
+          :intent :problem/solve
+          :input {:prompt "Wyjaśnij ACID i podaj przykład."}
+          :dispatch {:candidates [:llm/solver]}}
+         {:op :call
+          :as :voice
+          :intent :text/respond
+          :input {:prompt {:slot/path [:solver :text]}}
+          :dispatch {:candidates [:llm/voice]}}
+         {:op :emit
+          :input {:text {:slot/path [:voice :text]}}}]}
 ```
 
 ### 7.3. Odpowiedź
 ```clojure
-{:request/id "..."
- :status     :ok|:error
- :output     {:text "..."}
- :usage      {:latency-ms 1234}
- :quality    {:must-pass? true :score 0.91}
- :errors     []}
+;; sukces
+{:proto 1
+ :trace {:id "demo-1"}
+ :result {:type :value
+          :out {:text "ACID to..."}
+          :usage {:mode :live}}}
+
+;; błąd
+{:proto 1
+ :trace {:id "demo-1"}
+ :error {:type :route/decide-failed
+         :message "LLM invocation failed after retries"
+         :retryable? true}}
 ```
 
 ## 8. Podstawowe funkcje (MVP)
@@ -220,12 +245,12 @@ Zdolności, które pozostają zachowane:
 | 2.2 HOF/capability jako wartość | 3.6, 4.2, 8.3 | Pokryte |
 | 2.3 Late binding/lazy runtime jako resilience | 3.7, 4.3, 9.C | Pokryte |
 | 2.4 Quality-aware dispatch | 3.7, 4.3, 7.2, 10 | Pokryte |
-| 3. Minimalne schematy EDN (registry/dispatch/wynik) | 7.2, 7.3, 9.C | Częściowo pokryte (struktura tak, pełne pola registry do uszczegółowienia) |
+| 3. Minimalne schematy EDN (registry/dispatch/wynik) | 7.2, 7.3, 9.C | Pokryte |
 
 Uwagi integracyjne:
 1. Brak kolizji semantycznych; oba dokumenty są komplementarne.
 2. Nie tracimy zdolności ze stratyfikacji: heterogeniczne wykonawstwo, rekurencyjna delegacja, late binding i quality-aware dispatch pozostają wymaganiami architektury.
-3. Do doprecyzowania implementacyjnego w Etapie C: komplet pól metadata capability (np. `:cap/cost`, `:cap/limits`) oraz strojenie polityk jakości per-intent (`:done`, `:switch-on`, scoring judge).
+3. Do strojenia operacyjnego pozostają głównie parametry jakości per-intent (prompty, checks, progi, judge), nie sam kształt kontraktów.
 
 ## 12. Definicja „done” dla nowych pączków
 
@@ -238,7 +263,7 @@ Każdy nowy pączek jest „done”, gdy:
 
 ---
 
-Dokument startowy v0.3. Każda iteracja aktualizuje:
+Dokument roboczy v0.4. Każda iteracja aktualizuje:
 - kontrakty danych,
 - mapę modułów,
 - plan etapów,

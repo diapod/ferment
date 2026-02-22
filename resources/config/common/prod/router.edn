@@ -3,6 +3,6 @@
  :ferment.router/default
  {:routing  #ref :ferment.caps/routing
   :profiles #ref :ferment.caps/profiles
-  :policy   :quality-aware}
+  :policy   :meta-decider}
 
 }

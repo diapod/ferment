@@ -6,6 +6,7 @@
   :protocol #ref :ferment.protocol/default
   :roles    #ref :ferment.roles/default
   :session  #ref :ferment.session/default
+  :ferment.model.session/enabled? false
   :effects
   {:fs/write
    {:enabled? true

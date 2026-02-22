@@ -6,7 +6,8 @@
 
     ferment.router
 
-  (:require [ferment.system :as system]))
+  (:require [integrant.core :as ig]
+            [ferment.system :as system]))
 
 (def ^:private router-top-keys
   #{:routing :profiles :policy})
@@ -99,56 +100,58 @@
                     {:path [:routing]
                      :required true}))
     (let [routing (:routing cfg)]
-      (ensure-keyword-map! routing [:routing])
-      (ensure-only-keys! routing routing-keys [:routing])
-      (when-not (contains? routing :intent->cap)
-        (fail-router! "Router config is missing required :routing/:intent->cap mapping."
-                      {:path [:routing :intent->cap]
-                       :required true}))
-      (validate-keyword->keyword-map! (:intent->cap routing) [:routing :intent->cap])
-      (when (contains? routing :cap->model-key)
-        (validate-keyword->keyword-map! (:cap->model-key routing)
-                                        [:routing :cap->model-key]))
-      (when (contains? routing :intent->model-key)
-        (validate-keyword->keyword-map! (:intent->model-key routing)
-                                        [:routing :intent->model-key]))
-      (when (contains? routing :cap->role)
-        (validate-keyword->keyword-map! (:cap->role routing)
-                                        [:routing :cap->role]))
-      (when (contains? routing :intent->role)
-        (validate-keyword->keyword-map! (:intent->role routing)
-                                        [:routing :intent->role]))
-      (when (contains? routing :switch-on)
-        (validate-keyword-coll! (:switch-on routing) [:routing :switch-on]))
-      (when (contains? routing :fallback)
-        (validate-keyword-coll! (:fallback routing) [:routing :fallback]))
-      (when (contains? routing :checks)
-        (validate-keyword-coll! (:checks routing) [:routing :checks]))
-      (when (contains? routing :policy)
-        (when-not (keyword? (:policy routing))
-          (fail-router! "Router config :routing/:policy must be a keyword."
-                        {:path [:routing :policy]
-                         :expected :keyword
-                         :value (:policy routing)})))
-      (when (contains? routing :retry)
-        (let [retry (:retry routing)]
-          (ensure-keyword-map! retry [:routing :retry])
-          (ensure-only-keys! retry retry-keys [:routing :retry])
-          (doseq [[k v] retry]
-            (when-not (and (integer? v) (<= 0 v))
-              (fail-router! "Router retry limits must be non-negative integers."
-                            {:path [:routing :retry k]
-                             :expected :non-negative-int
-                             :value v}))))))
+      (when-not (ig/ref? routing)
+        (ensure-keyword-map! routing [:routing])
+        (ensure-only-keys! routing routing-keys [:routing])
+        (when-not (contains? routing :intent->cap)
+          (fail-router! "Router config is missing required :routing/:intent->cap mapping."
+                        {:path [:routing :intent->cap]
+                         :required true}))
+        (validate-keyword->keyword-map! (:intent->cap routing) [:routing :intent->cap])
+        (when (contains? routing :cap->model-key)
+          (validate-keyword->keyword-map! (:cap->model-key routing)
+                                          [:routing :cap->model-key]))
+        (when (contains? routing :intent->model-key)
+          (validate-keyword->keyword-map! (:intent->model-key routing)
+                                          [:routing :intent->model-key]))
+        (when (contains? routing :cap->role)
+          (validate-keyword->keyword-map! (:cap->role routing)
+                                          [:routing :cap->role]))
+        (when (contains? routing :intent->role)
+          (validate-keyword->keyword-map! (:intent->role routing)
+                                          [:routing :intent->role]))
+        (when (contains? routing :switch-on)
+          (validate-keyword-coll! (:switch-on routing) [:routing :switch-on]))
+        (when (contains? routing :fallback)
+          (validate-keyword-coll! (:fallback routing) [:routing :fallback]))
+        (when (contains? routing :checks)
+          (validate-keyword-coll! (:checks routing) [:routing :checks]))
+        (when (contains? routing :policy)
+          (when-not (keyword? (:policy routing))
+            (fail-router! "Router config :routing/:policy must be a keyword."
+                          {:path [:routing :policy]
+                           :expected :keyword
+                           :value (:policy routing)})))
+        (when (contains? routing :retry)
+          (let [retry (:retry routing)]
+            (ensure-keyword-map! retry [:routing :retry])
+            (ensure-only-keys! retry retry-keys [:routing :retry])
+            (doseq [[k v] retry]
+              (when-not (and (integer? v) (<= 0 v))
+                (fail-router! "Router retry limits must be non-negative integers."
+                              {:path [:routing :retry k]
+                               :expected :non-negative-int
+                               :value v})))))))
     (when (contains? cfg :profiles)
       (let [profiles (:profiles cfg)]
-        (ensure-keyword-map! profiles [:profiles])
-        (doseq [[profile profile-cfg] profiles]
-          (when-not (map? profile-cfg)
-            (fail-router! "Router profile entries must be maps."
-                          {:path [:profiles profile]
-                           :expected :map
-                           :value profile-cfg})))))
+        (when-not (ig/ref? profiles)
+          (ensure-keyword-map! profiles [:profiles])
+          (doseq [[profile profile-cfg] profiles]
+            (when-not (map? profile-cfg)
+              (fail-router! "Router profile entries must be maps."
+                            {:path [:profiles profile]
+                             :expected :map
+                             :value profile-cfg}))))))
     (when (contains? cfg :policy)
       (when-not (keyword? (:policy cfg))
         (fail-router! "Router top-level :policy must be a keyword."

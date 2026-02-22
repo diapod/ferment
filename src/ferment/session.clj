@@ -209,17 +209,27 @@
            :get!          (fn [sid]      (get-session          manager sid))
            :list!         (fn []         (list-sessions        manager))
            :append-turn!  (fn [sid turn] (append-session-turn! manager sid turn))
-           :get-var!      (fn [sid k]    (store/get-var       store sid k))
-           :get-vars!     (fn [sid ks]   (store/get-vars      store sid ks))
+           :get-var!      (fn
+                            ([sid k]       (store/get-var       store sid k))
+                            ([sid k opts]  (store/get-var       store sid k opts)))
+           :get-vars!     (fn
+                            ([sid ks]       (store/get-vars      store sid ks))
+                            ([sid ks opts]  (store/get-vars      store sid ks opts)))
            :put-var!      (fn
                             ([sid k v]       (store/put-var!      store sid k v))
                             ([sid k v opts]  (store/put-var!      store sid k v opts)))
            :put-vars!     (fn
                             ([sid kvs]       (store/put-vars!     store sid kvs))
                             ([sid kvs opts]  (store/put-vars!     store sid kvs opts)))
-           :del-var!      (fn [sid k]    (store/del-var!      store sid k))
-           :del-vars!     (fn [sid ks]   (store/del-vars!     store sid ks))
-           :del-all-vars! (fn [sid]      (store/del-all-vars! store sid))
+           :del-var!      (fn
+                            ([sid k]       (store/del-var!      store sid k))
+                            ([sid k opts]  (store/del-var!      store sid k opts)))
+           :del-vars!     (fn
+                            ([sid ks]       (store/del-vars!     store sid ks))
+                            ([sid ks opts]  (store/del-vars!     store sid ks opts)))
+           :del-all-vars! (fn
+                            ([sid]       (store/del-all-vars! store sid))
+                            ([sid opts]  (store/del-all-vars! store sid opts)))
            :freeze!       (fn
                             ([sid]       (freeze-session! manager sid nil))
                             ([sid opts]  (freeze-session! manager sid opts)))
@@ -248,12 +258,16 @@
   ((:append-turn! session-service) sid turn))
 
 (defn get-var!
-  [session-service sid k]
-  ((:get-var! session-service) sid k))
+  ([session-service sid k]
+   ((:get-var! session-service) sid k))
+  ([session-service sid k opts]
+   ((:get-var! session-service) sid k opts)))
 
 (defn get-vars!
-  [session-service sid ks]
-  ((:get-vars! session-service) sid ks))
+  ([session-service sid ks]
+   ((:get-vars! session-service) sid ks))
+  ([session-service sid ks opts]
+   ((:get-vars! session-service) sid ks opts)))
 
 (defn put-var!
   ([session-service sid k v]
@@ -268,16 +282,22 @@
    ((:put-vars! session-service) sid kvs opts)))
 
 (defn del-var!
-  [session-service sid k]
-  ((:del-var! session-service) sid k))
+  ([session-service sid k]
+   ((:del-var! session-service) sid k))
+  ([session-service sid k opts]
+   ((:del-var! session-service) sid k opts)))
 
 (defn del-vars!
-  [session-service sid ks]
-  ((:del-vars! session-service) sid ks))
+  ([session-service sid ks]
+   ((:del-vars! session-service) sid ks))
+  ([session-service sid ks opts]
+   ((:del-vars! session-service) sid ks opts)))
 
 (defn del-all-vars!
-  [session-service sid]
-  ((:del-all-vars! session-service) sid))
+  ([session-service sid]
+   ((:del-all-vars! session-service) sid))
+  ([session-service sid opts]
+   ((:del-all-vars! session-service) sid opts)))
 
 (defn freeze!
   [session-service sid & [opts]]

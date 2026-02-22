@@ -291,10 +291,12 @@
 (defn normalize-call-result
   "Normalizes call result into env slot payload."
   [cap-id result]
-  {:cap/id cap-id
-   :result result
-   :out (contracts/result-out-of result)
-   :error (:error result)})
+  (let [invocation (when (map? result) (:invoke/meta result))]
+    (cond-> {:cap/id cap-id
+             :result result
+             :out (contracts/result-out-of result)
+             :error (:error result)}
+      (map? invocation) (assoc :invoke/meta invocation))))
 
 (defn- normalize-tool-result
   [tool-id result]

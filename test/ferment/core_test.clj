@@ -9,6 +9,7 @@
 
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [ferment.contracts :as contracts]
             [ferment.core :as core]
             [ferment.effects :as effects]
@@ -40,6 +41,25 @@
                               #"LLM invocation failed after retries"
                               (core/voice! "{\"intent\":\"ok\"}" "hej")))
         (is (= 3 @calls))))))
+
+(deftest invoke-capability-rejects-tool-call-output-outside-route-decide
+  (testing "tool_call style output is rejected for non-route intents and retried under contract."
+    (let [calls (atom 0)]
+      (with-redefs [core/ollama-generate!
+                    (fn [_]
+                      (swap! calls inc)
+                      {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"X\"}}</tool_call>"})]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"LLM invocation failed after retries"
+                              (core/invoke-capability!
+                               nil
+                               {:role :voice
+                                :intent :text/respond
+                                :cap-id :llm/voice
+                                :model "voice-model"
+                                :input {:prompt "hej"}
+                                :max-attempts 2})))
+        (is (= 2 @calls))))))
 
 (deftest solver-can-read-model-selection-from-runtime-config
   (testing "solver! accepts runtime config map and uses :ferment.model/solver."
@@ -221,6 +241,116 @@
                          :input {:prompt "Plan gotowy"}}]}
                plan))))))
 
+(deftest invoke-capability-strips-think-blocks-from-model-output
+  (testing "invoke-capability! removes `<think>...</think>` content before returning text."
+    (with-redefs [core/ollama-generate!
+                  (fn [_]
+                    {:response "<think>internal reasoning</think>\n\nFerment is a multi-model orchestrator."})]
+      (let [result (core/invoke-capability!
+                    nil
+                    {:role :voice
+                     :intent :text/respond
+                     :cap-id :llm/voice
+                     :model "voice-model"
+                     :prompt "what is Ferment?"
+                     :max-attempts 1})
+            text (get-in result [:result :out :text])]
+        (is (string? text))
+        (is (not (str/includes? text "<think")))
+        (is (= "Ferment is a multi-model orchestrator." text))))))
+
+(deftest invoke-capability-falls-back-to-think-body-for-non-voice-intents
+  (testing "For non-user-facing intents, parser keeps non-empty text when output is think-only."
+    (with-redefs [core/ollama-generate!
+                  (fn [_]
+                    {:response "<think>ACID to atomowość, spójność, izolacja, trwałość.</think>"})]
+      (let [result (core/invoke-capability!
+                    nil
+                    {:role :solver
+                     :intent :problem/solve
+                     :cap-id :llm/solver
+                     :model "solver-model"
+                     :prompt "co to ACID?"
+                     :max-attempts 1})
+            text (get-in result [:result :out :text])]
+        (is (string? text))
+        (is (not (str/blank? text)))
+        (is (str/includes? text "ACID"))))))
+
+(deftest invoke-capability-non-voice-does-not-leak-unclosed-think
+  (testing "For non-user-facing intents, unclosed think-only output falls back to prompt instead of leaking think content."
+    (with-redefs [core/ollama-generate!
+                  (fn [_]
+                    {:response "<think>internal reasoning without closing tag"})]
+      (let [result (core/invoke-capability!
+                    nil
+                    {:role :solver
+                     :intent :problem/solve
+                     :cap-id :llm/solver
+                     :model "solver-model"
+                     :input {:prompt "Pytanie testowe"}
+                     :max-attempts 1})
+            text (get-in result [:result :out :text])]
+        (is (= "Pytanie testowe" text))
+        (is (not (str/includes? text "<think")))))))
+
+(deftest invoke-capability-voice-falls-back-to-request-prompt-when-think-only
+  (testing "For text/respond, think-only output falls back to request prompt instead of empty text."
+    (with-redefs [core/ollama-generate!
+                  (fn [_]
+                    {:response "<think>internal notes only</think>"})]
+      (let [result (core/invoke-capability!
+                    nil
+                    {:role :voice
+                     :intent :text/respond
+                     :cap-id :llm/voice
+                     :model "voice-model"
+                     :input {:prompt "ACID to atomowość, spójność, izolacja, trwałość."}
+                     :max-attempts 1})
+            text (get-in result [:result :out :text])]
+        (is (= "ACID to atomowość, spójność, izolacja, trwałość." text))
+        (is (not (str/includes? text "<think")))))))
+
+(deftest invoke-capability-text-respond-enforces-max-chars
+  (testing "text/respond output is truncated to :constraints/:max-chars."
+    (with-redefs [core/ollama-generate!
+                  (fn [_]
+                    {:response "abcdefghijklmnop"})]
+      (let [result (core/invoke-capability!
+                    nil
+                    {:role :voice
+                     :intent :text/respond
+                     :cap-id :llm/voice
+                     :model "voice-model"
+                     :input {:prompt "hej"}
+                     :constraints {:max-chars 10}
+                     :max-attempts 1})
+            text (get-in result [:result :out :text])]
+        (is (= "abcdefghij" text))
+        (is (= 10 (count text)))))))
+
+(deftest invoke-capability-uses-intent-system-prompt-from-protocol
+  (testing "invoke-capability! injects intent-level system prompt when request does not provide one."
+    (let [seen (atom nil)
+          runtime {:protocol {:intents {:text/respond {:in-schema :req/text
+                                                       :out-schema :res/text
+                                                       :system "SYS/VOICE"}}
+                              :result/types [:value]}}]
+      (with-redefs [core/ollama-generate!
+                    (fn [params]
+                      (reset! seen params)
+                      {:response "ok"})]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice
+                       :model "voice-model"
+                       :prompt "hej"
+                       :max-attempts 1})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= "SYS/VOICE" (:system @seen))))))))
+
 (deftest execute-capability-evaluates-plan-in-runtime
   (testing "execute-capability! evaluates returned plan and normalizes final value output."
     (with-redefs [core/ollama-generate!
@@ -228,9 +358,9 @@
                     (if (= "mock/meta" model)
                       {:response "PLAN"}
                       {:response (str "VOICE:" prompt)}))]
-      (let [result (core/execute-capability!
-                    nil
-                    {:routing {:intent->cap {:text/respond :llm/voice}}}
+        (let [result (core/execute-capability!
+                      nil
+                      {:routing {:intent->cap {:text/respond :llm/voice}}}
                     {:role :router
                      :intent :route/decide
                      :cap-id :llm/meta
@@ -249,7 +379,35 @@
                                                  :input {:slot/id [:answer :out]}}]}
                                  :bindings {:summary "hej"}}})})]
         (is (= :value (contracts/result-type-of result)))
-        (is (= "VOICE:hej" (get-in result [:result :out :text])))))))
+        (is (= "VOICE:hej" (get-in result [:result :out :text])))
+        (is (= true (get-in result [:result :plan/run :ok?])))
+        (is (map? (get-in result [:result :plan/run :telemetry])))
+        (is (nil? (get-in result [:result :plan/run :env])))
+        (is (vector? (get-in result [:result :plan/run :participants])))))))
+
+(deftest execute-capability-can-expose-plan-debug-when-enabled
+  (testing "execute-capability! may include pre-execution plan with slot refs when :debug/plan? is true."
+    (with-redefs [core/invoke-capability!
+                  (fn [_runtime _opts]
+                    {:result {:type :plan
+                              :plan {:nodes [{:op :let
+                                              :as :solver
+                                              :value {:out {:text "ACID"}}}
+                                             {:op :emit
+                                              :input {:slot/id [:solver :out :text]}}]}}})]
+      (let [result (core/execute-capability!
+                    nil
+                    {}
+                    {:role :router
+                     :intent :route/decide
+                     :cap-id :llm/meta
+                     :debug/plan? true})]
+        (is (= :value (contracts/result-type-of result)))
+        (is (= {:slot/id [:solver :out :text]}
+               (get-in result [:result :plan/debug :nodes 1 :input])))
+        (is (= "ACID"
+               (get-in result [:result :out :text])))
+        (is (map? (get-in result [:result :plan/run :telemetry])))))))
 
 (deftest execute-capability-runs-tool-node-with-runtime-effects
   (testing "execute-capability! runs :tool plan nodes through scoped runtime effect handler."
@@ -447,15 +605,22 @@
                       {:ok? true
                        :result {:result {:type :value
                                          :out {:text "ok"}}}})]
-        (is (= {:result {:type :value
-                         :out {:text "ok"}}}
-               (core/invoke-capability!
-                runtime
-                {:role :voice
-                 :intent :text/respond
-                 :cap-id :llm/voice
-                 :model "voice-model"
-                 :prompt "hej"})))
+        (let [response (core/invoke-capability!
+                        runtime
+                        {:role :voice
+                         :intent :text/respond
+                         :cap-id :llm/voice
+                         :model "voice-model"
+                         :prompt "hej"})]
+          (is (= {:type :value
+                  :out {:text "ok"}}
+                 (:result response)))
+          (is (= {:role :voice
+                  :intent :text/respond
+                  :cap/id :llm/voice
+                  :model-key :ferment.model/voice
+                  :model "voice-model"}
+                 (:invoke/meta response))))
         (is (= {:no-web true :language :pl}
                (get-in @captured [:request :constraints])))
         (is (= {:must #{:schema-valid}

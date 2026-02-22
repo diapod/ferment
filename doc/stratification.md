@@ -220,12 +220,11 @@ Błąd:
 
 ## 5) MVP i status implementacji
 
-1. Capability registry (ID -> meta, schematy): częściowo wdrożone.
-2. IR/Plan + CallNode: wdrożone minimalnie (`:plan`, materializacja slotów, `CallNode`).
-3. Aplikator/evaluator (resolve/execute/rekurencja): wdrożone minimalnie (`:let`, `:call`, `:emit`, plan->plan).
-   Wdrożone: verify (`:done`), retry/fallback (`:retry`, `:switch-on`, kandydaci), judge-loop (opcjonalny, konfigurowalny).
-4. Walidatory kontraktów: wdrożone (`request` i `response` envelope).
-5. Judge capability: wdrożone opcjonalnie (gałąź `:quality/judge`, domyślnie wyłączone w `prod`, możliwe włączenie np. w `dev`).
+1. Capability registry (ID -> meta, schematy): wdrożone (flattened `:ferment.caps.registry/*` + metadane `:cap/version`, `:cap/cost`, `:cap/limits`, `:cap/tags`).
+2. IR/Plan + CallNode: wdrożone (`:plan`, materializacja slotów, `CallNode`, `:requires` jako twardy filtr kontraktowy przy doborze capability).
+3. Aplikator/evaluator (resolve/execute/rekurencja): wdrożone (`:let`, `:call`, `:emit`, plan->plan, retry/fallback/switch-on, telemetry, egzekucja efektów przez runtime scope + RBAC).
+4. Walidatory kontraktów: wdrożone (`request` i `response` envelope + walidacja `:in-schema`/`:out-schema` per intent + walidacja planów routingu).
+5. Judge capability: wdrożone opcjonalnie; globalny default jest wyłączony, a w `prod` działa canary per-intent (`:text/respond`, `:code/patch`, `:max-attempts 1`).
 
 ## 6) Dlaczego to jest stratified
 

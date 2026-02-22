@@ -23,8 +23,13 @@
 
  :ferment.model.runtime/solver
  {:defaults #ref :ferment.model.defaults/runtime
-  :cmd/quit "q"
-  :command  ["mlx_lm.chat" "--model" #ref :ferment.model.id/solver]
+  :command     [#ref :ferment.env/ferment.model.server.bin
+                "--host" #ref :ferment.env/ferment.model.solver.server.host
+                "--port" #ref :ferment.env/ferment.model.solver.server.port
+                "--model" #ref :ferment.model.id/solver]
+  :invoke/http {:base-url #ref :ferment.env/ferment.model.solver.base.url
+                :endpoint #ref :ferment.env/ferment.model.solver.endpoint
+                :model    #ref :ferment.model.id/solver}
   :http     {:enabled? true :endpoint "solver/responses"}
   :name     "solver model runtime"}
 
@@ -41,8 +46,14 @@
 
  :ferment.model.runtime/voice
  {:defaults #ref :ferment.model.defaults/runtime
-  :cmd/quit "q"
-  :command  ["mlx_lm.chat" "--model" #ref :ferment.model.id/voice]
+  :command     [#ref :ferment.env/ferment.model.server.bin
+                "--host" #ref :ferment.env/ferment.model.voice.server.host
+                "--port" #ref :ferment.env/ferment.model.voice.server.port
+                "--model" #ref :ferment.model.id/voice]
+  :invoke/http {:base-url #ref :ferment.env/ferment.model.voice.base.url
+                :endpoint #ref :ferment.env/ferment.model.voice.endpoint
+                :temperature 0.0
+                :model    #ref :ferment.model.id/voice}
   :http     {:enabled? true :endpoint "voice/responses"}
   :name     "voice model runtime"}
 
@@ -59,8 +70,13 @@
 
  :ferment.model.runtime/coding
  {:defaults #ref :ferment.model.defaults/runtime
-  :cmd/quit "q"
-  :command  ["mlx_lm.chat" "--model" #ref :ferment.model.id/coding]
+  :command     [#ref :ferment.env/ferment.model.server.bin
+                "--host" #ref :ferment.env/ferment.model.coding.server.host
+                "--port" #ref :ferment.env/ferment.model.coding.server.port
+                "--model" #ref :ferment.model.id/coding]
+  :invoke/http {:base-url #ref :ferment.env/ferment.model.coding.base.url
+                :endpoint #ref :ferment.env/ferment.model.coding.endpoint
+                :model    #ref :ferment.model.id/coding}
   :http     {:enabled? true :endpoint "coding/responses"}
   :name     "coding model runtime"}
 
@@ -77,9 +93,14 @@
 
  :ferment.model.runtime/meta
  {:defaults    #ref :ferment.model.defaults/runtime
-  :inherit-io? [:out :err]
-  :cmd/quit    "q"
-  :command     ["mlx_lm.chat" "--model" #ref :ferment.model.id/meta]
+  :command     [#ref :ferment.env/ferment.model.server.bin
+                "--host" #ref :ferment.env/ferment.model.meta.server.host
+                "--port" #ref :ferment.env/ferment.model.meta.server.port
+                "--model" #ref :ferment.model.id/meta]
+  :invoke/http {:base-url #ref :ferment.env/ferment.model.meta.base.url
+                :endpoint #ref :ferment.env/ferment.model.meta.endpoint
+                :temperature 0.0
+                :model    #ref :ferment.model.id/meta}
   :http        {:enabled? true :endpoint "meta/responses"}
   :name        "meta model runtime"}
 

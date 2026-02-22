@@ -773,6 +773,70 @@
       :else
       {:ok? true})))
 
+(defn- validate-route-solver->voice-plan
+  [plan]
+  (let [nodes (when (map? plan) (:nodes plan))
+        node0 (when (vector? nodes) (nth nodes 0 nil))
+        node1 (when (vector? nodes) (nth nodes 1 nil))
+        node2 (when (vector? nodes) (nth nodes 2 nil))
+        voice-prompt-slot (get-in node1 [:input :prompt :slot/id])
+        emit-slot (get-in node2 [:input :slot/id])]
+    (cond
+      (not (map? plan))
+      {:ok? false
+       :reason :route/plan-not-map}
+
+      (not (vector? nodes))
+      {:ok? false
+       :reason :route/plan-nodes-not-vector}
+
+      (< (count nodes) 3)
+      {:ok? false
+       :reason :route/plan-too-short}
+
+      (not= :call (:op node0))
+      {:ok? false
+       :reason :route/plan-first-op-not-call}
+
+      (not= :problem/solve (:intent node0))
+      {:ok? false
+       :reason :route/plan-first-intent-not-problem-solve}
+
+      (not= :solver (:as node0))
+      {:ok? false
+       :reason :route/plan-first-as-not-solver}
+
+      (not (nonblank-string? (get-in node0 [:input :prompt])))
+      {:ok? false
+       :reason :route/plan-solver-prompt-not-string}
+
+      (not= :call (:op node1))
+      {:ok? false
+       :reason :route/plan-second-op-not-call}
+
+      (not= :text/respond (:intent node1))
+      {:ok? false
+       :reason :route/plan-second-intent-not-text-respond}
+
+      (not= :voice (:as node1))
+      {:ok? false
+       :reason :route/plan-second-as-not-voice}
+
+      (not= [:solver :out :text] voice-prompt-slot)
+      {:ok? false
+       :reason :route/plan-voice-prompt-not-solver-slot}
+
+      (not= :emit (:op node2))
+      {:ok? false
+       :reason :route/plan-third-op-not-emit}
+
+      (not= [:voice :out] emit-slot)
+      {:ok? false
+       :reason :route/plan-emit-not-voice-out}
+
+      :else
+      {:ok? true})))
+
 (defn- validate-intent-result-shape
   [protocol intent result]
   (let [judge-intent (or (get-in (intent-policy protocol intent) [:judge :intent])
@@ -797,6 +861,22 @@
 
         :else
         (validate-eval-grade-out (result-out-of result) contract))
+
+      (and (= :route/decide intent)
+           (= :route/solver->voice contract-kind))
+      (cond
+        (contains? result :error)
+        {:ok? false
+         :reason :route/plan-error-not-allowed}
+
+        (and (keyword? (:type contract))
+             (not= (:type contract) (result-type-of result)))
+        {:ok? false
+         :reason :route/plan-result-type-not-plan
+         :result/type (result-type-of result)}
+
+        :else
+        (validate-route-solver->voice-plan (result-plan-of result)))
 
       (and (= :route/decide intent)
            (= :route/decide contract-kind))

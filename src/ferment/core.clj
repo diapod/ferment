@@ -60,6 +60,15 @@
       (if (map? cfg) cfg {}))
     {}))
 
+(defn- intent-system-prompt
+  [protocol intent role]
+  (let [intent-cfg (intent-config protocol intent)]
+    (or (some-> (:system intent-cfg) str str/trim not-empty)
+        (some-> (:system/prompt intent-cfg) str str/trim not-empty)
+        (some-> (get-in protocol [:prompts :intents intent]) str str/trim not-empty)
+        (some-> (get-in protocol [:prompts :roles role]) str str/trim not-empty)
+        (some-> (get-in protocol [:prompts :default]) str str/trim not-empty))))
+
 (defn- intent-policy-config
   [protocol intent]
   (let [cfg (contracts/intent-policy protocol intent)]
@@ -69,6 +78,11 @@
   [protocol intent]
   (let [done-cfg (:done (intent-policy-config protocol intent))]
     (if (map? done-cfg) done-cfg nil)))
+
+(defn- intent-default-constraints
+  [protocol intent]
+  (let [cfg (get-in protocol [:intents intent :constraints])]
+    (if (map? cfg) cfg nil)))
 
 (defn- intent-judge-config
   [protocol intent]
@@ -167,6 +181,36 @@
       (contains? violations :hallucinated/api) false
       :else true)))
 
+(def ^:private list-item-line-pattern
+  #"(?m)^\s*(?:[-*+•]|\d+[.)])\s+")
+
+(def ^:private inline-numbered-item-pattern
+  #"(?i)(?:^|\s)\d+[.)]\s+")
+
+(defn- list-expansion?
+  [text]
+  (let [s (some-> text str)
+        line-markers (if (string? s)
+                       (count (re-seq list-item-line-pattern s))
+                       0)
+        inline-markers (if (string? s)
+                         (count (re-seq inline-numbered-item-pattern s))
+                         0)]
+    (or (>= line-markers 2)
+        (>= inline-markers 3))))
+
+(defn- no-list-expansion?
+  [call-node _env result]
+  (let [intent (keywordish (:intent call-node))]
+    (if (not= :text/respond intent)
+      true
+      (let [out (contracts/result-out-of result)
+            text (or (when (string? (:text out)) (:text out))
+                     (when (string? (:content out)) (:content out))
+                     (when (string? out) out)
+                     "")]
+        (not (list-expansion? text))))))
+
 (defn- schema-valid?
   [protocol call-node result]
   (:ok? (contracts/validate-result protocol
@@ -176,12 +220,14 @@
 
 (def ^:private builtin-check-fns
   {:tests-pass tests-pass?
-   :no-hallucinated-apis no-hallucinated-apis?})
+   :no-hallucinated-apis no-hallucinated-apis?
+   :no-list-expansion no-list-expansion?})
 
 (def ^:private default-check-descriptors
   {:schema-valid :builtin/schema-valid
    :tests-pass :builtin/tests-pass
-   :no-hallucinated-apis :builtin/no-hallucinated-apis})
+   :no-hallucinated-apis :builtin/no-hallucinated-apis
+   :no-list-expansion :builtin/no-list-expansion})
 
 (defn- resolve-check-descriptor
   [protocol descriptor]
@@ -193,6 +239,7 @@
 
     (= descriptor :builtin/tests-pass) tests-pass?
     (= descriptor :builtin/no-hallucinated-apis) no-hallucinated-apis?
+    (= descriptor :builtin/no-list-expansion) no-list-expansion?
     (keyword? descriptor) (get builtin-check-fns descriptor)
     (ifn? descriptor) descriptor
     :else nil))
@@ -390,6 +437,28 @@
           (model/model-id runtime model-k nil))
         (model/solver-id runtime))))
 
+(def ^:private known-model-keys
+  #{:ferment.model/coding
+    :ferment.model/solver
+    :ferment.model/meta
+    :ferment.model/voice})
+
+(defn- known-model-key?
+  [k]
+  (and (keyword? k)
+       (contains? known-model-keys k)))
+
+(defn- resolve-invocation-model-id
+  [runtime model model-k]
+  (or (when (string? model)
+        (some-> model str str/trim not-empty))
+      (when (known-model-key? model)
+        (model-id-by-key runtime model))
+      (when (known-model-key? model-k)
+        (model-id-by-key runtime model-k))
+      (when (some? model)
+        (some-> model str str/trim not-empty))))
+
 (defn- model-runtime-cfg
   [runtime resolver cap-id intent]
   (let [model-k (router/resolve-model-key runtime resolver cap-id intent)]
@@ -531,7 +600,17 @@
                           (if (map? session-fragment) session-fragment {})
                           (if (map? auth-fragment) auth-fragment {})
                           (if (map? context) context {}))
-        constraints' (or constraints (protocol-default protocol' :constraints/default nil))
+        constraints-default (if (map? (protocol-default protocol' :constraints/default nil))
+                              (protocol-default protocol' :constraints/default nil)
+                              {})
+        constraints-intent  (if (map? (intent-default-constraints protocol' intent))
+                              (intent-default-constraints protocol' intent)
+                              {})
+        constraints-local   (if (map? constraints) constraints {})
+        constraints' (let [merged (merge constraints-default
+                                         constraints-intent
+                                         constraints-local)]
+                       (when (seq merged) merged))
         done'        (or done
                          (intent-default-done protocol' intent)
                          (protocol-default protocol' :done/default nil))
@@ -555,25 +634,138 @@
       (map? budget')      (assoc :budget budget')
       (map? effects')     (assoc :effects effects'))))
 
+(def ^:private think-block-pattern
+  #"(?is)<think\b[^>]*>.*?</think>")
+
+(def ^:private tool-call-block-pattern
+  #"(?is)<tool_call\b[^>]*>.*?</tool_call>")
+
+(def ^:private think-only-pattern
+  #"(?is)^\s*<think\b[^>]*>(.*?)</think>\s*$")
+
+(defn- strip-think-blocks
+  [text]
+  (let [without-closed (str/replace (or text "") think-block-pattern "")
+        lowered        (str/lower-case without-closed)
+        open-idx       (.indexOf ^String lowered "<think")]
+    (if (neg? open-idx)
+      without-closed
+      (subs without-closed 0 open-idx))))
+
+(defn- sanitize-model-text
+  [text]
+  (if (string? text)
+    (-> text
+        strip-think-blocks
+        str/trim)
+    (str text)))
+
+(defn- request-input-text
+  [request]
+  (or (some-> request :input :prompt str str/trim not-empty)
+      (some-> request :input :text str str/trim not-empty)
+      (some-> request :input :content str str/trim not-empty)))
+
+(def ^:private default-text-respond-max-chars 1200)
+
+(defn- request-max-chars
+  [request]
+  (let [v (get-in request [:constraints :max-chars])
+        n (cond
+            (integer? v) (long v)
+            (number? v) (long v)
+            (string? v) (try
+                          (Long/parseLong (str/trim v))
+                          (catch Throwable _ nil))
+            :else nil)]
+    (when (and (integer? n) (pos? n))
+      (int (min 12000 n)))))
+
+(defn- clamp-max-chars
+  [s max-chars]
+  (let [text (str (or s ""))]
+    (if (and (integer? max-chars)
+             (pos? max-chars)
+             (> (count text) max-chars))
+      (subs text 0 max-chars)
+      text)))
+
+(defn- normalize-list-format
+  [text]
+  (-> (str (or text ""))
+      (str/replace #"\r\n?" "\n")
+      (str/replace #"\n{3,}" "\n\n")
+      str/trim))
+
+(defn- parse-model-text
+  [text request]
+  (let [cleaned  (sanitize-model-text text)
+        raw      (some-> text str str/trim not-empty)
+        intent   (some-> request :task :intent keywordish)
+        prompt'  (request-input-text request)
+        prompt-clean (some-> prompt' sanitize-model-text str/trim not-empty)
+        think-body (when (string? raw)
+                     (some->> (re-matches think-only-pattern raw)
+                              second
+                              str/trim
+                              not-empty))
+        text0 (cond
+      (and (str/blank? cleaned)
+           (some? raw)
+           (= :text/respond intent))
+      ;; Keep user-facing contract stable: if VOICE produced no final text,
+      ;; fall back to sanitized request prompt (typically solver output).
+      (or prompt-clean "Brak finalnej odpowiedzi modelu.")
+
+      (and (str/blank? cleaned)
+           (some? raw))
+      (or think-body
+          prompt-clean
+          "Brak odpowiedzi modelu.")
+
+      :else
+      cleaned)
+        text1 (if (= :text/respond intent)
+                (normalize-list-format text0)
+                text0)
+        max-chars (if (= :text/respond intent)
+                    (or (request-max-chars request)
+                        default-text-respond-max-chars)
+                    (request-max-chars request))]
+    (-> text1
+        (clamp-max-chars max-chars)
+        str/trim)))
+
+(defn- tool-call-output?
+  [text]
+  (let [s (some-> text str)
+        low (some-> s str/lower-case)]
+    (boolean
+     (or (and s (re-find tool-call-block-pattern s))
+         (and low (str/includes? low "\"tool_call\""))
+         (and low (str/includes? low "\"tool_calls\""))))))
+
 (defn- default-result-parser
   [text {:keys [request mode]}]
-  {:proto  1
-   :trace  (:trace request)
-   :result {:type  :value
-            :out   {:text text}
-            :usage {:mode mode}}})
+  (let [text' (parse-model-text text request)]
+    {:proto  1
+     :trace  (:trace request)
+     :result {:type  :value
+              :out   {:text text'}
+              :usage {:mode mode}}}))
 
 (defn- default-stream-result-parser
   [text {:keys [request mode]}]
-  {:proto 1
-   :trace (:trace request)
-   :result {:type :stream
-            :stream [{:seq 0
-                      :event :delta
-                      :text text}
-                     {:seq 1
-                      :event :done}]
-            :usage {:mode mode}}})
+  (let [text' (parse-model-text text request)]
+    {:proto 1
+     :trace (:trace request)
+     :result {:type :stream
+              :stream [{:seq 0
+                        :event :delta
+                        :text text'}
+                       {:seq 1
+                        :event :done}]
+              :usage {:mode mode}}}))
 
 (defn- stream-response-mode?
   [opts]
@@ -587,11 +779,12 @@
 
 (defn- judge-result-parser
   [text {:keys [request mode]}]
-  (let [parsed (parse-structured-text text)
-        score  (judge-score-from-output (or parsed text) [:score])
+  (let [text'  (sanitize-model-text text)
+        parsed (parse-structured-text text')
+        score  (judge-score-from-output (or parsed text') [:score])
         out-map (cond
                   (map? parsed) parsed
-                  :else {:text text})
+                  :else {:text text'})
         out-map (if (number? score)
                   (assoc out-map :score score)
                   out-map)]
@@ -627,13 +820,20 @@
                      default-stream-result-parser)
                    default-result-parser)
         resolver' (router/resolver-config runtime resolver)
+        model-k  (router/resolve-model-key runtime resolver' cap-id intent)
+        model-id (resolve-invocation-model-id runtime model model-k)
+        invocation-meta (cond-> {:role role
+                                 :intent intent
+                                 :cap/id cap-id}
+                          (keyword? model-k) (assoc :model-key model-k)
+                          (some? model-id) (assoc :model model-id))
         input' (if (map? input)
                  input
                  {:prompt (or prompt "")})
         prompt' (input->prompt input')
-        system' (or system
-                    (when (map? input')
-                      (:system input')))
+        system' (or (some-> system str str/trim not-empty)
+                    (some-> input' :system str str/trim not-empty)
+                    (intent-system-prompt protocol intent role))
         session-runtime (open-runtime-session! runtime opts)
         session-service (:service session-runtime)
         session-id (:id session-runtime)
@@ -664,7 +864,7 @@
                                       :turn/intent intent
                                       :turn/cap-id cap-id})
         invoke-fn (fn [request* attempt-no]
-                    (let [result (ollama-generate! {:model model
+                    (let [result (ollama-generate! {:model (or model model-id)
                                                     :runtime runtime
                                                     :resolver resolver'
                                                     :cap-id cap-id
@@ -674,15 +874,37 @@
                                                     :session-id session-id
                                                     :temperature temperature
                                                     :mode mode})
-                          text (:response result)]
-                      (if (and (string? text) (not (str/blank? text)))
+                          text (:response result)
+                          text' (if (string? text) text "")]
+                      (cond
+                        ;; route/decide parser may synthesize canonical plan from request prompt
+                        ;; even when model returned empty output.
+                        (= :route/decide intent)
                         (parser
-                         text
+                         text'
                          {:request request*
                           :mode mode
                           :attempt attempt-no
                           :cap/id cap-id
                           :raw result})
+
+                        (and (not (str/blank? text'))
+                             (tool-call-output? text'))
+                        ;; Tool-calling syntax is not part of canonical non-route contract.
+                        ;; Return invalid value payload to trigger retry/fallback under contract flow.
+                        {:trace  (:trace request*)
+                         :result {:type :value}}
+
+                        (not (str/blank? text'))
+                        (parser
+                         text'
+                         {:request request*
+                          :mode mode
+                          :attempt attempt-no
+                          :cap/id cap-id
+                          :raw result})
+
+                        :else
                         ;; Missing :out makes the result invalid and triggers retry.
                         {:trace  (:trace request*)
                          :result {:type :value}})))
@@ -693,7 +915,8 @@
                                                                3)
                                              :protocol protocol})]
     (if (:ok? run)
-      (let [result (:result run)]
+      (let [result (cond-> (:result run)
+                     (map? invocation-meta) (assoc :invoke/meta invocation-meta))]
         (append-session-turn-safe! session-service session-id
                                    {:turn/role :assistant
                                     :turn/text (session-turn-text
@@ -826,19 +1049,61 @@
     (nil? emitted) {}
     :else {:value emitted}))
 
+(defn- normalize-participant
+  [invocation]
+  (when (map? invocation)
+    (let [role      (keywordish (:role invocation))
+          intent    (keywordish (:intent invocation))
+          cap-id    (keywordish (:cap/id invocation))
+          model-key (keywordish (:model-key invocation))
+          model-id  (some-> (:model invocation) str str/trim not-empty)]
+      (cond-> {}
+        (keyword? role) (assoc :role role)
+        (keyword? intent) (assoc :intent intent)
+        (keyword? cap-id) (assoc :cap/id cap-id)
+        (keyword? model-key) (assoc :model-key model-key)
+        (some? model-id) (assoc :model model-id)))))
+
+(defn- slot-invocation
+  [slot]
+  (or (when (map? slot) (:invoke/meta slot))
+      (when (map? slot) (get-in slot [:result :invoke/meta]))))
+
+(defn- run-participants
+  [run]
+  (let [env         (if (map? (:env run)) (:env run) {})
+        invocations (if (map? env)
+                      (keep slot-invocation (vals env))
+                      [])]
+    (->> invocations
+         (keep normalize-participant)
+         distinct
+         vec)))
+
+(defn- public-plan-run
+  [run]
+  (let [ok? (boolean (:ok? run))
+        participants (run-participants run)]
+    (cond-> {:ok? ok?}
+      (map? (:telemetry run)) (assoc :telemetry (:telemetry run))
+      (seq participants) (assoc :participants participants)
+      (and (not ok?) (keyword? (:failure/type run))) (assoc :failure/type (:failure/type run))
+      (and (not ok?) (some? (:error run))) (assoc :error (:error run)))))
+
 (defn execute-capability!
   "Invokes capability and executes returned plan (if any) in runtime evaluator."
   ([runtime opts]
    (execute-capability! runtime nil opts))
   ([runtime resolver opts]
-   (let [effects-cfg (runtime-effects runtime)
-         check-fns (runtime-check-fns runtime)
-         judge-fn  (runtime-judge-fn runtime resolver opts)
-         protocol  (or (runtime-protocol runtime) {})
-         resolver' (cond-> (if (map? resolver) resolver {})
-                     (map? protocol) (assoc :protocol protocol))
-         result (invoke-capability! runtime opts)
-         rtype  (contracts/result-type-of result)
+  (let [effects-cfg (runtime-effects runtime)
+        check-fns (runtime-check-fns runtime)
+        judge-fn  (runtime-judge-fn runtime resolver opts)
+        debug-plan? (true? (:debug/plan? opts))
+        protocol  (or (runtime-protocol runtime) {})
+        resolver' (cond-> (if (map? resolver) resolver {})
+                    (map? protocol) (assoc :protocol protocol))
+        result (invoke-capability! runtime opts)
+        rtype  (contracts/result-type-of result)
          workflow-env (cond-> {}
                         (map? (:workflow/env opts)) (merge (:workflow/env opts))
                         (map? (:auth/user opts)) (assoc :auth/user (:auth/user opts))
@@ -856,10 +1121,11 @@
                     :judge-fn judge-fn
                     :env workflow-env})
              out  (emitted->out (:emitted run))]
-         (assoc result
-                :result {:type :value
-                         :out out
-                         :plan/run run}))
+        (assoc result
+               :result (cond-> {:type :value
+                                :out out
+                                :plan/run (public-plan-run run)}
+                         debug-plan? (assoc :plan/debug plan))))
        result))))
 
 (defn- find-text
@@ -954,12 +1220,14 @@
             :cap-id :llm/voice
             :model (model/voice-id runtime)
             :system (str
-                     "Jesteś VOICE. Twoim zadaniem jest sformułować wypowiedź po polsku.\n"
+                     "Jesteś VOICE w projekcie Ferment (Clojure: orkiestrator modeli AI).\n"
+                     "Odpowiadaj po polsku, jasno i zwięźle.\n"
                      "NIE wymyślaj faktów technicznych. Opieraj się WYŁĄCZNIE na JSON od SOLVER.\n"
-                     "Jeśli brakuje danych, zadaj max 2 pytania doprecyzowujące.\n"
-                     "Mów jasno i zwięźle, jak rzemieślnik.")
+                     "Termin 'Ferment' interpretuj jako ten projekt, nie jako funkcję JavaScript.\n"
+                     "Nie ujawniaj wewnętrznego rozumowania i nigdy nie zwracaj znaczników <think>.\n"
+                     "Jeśli brakuje danych, zadaj max 2 pytania doprecyzowujące.")
             :prompt (str "USER:\n" user-text "\n\nSOLVER_JSON:\n" solver-json)
-            :temperature 0.4})))))
+            :temperature 0.0})))))
 
 (defn respond!
   ([user-text]

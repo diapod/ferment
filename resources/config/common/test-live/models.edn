@@ -1,6 +1,6 @@
 {
  ;; Lightweight "live" profile for smoke/integration checks.
- ;; All model roles share one small runtime process to minimize memory usage.
+ ;; Keep `meta` as shared small runtime and run `voice` on small Bielik runtime.
 
  :ferment.model.defaults/profile "mini"
  :ferment.model.defaults/runtime {:enabled? false
@@ -12,9 +12,9 @@
                            :id/mini "mlx-community/SmolLM3-3B-8bit"
                            :id/fallback "mlx-community/SmolLM3-3B-8bit"}
  :ferment.model.id/voice {:profile "mini"
-                          :id/default "mlx-community/SmolLM3-3B-8bit"
-                          :id/mini "mlx-community/SmolLM3-3B-8bit"
-                          :id/fallback "mlx-community/SmolLM3-3B-8bit"}
+                          :id/default "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
+                          :id/mini "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
+                          :id/fallback "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"}
  :ferment.model.id/coding {:profile "mini"
                            :id/default "mlx-community/SmolLM3-3B-8bit"
                            :id/mini "mlx-community/SmolLM3-3B-8bit"
@@ -24,23 +24,39 @@
                          :id/mini "mlx-community/SmolLM3-3B-8bit"
                          :id/fallback "mlx-community/SmolLM3-3B-8bit"}
 
- ;; Keep only one process alive (meta); other runtimes stay disabled.
+ ;; Keep meta shared; voice runs separately; solver/coding stay disabled.
  :ferment.model.runtime/solver {:enabled? false
                                 :http {:enabled? false}}
- :ferment.model.runtime/voice {:enabled? false
+ :ferment.model.runtime/voice {:enabled? true
+                               :inherit-io? false
+                               :command [#ref :ferment.env/ferment.model.server.bin
+                                         "--host" #ref :ferment.env/ferment.model.voice.server.host
+                                         "--port" #ref :ferment.env/ferment.model.voice.server.port
+                                         "--model" #ref :ferment.model.id/voice]
+                               :invoke/http {:base-url #ref :ferment.env/ferment.model.voice.base.url
+                                             :endpoint #ref :ferment.env/ferment.model.voice.endpoint
+                                             :temperature 0.0
+                                             :model    #ref :ferment.model.id/voice}
                                :http {:enabled? false}}
  :ferment.model.runtime/coding {:enabled? false
                                 :http {:enabled? false}}
  :ferment.model.runtime/meta {:enabled? true
                               :inherit-io? false
-                              :command ["mlx_lm.chat" "--model" #ref :ferment.model.id/meta]
+                              :command [#ref :ferment.env/ferment.model.server.bin
+                                        "--host" #ref :ferment.env/ferment.model.meta.server.host
+                                        "--port" #ref :ferment.env/ferment.model.meta.server.port
+                                        "--model" #ref :ferment.model.id/meta]
+                              :invoke/http {:base-url #ref :ferment.env/ferment.model.meta.base.url
+                                            :endpoint #ref :ferment.env/ferment.model.meta.endpoint
+                                            :temperature 0.0
+                                            :model    #ref :ferment.model.id/meta}
                               :http {:enabled? false}}
 
- ;; Point all roles to the shared runtime.
+ ;; Keep solver/coding/meta on shared meta runtime; voice on Bielik runtime.
  :ferment.model/solver {:id #ref :ferment.model.id/solver
                         :runtime #ref :ferment.model.runtime/meta}
  :ferment.model/voice {:id #ref :ferment.model.id/voice
-                       :runtime #ref :ferment.model.runtime/meta}
+                       :runtime #ref :ferment.model.runtime/voice}
  :ferment.model/coding {:id #ref :ferment.model.id/coding
                         :runtime #ref :ferment.model.runtime/meta}
  :ferment.model/meta {:id #ref :ferment.model.id/meta

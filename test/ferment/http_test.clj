@@ -41,6 +41,46 @@
              (set (get-in @seen [:session/meta :user/roles]))))
       (is (= (:roles runtime) (:roles @seen))))))
 
+(deftest invoke-act-applies-session-var-defaults-when-missing
+  (testing "invoke-act fills missing context/constraints/input defaults from session vars."
+    (let [seen (atom nil)]
+      (letfn [(get-vars-fn
+                ([sid ks]
+                 (is (= "sess-ctx-1" sid))
+                 (is (= [:session/language
+                         :session/style
+                         :session/system-prompt
+                         :session/context-summary]
+                        ks))
+                 {:session/language :pl
+                  :session/style :concise
+                  :session/system-prompt "SYS-FROM-SESSION"
+                  :session/context-summary "ctx-from-session"})
+                ([sid ks opts]
+                 (is (= :text/respond (:intent opts)))
+                 (is (= :act/defaults (:operation opts)))
+                 (get-vars-fn sid ks)))]
+        (let [runtime {:protocol {}
+                       :resolver {}
+                       :session {:get-vars! get-vars-fn}}
+              payload {:proto 1
+                       :trace {:id "t-session-defaults-1"}
+                       :session/id "sess-ctx-1"
+                       :task {:intent :text/respond
+                              :cap/id :llm/voice}
+                       :input {:prompt "hej"}}
+              response (with-redefs [core/execute-capability!
+                                     (fn [_runtime _resolver opts]
+                                       (reset! seen opts)
+                                       {:result {:type :value
+                                                 :out {:text "ok"}}})]
+                         (http/invoke-act runtime payload nil nil))]
+          (is (= 200 (:status response)))
+          (is (= :pl (get-in @seen [:constraints :language])))
+          (is (= :concise (get-in @seen [:constraints :style])))
+          (is (= "SYS-FROM-SESSION" (get-in @seen [:input :system])))
+          (is (= "ctx-from-session" (get-in @seen [:context :summary]))))))))
+
 (deftest invoke-act-maps-forbidden-effect-to-403
   (testing "auth/forbidden-effect error from workflow/core is exposed as HTTP 403 envelope."
     (let [runtime {:roles {:enabled? true
@@ -155,6 +195,223 @@
       (is (= 200 (:status response)))
       (is (= [:route/decide :text/respond] @calls))
       (is (= :llm/solver (:cap-id @seen))))))
+
+(deftest invoke-act-meta-routing-adapts-tool-call-to-solver-voice-plan
+  (testing "Meta route/decide output in tool_call format is adapted into canonical solver->voice plan and executed."
+    (let [calls (atom [])
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem}
+                              :text/respond {:in-schema :req/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 2}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5b"}
+                   :task {:intent :text/respond}
+                   :input {:prompt "Kto stworzył Clojure?"}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent prompt]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide
+                                     {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Kto stworzył Clojure?\"}}</tool_call>"}
+                                     :problem/solve
+                                     {:response "Clojure został stworzony przez Richa Hickeya."}
+                                     :text/respond
+                                     {:response (str "VOICE:" prompt)}
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= [:route/decide :problem/solve :text/respond] @calls))
+      (is (= "VOICE:Clojure został stworzony przez Richa Hickeya."
+             (get-in response [:body :result :out :text])))
+      (is (= #{:ferment.model/meta
+               :ferment.model/solver
+               :ferment.model/voice}
+             (->> (get-in response [:body :models/used])
+                  (map :model-key)
+                  set)))
+      (is (= #{:llm/meta :llm/solver :llm/voice}
+             (->> (get-in response [:body :models/used])
+                  (map :cap/id)
+                  set))))))
+
+(deftest invoke-act-meta-routing-synthesizes-plan-on-empty-route-output
+  (testing "Meta route/decide may return empty text; parser still synthesizes canonical solver->voice plan from request prompt."
+    (let [calls (atom [])
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem}
+                              :text/respond {:in-schema :req/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 2}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5c"}
+                   :task {:intent :text/respond}
+                   :routing {:meta? true
+                             :strict? true}
+                   :input {:prompt "Czy ryby piją?"}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent prompt]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide {:response ""}
+                                     :problem/solve {:response "Ryby nie piją jak ssaki; regulują gospodarkę wodną osmotycznie."}
+                                     :text/respond {:response (str "VOICE:" prompt)}
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= [:route/decide :problem/solve :text/respond] @calls))
+      (is (= "VOICE:Ryby nie piją jak ssaki; regulują gospodarkę wodną osmotycznie."
+             (get-in response [:body :result :out :text]))))))
+
+(deftest invoke-act-meta-routing-ignores-invalid-model-plan-and-synthesizes-canonical-plan
+  (testing "Meta route/decide ignores non-canonical model plan and falls back to synthesized solver->voice plan."
+    (let [calls (atom [])
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem}
+                              :text/respond {:in-schema :req/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 2}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5d"}
+                   :task {:intent :text/respond}
+                   :routing {:meta? true
+                             :strict? true}
+                   :input {:prompt "Wyjaśnij ACID jednym zdaniem."}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent prompt]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide
+                                     {:response "{\"plan\":{\"nodes\":[{\"op\":\"call\",\"intent\":\"text/respond\",\"cap/id\":\"llm/voice\"}]}}"}
+                                     :problem/solve
+                                     {:response "ACID to zbiór gwarancji poprawności transakcji: atomowość, spójność, izolacja, trwałość."}
+                                     :text/respond
+                                     {:response (str "VOICE:" prompt)}
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= [:route/decide :problem/solve :text/respond] @calls))
+      (is (= "VOICE:ACID to zbiór gwarancji poprawności transakcji: atomowość, spójność, izolacja, trwałość."
+             (get-in response [:body :result :out :text]))))))
+
+(deftest invoke-act-meta-routing-can-expose-lazy-plan-in-debug-mode
+  (testing "When routing debug is enabled, /v1/act includes pre-execution plan with lazy slot refs."
+    (let [calls (atom [])
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem}
+                              :text/respond {:in-schema :req/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 2}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5dbg"}
+                   :task {:intent :text/respond}
+                   :routing {:meta? true
+                             :strict? true
+                             :debug/plan? true}
+                   :input {:prompt "Wyjaśnij ACID jednym zdaniem."}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent prompt]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide
+                                     {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Wyjaśnij ACID jednym zdaniem.\"}}</tool_call>"}
+                                     :problem/solve
+                                     {:response "ACID to zestaw gwarancji poprawności transakcji."}
+                                     :text/respond
+                                     {:response (str "VOICE:" prompt)}
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= [:route/decide :problem/solve :text/respond] @calls))
+      (is (= {:slot/id [:solver :out :text]}
+             (get-in response [:body :result :plan/debug :nodes 1 :input :prompt])))
+      (is (= {:slot/id [:voice :out]}
+             (get-in response [:body :result :plan/debug :nodes 2 :input]))))))
+
+(deftest invoke-act-meta-routing-fails-when-no-list-expansion-check-fails
+  (testing "Strict meta routing fails closed when voice output violates :no-list-expansion quality policy."
+    (let [calls (atom [])
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem
+                                              :out-schema :res/problem}
+                              :text/respond {:in-schema :req/text
+                                             :out-schema :res/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 1
+                    :policy/checks {:schema-valid :builtin/schema-valid
+                                    :no-list-expansion :builtin/no-list-expansion}
+                    :policy/intents {:text/respond {:done {:must #{:schema-valid}
+                                                            :should #{:no-list-expansion}
+                                                            :score-min 1.0}
+                                                    :checks [:schema-valid]}}}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5e"}
+                   :task {:intent :text/respond}
+                   :routing {:meta? true
+                             :strict? true
+                             :force? true}
+                   :input {:prompt "Wyjaśnij ACID jednym zdaniem."}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide
+                                     {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Wyjaśnij ACID jednym zdaniem.\"}}</tool_call>"}
+                                     :problem/solve
+                                     {:response "ACID to zestaw gwarancji dla transakcji."}
+                                     :text/respond
+                                     {:response "- atomowość\n- spójność\n- izolacja\n- trwałość"}
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 502 (:status response)))
+      (is (= :route/decide-failed
+             (get-in response [:body :error :type])))
+      (is (= [:route/decide :problem/solve :text/respond] @calls)))))
 
 (deftest invoke-act-meta-routing-strict-mode-fails-closed
   (testing "strict meta routing returns 502 when the decider fails and does not execute main capability."

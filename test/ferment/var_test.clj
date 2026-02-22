@@ -165,7 +165,7 @@
       (is (map? router))
       (is (= :ferment.caps/routing (:routing router)))
       (is (= :ferment.caps/profiles (:profiles router)))
-      (is (= :quality-aware (:policy router))))))
+      (is (= :meta-decider (:policy router))))))
 
 (deftest caps-entry-hooks-normalize-capability-metadata
   (testing "Entry hooks normalize capability contract metadata."
@@ -985,6 +985,8 @@
 (deftest http-session-bridge-supports-runtime-and-store-actions
   (testing "Endpoint /v1/session handles worker/session bridge actions."
     (let [port (free-port)
+          audit* (atom [])
+          vars* (atom {:session/language :pl})
           runtime {:session {:open! (fn [sid _opts]
                                       {:session/id sid
                                        :session/version 1
@@ -994,7 +996,52 @@
                                      {:session/id sid
                                       :session/version 2
                                       :session/state :warm
-                                      :session/frozen? true})}
+                                      :session/frozen? true})
+                             :get-var! (fn
+                                         ([_sid k]
+                                          (get @vars* k))
+                                         ([_sid k _opts]
+                                          (get @vars* k)))
+                             :get-vars! (fn
+                                          ([_sid ks]
+                                           (select-keys @vars* ks))
+                                          ([_sid ks _opts]
+                                           (select-keys @vars* ks)))
+                             :put-var! (fn
+                                         ([_sid k v]
+                                          (swap! vars* assoc k v)
+                                          true)
+                                         ([_sid k v _opts]
+                                          (swap! vars* assoc k v)
+                                          true))
+                             :put-vars! (fn
+                                          ([_sid kvs]
+                                           (swap! vars* merge kvs)
+                                           true)
+                                          ([_sid kvs _opts]
+                                           (swap! vars* merge kvs)
+                                           true))
+                             :del-var! (fn
+                                         ([_sid k]
+                                          (swap! vars* dissoc k)
+                                          true)
+                                         ([_sid k _opts]
+                                          (swap! vars* dissoc k)
+                                          true))
+                             :del-vars! (fn
+                                          ([_sid ks]
+                                           (swap! vars* #(apply dissoc % ks))
+                                           true)
+                                          ([_sid ks _opts]
+                                           (swap! vars* #(apply dissoc % ks))
+                                           true))
+                             :del-all-vars! (fn
+                                              ([_sid]
+                                               (reset! vars* {})
+                                               true)
+                                              ([_sid _opts]
+                                               (reset! vars* {})
+                                               true))}
                    :models {}}
           server-state (fhttp/init-http
                         :ferment.http/default
@@ -1007,6 +1054,10 @@
         (with-redefs [model/session-workers-state
                       (fn [_runtime]
                         {:ferment.model/meta {"s-1" {:running? true}}})
+                      ferment.oplog/logger
+                      (fn [_sub _cfg]
+                        (fn [& {:as msg}]
+                          (swap! audit* conj msg)))
                       model/thaw-session-worker!
                       (fn [_runtime model-id sid]
                         {:ok? true :model model-id :session/id sid :worker-id :w-1})
@@ -1021,7 +1072,34 @@
                 thaw-body  (json/parse-string (:body thaw-resp) true)
                 get-resp   (http-post-json url {:action "session/get"
                                                 :session/id "s-1"})
-                get-body   (json/parse-string (:body get-resp) true)]
+                get-body   (json/parse-string (:body get-resp) true)
+                put-var-resp (http-post-json url {:action "session/put-var"
+                                                  :session/id "s-1"
+                                                  :key "session/language"
+                                                  :value "en"})
+                put-var-body (json/parse-string (:body put-var-resp) true)
+                get-var-resp (http-post-json url {:action "session/get-var"
+                                                  :session/id "s-1"
+                                                  :key "session/language"})
+                get-var-body (json/parse-string (:body get-var-resp) true)
+                put-vars-resp (http-post-json url {:action "session/put-vars"
+                                                   :session/id "s-1"
+                                                   :vars {"session/style" "concise"
+                                                          "context/summary" "short"}})
+                put-vars-body (json/parse-string (:body put-vars-resp) true)
+                get-vars-resp (http-post-json url {:action "session/get-vars"
+                                                   :session/id "s-1"
+                                                   :keys ["session/language"
+                                                          "session/style"
+                                                          "context/summary"]})
+                get-vars-body (json/parse-string (:body get-vars-resp) true)
+                del-var-resp (http-post-json url {:action "session/del-var"
+                                                  :session/id "s-1"
+                                                  :key "session/style"})
+                del-var-body (json/parse-string (:body del-var-resp) true)
+                del-all-resp (http-post-json url {:action "session/del-all-vars"
+                                                  :session/id "s-1"})
+                del-all-body (json/parse-string (:body del-all-resp) true)]
             (is (= 200 (:status state-resp)))
             (is (= true (get state-body :ok?)))
             (is (= 200 (:status thaw-resp)))
@@ -1029,7 +1107,40 @@
             (is (= "s-1" (get thaw-body :session/id)))
             (is (= 200 (:status get-resp)))
             (is (= "s-1" (get-in get-body [:session :session/id])))
-            (is (= 2 (get-in get-body [:session :session/version])))))
+            (is (= 2 (get-in get-body [:session :session/version])))
+            (is (= 200 (:status put-var-resp)))
+            (is (= true (get put-var-body :written?)))
+            (is (= 200 (:status get-var-resp)))
+            (is (= "en" (get get-var-body :value)))
+            (is (= 200 (:status put-vars-resp)))
+            (is (= true (get put-vars-body :written?)))
+            (is (= 200 (:status get-vars-resp)))
+            (is (= "en"
+                   (or (get-in get-vars-body [:vars :session/language])
+                       (get-in get-vars-body [:vars "session/language"]))))
+            (is (= "concise"
+                   (or (get-in get-vars-body [:vars :session/style])
+                       (get-in get-vars-body [:vars "session/style"]))))
+            (is (= "short"
+                   (or (get-in get-vars-body [:vars :context/summary])
+                       (get-in get-vars-body [:vars "context/summary"]))))
+            (is (= 200 (:status del-var-resp)))
+            (is (= true (get del-var-body :deleted?)))
+            (is (= 200 (:status del-all-resp)))
+            (is (= true (get del-all-body :deleted?)))
+            (is (= {} @vars*))
+            (let [session-logs (filter #(= "/v1/session" (:endpoint %)) @audit*)
+                  put-var-log (some #(when (= :session/put-var (:operation %)) %) session-logs)
+                  put-vars-log (some #(when (= :session/put-vars (:operation %)) %) session-logs)
+                  del-var-log (some #(when (= :session/del-var (:operation %)) %) session-logs)]
+              (is (seq session-logs))
+              (is (= :ok (:outcome put-var-log)))
+              (is (= "s-1" (:session-id put-var-log)))
+              (is (= [:session/language] (:session/var-keys put-var-log)))
+              (is (not (contains? put-var-log :value)))
+              (is (= #{:context/summary :session/style}
+                     (set (:session/var-keys put-vars-log))))
+              (is (= [:session/style] (:session/var-keys del-var-log))))))
         (finally
           (fhttp/stop-http :ferment.http/default server-state))))))
 
@@ -1269,8 +1380,8 @@
       (is (= "mock" (:ferment.env/ferment.llm.mode cfg)))
       (is (false? (get-in cfg [:ferment.model.defaults/runtime :enabled?]))))))
 
-(deftest test-live-config-is-lightweight-single-runtime
-  (testing "Test-live config keeps one small shared runtime enabled for smoke checks."
+(deftest test-live-config-is-lightweight-meta-plus-bielik-voice
+  (testing "Test-live config keeps shared meta runtime and separate small Bielik voice runtime."
     (let [cfg (system/read-configs nil
                                    "config/common/prod"
                                    "config/local/prod"
@@ -1279,15 +1390,17 @@
       (is (= :test-live (get-in cfg [:ferment.app/properties :profile])))
       (is (= "live" (:ferment.env/ferment.llm.mode cfg)))
       (is (false? (get-in cfg [:ferment.model.runtime/solver :enabled?])))
-      (is (false? (get-in cfg [:ferment.model.runtime/voice :enabled?])))
+      (is (true? (get-in cfg [:ferment.model.runtime/voice :enabled?])))
       (is (false? (get-in cfg [:ferment.model.runtime/coding :enabled?])))
       (is (true? (get-in cfg [:ferment.model.runtime/meta :enabled?])))
       (is (= :ferment.model.runtime/meta
              (:key (get-in cfg [:ferment.model/solver :runtime]))))
-      (is (= :ferment.model.runtime/meta
+      (is (= :ferment.model.runtime/voice
              (:key (get-in cfg [:ferment.model/voice :runtime]))))
       (is (= :ferment.model.runtime/meta
-             (:key (get-in cfg [:ferment.model/coding :runtime])))))))
+             (:key (get-in cfg [:ferment.model/coding :runtime]))))
+      (is (= "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
+             (get-in cfg [:ferment.model.id/voice :id/default]))))))
 
 (deftest dev-overlay-order-beats-local-prod
   (testing "Overlay order guarantees dev overrides prod (including local)."
@@ -1400,6 +1513,71 @@
           (is (= {:prompt "hej"} (:payload @called)))
           (is (= :RUNNING (get-in @called [:session :stage]))))))))
 
+(deftest model-runtime-worker-default-invoke-function-uses-runtime-http
+  (testing "Worker with :invoke/http gets default invoke-fn based on runtime HTTP transport."
+    (let [called (atom nil)]
+      (with-redefs [model/invoke-runtime-http!
+                    (fn [payload session worker-config]
+                      (reset! called {:cfg worker-config
+                                      :session session
+                                      :payload payload})
+                      {:text "meta-http-ok"})]
+        (let [cfg (model/preconfigure-runtime-worker
+                   :ferment.model.runtime/meta
+                   {:invoke/http {:url "http://127.0.0.1:18080/v1/chat/completions"}})
+              response (model/runtime-request-handler
+                        {:stage :RUNNING}
+                        {:id :ferment.model.runtime/meta}
+                        {:body :invoke
+                         :args [{:prompt "hej-http"}]}
+                        [cfg])]
+          (is (= :runtime-http (:invoke/mode cfg)))
+          (is (fn? (:invoke-fn cfg)))
+          (is (= {:ok? true
+                  :result {:text "meta-http-ok"}}
+                 response))
+          (is (= {:prompt "hej-http"} (:payload @called)))
+          (is (= :RUNNING (get-in @called [:session :stage]))))))))
+
+(deftest model-runtime-http-invoke-parses-chat-completions-response
+  (testing "invoke-runtime-http! sends chat-style payload and extracts text from OpenAI-like response."
+    (let [port (free-port)
+          request-body (atom nil)
+          server (com.sun.net.httpserver.HttpServer/create
+                  (java.net.InetSocketAddress. "127.0.0.1" port)
+                  0)]
+      (.createContext
+       server
+       "/v1/chat/completions"
+       (reify com.sun.net.httpserver.HttpHandler
+         (handle [_ exchange]
+           (let [body-str (slurp (.getRequestBody exchange) :encoding "UTF-8")
+                 body-map (json/parse-string body-str true)
+                 _ (reset! request-body body-map)
+                 response-str (json/generate-string
+                               {:choices [{:index 0
+                                           :message {:role "assistant"
+                                                     :content "meta-http-live-ok"}}]})
+                 response-bytes (.getBytes response-str "UTF-8")]
+             (.set (.getResponseHeaders exchange) "Content-Type" "application/json")
+             (.sendResponseHeaders exchange 200 (long (alength response-bytes)))
+             (with-open [out (.getResponseBody exchange)]
+               (.write out response-bytes))))))
+      (.setExecutor server nil)
+      (.start server)
+      (try
+        (let [result (model/invoke-runtime-http!
+                      {:prompt "Explain Ferment shortly."
+                       :system "Keep it concise."}
+                      nil
+                      {:invoke/http {:url (str "http://127.0.0.1:" port "/v1/chat/completions")}})
+              messages (:messages @request-body)]
+          (is (= "meta-http-live-ok" (:text result)))
+          (is (= "Keep it concise." (get-in messages [0 :content])))
+          (is (= "Explain Ferment shortly." (get-in messages [1 :content]))))
+        (finally
+          (.stop server 0))))))
+
 (deftest model-runtime-request-quit-writes-command-to-process-stdin
   (testing "Command :quit writes :cmd/quit to process stdin with trailing newline."
     (let [sink (java.io.ByteArrayOutputStream.)
@@ -1421,6 +1599,28 @@
                      :cmd/quit "q"})]
       (is (= true (:ok? response)))
       (is (= "q\n" (.toString sink "UTF-8"))))))
+
+(deftest model-runtime-request-reset-writes-command-to-process-stdin
+  (testing "Command :reset writes :cmd/reset to process stdin with trailing newline."
+    (let [sink (java.io.ByteArrayOutputStream.)
+          process (proxy [Process] []
+                    (getOutputStream [] sink)
+                    (getInputStream [] (java.io.ByteArrayInputStream. (byte-array 0)))
+                    (getErrorStream [] (java.io.ByteArrayInputStream. (byte-array 0)))
+                    (waitFor [] 0)
+                    (exitValue [] 0)
+                    (destroy [] nil)
+                    (destroyForcibly [] this)
+                    (isAlive [] true))
+          response (model/runtime-request-handler
+                    {:runtime/state {:process process}}
+                    {:id :ferment.model.runtime/meta}
+                    {:body :reset}
+                    {:id :ferment.model.runtime/meta
+                     :name "meta model runtime"
+                     :cmd/reset "r"})]
+      (is (= true (:ok? response)))
+      (is (= "r\n" (.toString sink "UTF-8"))))))
 
 (deftest model-runtime-request-runtime-returns-safe-snapshot
   (testing "Command :runtime returns operator snapshot without raw/secret fields."
@@ -1572,6 +1772,35 @@
         (is (<= 2 (count @open-calls)))
         (is (= "s-1" (:sid (first @open-calls))))
         (is (contains? (get (model/session-workers-state runtime) :ferment.model/meta) "s-1"))))))
+
+(deftest model-shared-runtime-resets-on-session-switch
+  (testing "Shared worker sends :reset before :invoke when session id changes."
+    (let [calls (atom [])
+          runtime {:models {:ferment.model/meta
+                            {:runtime {:id :ferment.model.runtime/meta
+                                       :worker :meta-worker
+                                       :config {:id :ferment.model.runtime/meta
+                                                :cmd/reset "r"}}}}
+                   :ferment.model.session/enabled? false
+                   :ferment.model.session/last-id-by-model (atom {})
+                   :ferment.model.session/lock (Object.)}]
+      (with-redefs [model/command-bot-worker!
+                    (fn [worker command & [payload]]
+                      (swap! calls conj {:worker worker
+                                         :command command
+                                         :payload payload})
+                      (case command
+                        :reset {:ok? true}
+                        :invoke {:ok? true :result {:text "OK"}}
+                        {:ok? false :error :unsupported-command}))]
+        (is (= {:ok? true :result {:text "OK"}}
+               (model/invoke-model! runtime :meta {:prompt "one"} {:session/id "s-1"})))
+        (is (= {:ok? true :result {:text "OK"}}
+               (model/invoke-model! runtime :meta {:prompt "two"} {:session/id "s-2"})))
+        (is (= [:invoke :reset :invoke]
+               (mapv :command @calls)))
+        (is (= "s-2" (get @(:ferment.model.session/last-id-by-model runtime)
+                           :ferment.model/meta)))))))
 
 (deftest model-session-runtime-expires-workers-by-ttl
   (testing "Session worker is stopped after TTL and restarted on next invoke."

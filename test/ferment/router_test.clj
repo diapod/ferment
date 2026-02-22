@@ -8,6 +8,7 @@
     ferment.router-test
 
   (:require [clojure.test :refer [deftest is testing]]
+            [integrant.core :as ig]
             [ferment.router :as router]))
 
 (deftest resolver-config-normalization
@@ -62,6 +63,17 @@
           :ferment.router/default
           {:routing {:intent->cap {:problem/solve :llm/solver}
                      :switch-on :eval/low-score}})))))
+
+(deftest router-config-validation-allows-integrant-refs
+  (testing "Router branch accepts unresolved Integrant refs for :routing and :profiles."
+    (let [cfg (router/init-router
+               :ferment.router/default
+               {:routing  (ig/ref :ferment.caps/routing)
+                :profiles (ig/ref :ferment.caps/profiles)
+                :policy   :quality-aware})]
+      (is (ig/ref? (:routing cfg)))
+      (is (ig/ref? (:profiles cfg)))
+      (is (= :quality-aware (:policy cfg))))))
 
 (deftest resolve-model-key-precedence
   (testing "model key resolution uses capability dispatch, then router branch routing, then defaults."

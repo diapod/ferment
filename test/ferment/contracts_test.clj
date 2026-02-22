@@ -33,8 +33,10 @@
              (get-in protocol [:intents :text/respond :in-schema])))
       (is (= :res/text
              (get-in protocol [:intents :text/respond :out-schema])))
-      (is (= :route/decide
+      (is (= :route/solver->voice
              (get-in protocol [:intents :route/decide :result/contract :contract/kind])))
+      (is (= :plan
+             (get-in protocol [:intents :route/decide :result/contract :type])))
       (is (= #{:schema-valid}
              (get-in protocol [:policy/intents :route/decide :done :must])))
       (is (= [:schema-valid :no-hallucinated-apis]
@@ -292,6 +294,41 @@
              (:reason (contracts/validate-result protocol :route/decide bad-alias))))
       (is (= :route/decide-error-not-allowed
              (:reason (contracts/validate-result protocol :route/decide error-result)))))))
+
+(deftest route-solver-voice-plan-contract-is-enforced
+  (testing "Intent :route/decide can require canonical solver->voice plan shape."
+    (let [protocol {:intents {:route/decide {:result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}}
+                    :result/types [:value :plan :error]}
+          ok-plan {:result {:type :plan
+                            :plan {:nodes [{:op :call
+                                            :intent :problem/solve
+                                            :as :solver
+                                            :input {:prompt "Q"}}
+                                           {:op :call
+                                            :intent :text/respond
+                                            :as :voice
+                                            :input {:prompt {:slot/id [:solver :out :text]}}}
+                                           {:op :emit
+                                            :input {:slot/id [:voice :out]}}]}}}
+          bad-plan {:result {:type :plan
+                             :plan {:nodes [{:op :call
+                                             :intent :problem/solve
+                                             :as :solver
+                                             :input {:prompt "Q"}}
+                                            {:op :call
+                                             :intent :problem/solve
+                                             :as :voice
+                                             :input {:prompt {:slot/id [:solver :out :text]}}}
+                                            {:op :emit
+                                             :input {:slot/id [:voice :out]}}]}}}
+          bad-type {:result {:type :value
+                             :out {:cap/id :llm/solver}}}]
+      (is (:ok? (contracts/validate-result protocol :route/decide ok-plan)))
+      (is (= :route/plan-second-intent-not-text-respond
+             (:reason (contracts/validate-result protocol :route/decide bad-plan))))
+      (is (= :route/plan-result-type-not-plan
+             (:reason (contracts/validate-result protocol :route/decide bad-type)))))))
 
 (deftest invoke-with-contract-enforces-route-decide-shape
   (testing "invoke-with-contract retries :route/decide until decision payload is valid."

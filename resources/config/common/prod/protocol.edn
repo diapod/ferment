@@ -10,12 +10,14 @@
 
   :intents                {:route/decide      {:in-schema :req/route
                                                :out-schema :res/route
-                                               :result/contract {:type :value
-                                                                 :contract/kind :route/decide}}
+                                               :result/contract {:type :plan
+                                                                 :contract/kind :route/solver->voice}}
                            :context/summarize {:in-schema :req/context
                                                :out-schema :res/context-summary}
                            :text/respond      {:in-schema :req/text
-                                               :out-schema :res/text}
+                                               :out-schema :res/text
+                                               :constraints {:max-chars 1200}
+                                               :system "Jesteś VOICE w projekcie Ferment (Clojure: orkiestrator modeli AI, routing, kontrakty).\nOdpowiadaj po polsku, krótko i rzeczowo.\nTermin 'Ferment' interpretuj jako ten projekt, nie jako funkcję/bibliotekę JavaScript.\nNie ujawniaj wewnętrznego rozumowania i nigdy nie zwracaj znaczników <think>.\nJeśli kontekst jest niejednoznaczny, poproś o doprecyzowanie zamiast zgadywać."}
                            :problem/solve     {:in-schema :req/problem
                                                :out-schema :res/problem}
                            :code/generate     {:in-schema :req/code
@@ -34,7 +36,8 @@
 
   :policy/checks          {:schema-valid         :builtin/schema-valid
                            :tests-pass           :builtin/tests-pass
-                           :no-hallucinated-apis :builtin/no-hallucinated-apis}
+                           :no-hallucinated-apis :builtin/no-hallucinated-apis
+                           :no-list-expansion    :builtin/no-list-expansion}
 
   :policy/default         {:done {:must      #{:schema-valid}
                                    :should    #{:tests-pass :no-hallucinated-apis}
@@ -61,10 +64,11 @@
                                                :checks [:schema-valid]
                                                :judge {:enabled? false}}
                            :text/respond      {:done {:must #{:schema-valid}
-                                                      :should #{:no-hallucinated-apis}
+                                                      :should #{:no-hallucinated-apis :no-list-expansion}
                                                       :score-min 0.8}
                                                :checks [:schema-valid :no-hallucinated-apis]
-                                               :judge {:enabled? false}}
+                                               :judge {:enabled? true
+                                                       :max-attempts 1}}
                            :problem/solve     {:done {:must #{:schema-valid}
                                                       :should #{:no-hallucinated-apis}
                                                       :score-min 0.8}
@@ -79,7 +83,8 @@
                                                       :should #{:tests-pass :no-hallucinated-apis}
                                                       :score-min 0.8}
                                                :checks [:schema-valid :tests-pass]
-                                               :judge {:enabled? false}}
+                                               :judge {:enabled? true
+                                                       :max-attempts 1}}
                            :code/explain      {:done {:must #{:schema-valid}
                                                       :should #{:tests-pass :no-hallucinated-apis}
                                                       :score-min 0.8}

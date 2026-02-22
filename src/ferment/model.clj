@@ -8,6 +8,9 @@
 
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [cheshire.core :as json]
+            [hato.client :as hato]
             [ferment.session :as fsession]
             [ferment.system :as system]
             [io.randomseed.utils.bot :as bot]
@@ -15,6 +18,8 @@
 
   (:import (java.io File)
            (java.lang ProcessBuilder ProcessBuilder$Redirect)
+           (java.net BindException ConnectException InetSocketAddress NoRouteToHostException ServerSocket SocketTimeoutException URI UnknownHostException)
+           (java.net.http HttpTimeoutException HttpConnectTimeoutException)
            (java.nio.charset StandardCharsets)
            (java.time Instant)
            (java.util.concurrent TimeUnit)))
@@ -206,24 +211,357 @@
           (assoc cmd 0 resolved)
           cmd)))))
 
+(defn- invoke-user-prompt
+  [payload]
+  (cond
+    (string? payload) payload
+    (string? (:prompt payload)) (:prompt payload)
+    (string? (get-in payload [:input :prompt])) (get-in payload [:input :prompt])
+    (map? payload) (pr-str payload)
+    (nil? payload) ""
+    :else (str payload)))
+
+(defn- invoke-system-prompt
+  [payload]
+  (some-> (cond
+            (string? (:system payload)) (:system payload)
+            (string? (get-in payload [:input :system])) (get-in payload [:input :system])
+            :else nil)
+          str/trim
+          not-empty))
+
 (defn- invoke-prompt
   [payload]
-  (let [prompt (cond
-                 (string? payload) payload
-                 (string? (:prompt payload)) (:prompt payload)
-                 (string? (get-in payload [:input :prompt])) (get-in payload [:input :prompt])
-                 (map? payload) (pr-str payload)
-                 (nil? payload) ""
-                 :else (str payload))
-        system (some-> (cond
-                         (string? (:system payload)) (:system payload)
-                         (string? (get-in payload [:input :system])) (get-in payload [:input :system])
-                         :else nil)
-                       str/trim
-                       not-empty)]
+  (let [prompt (invoke-user-prompt payload)
+        system (invoke-system-prompt payload)]
     (if system
       (str "SYSTEM:\n" system "\n\nUSER:\n" prompt "\n\nASSISTANT:\n")
       prompt)))
+
+(defn- parse-positive-long
+  [v default]
+  (let [n (cond
+            (integer? v) (long v)
+            (number? v) (long v)
+            (string? v) (try
+                          (Long/parseLong (str/trim v))
+                          (catch Throwable _ nil))
+            :else nil)]
+    (if (and (some? n) (pos? n))
+      n
+      (long default))))
+
+(defn- normalize-http-endpoint
+  [v default]
+  (let [e (or (some-> v str str/trim not-empty)
+              default)]
+    (cond
+      (str/starts-with? e "http://") e
+      (str/starts-with? e "https://") e
+      (str/starts-with? e "/") e
+      :else (str "/" e))))
+
+(defn- invoke-http-config
+  [worker-config]
+  (let [cfg (when (map? worker-config)
+              (:invoke/http worker-config))]
+    (when (map? cfg) cfg)))
+
+(defn- parse-port-number
+  [v]
+  (let [n (cond
+            (integer? v) (long v)
+            (number? v) (long v)
+            (string? v) (try
+                          (Long/parseLong (str/trim v))
+                          (catch Throwable _ nil))
+            :else nil)]
+    (when (and (integer? n) (<= 1 n 65535))
+      (int n))))
+
+(defn- parse-uri-host-port
+  [s]
+  (when-some [u' (some-> s str str/trim not-empty)]
+    (try
+      (let [^URI u (URI. u')
+            host   (some-> (.getHost u) str str/trim not-empty)
+            port   (parse-port-number (.getPort u))]
+        (when (and host port)
+          {:host host
+           :port port}))
+      (catch Throwable _ nil))))
+
+(defn- command-flag-value
+  [command flag]
+  (let [argv (vec (map str (or command [])))
+        idx  (.indexOf ^java.util.List argv (str flag))]
+    (or (when (and (>= idx 0)
+                   (< (inc idx) (count argv)))
+          (get argv (inc idx)))
+        (some (fn [arg]
+                (let [prefix (str flag "=")]
+                  (when (str/starts-with? arg prefix)
+                    (subs arg (count prefix)))))
+              argv))))
+
+(defn- runtime-http-host-port
+  [worker-config]
+  (let [cfg      (invoke-http-config worker-config)
+        from-uri (or (parse-uri-host-port (:url cfg))
+                     (parse-uri-host-port (:base-url cfg)))
+        host-arg (some-> (command-flag-value (:command worker-config) "--host")
+                         str
+                         str/trim
+                         not-empty)
+        port-arg (parse-port-number (command-flag-value (:command worker-config) "--port"))]
+    (or from-uri
+        (when port-arg
+          {:host (or host-arg "127.0.0.1")
+           :port port-arg}))))
+
+(defn- port-bindable?
+  [host port]
+  (let [bind-host (some-> host str str/trim not-empty)]
+    (try
+      (with-open [^ServerSocket socket (ServerSocket.)]
+        (.setReuseAddress socket false)
+        (.bind socket (InetSocketAddress. ^String (or bind-host "127.0.0.1")
+                                          (int port)))
+        true)
+      (catch BindException _ false)
+      ;; Unknown host or invalid bind target should not be reported as "port in use".
+      (catch Throwable _ true))))
+
+(defn- listening-pids-for-port
+  [port]
+  (try
+    (let [{:keys [exit out]} (shell/sh "lsof"
+                                       "-nP"
+                                       (str "-iTCP:" port)
+                                       "-sTCP:LISTEN"
+                                       "-t")]
+      (if (zero? (long (or exit 1)))
+        (->> (str/split-lines (or out ""))
+             (map str/trim)
+             (remove str/blank?)
+             (keep (fn [line]
+                     (try
+                       (Long/parseLong line)
+                       (catch Throwable _ nil))))
+             distinct
+             vec)
+        []))
+    (catch Throwable _ [])))
+
+(defn- assert-runtime-port-available!
+  [worker-config]
+  (when (map? (invoke-http-config worker-config))
+    (when-some [{:keys [host port]} (runtime-http-host-port worker-config)]
+      (when-not (port-bindable? host port)
+        (throw
+         (ex-info "Runtime HTTP port is already in use by another process."
+                  {:error :runtime-port-in-use
+                   :type :runtime/port-in-use
+                   :host host
+                   :port port
+                   :listener/pids (listening-pids-for-port port)
+                   :invoke/http (select-keys (invoke-http-config worker-config)
+                                             [:url :base-url :endpoint])}))))))
+
+(defn- invoke-http-url
+  [worker-config]
+  (let [cfg (invoke-http-config worker-config)
+        direct (some-> (:url cfg) str str/trim not-empty)
+        base   (some-> (:base-url cfg) str str/trim not-empty)
+        ep     (normalize-http-endpoint (:endpoint cfg) "/v1/chat/completions")]
+    (cond
+      direct direct
+      (and base (str/starts-with? ep "/")) (str (str/replace base #"/+$" "") ep)
+      (and base ep) (str (str/replace base #"/+$" "") "/" ep)
+      :else nil)))
+
+(defn- invoke-http-ready-url
+  [worker-config]
+  (let [cfg (invoke-http-config worker-config)]
+    (or (some-> (:ready-url cfg) str str/trim not-empty)
+        (let [base (some-> (:base-url cfg) str str/trim not-empty)]
+          (when base
+            (str (str/replace base #"/+$" "") "/v1/models"))))))
+
+(defn- invoke-http-body
+  [payload worker-config]
+  (let [cfg     (invoke-http-config worker-config)
+        format' (or (:request/format cfg)
+                    :openai-chat)
+        prompt  (invoke-user-prompt payload)
+        system  (invoke-system-prompt payload)
+        model-id (or (some-> (:model cfg) str str/trim not-empty)
+                     (some-> (:model worker-config) str str/trim not-empty))
+        temp    (when (number? (:temperature cfg))
+                  (double (:temperature cfg)))
+        max-toks (when (number? (:max-tokens cfg))
+                   (long (:max-tokens cfg)))
+        top-p   (when (number? (:top-p cfg))
+                  (double (:top-p cfg)))]
+    (case format'
+      :prompt-json
+      (cond-> {:prompt prompt}
+        system (assoc :system system)
+        model-id (assoc :model model-id)
+        (number? temp) (assoc :temperature temp)
+        (number? max-toks) (assoc :max_tokens max-toks)
+        (number? top-p) (assoc :top_p top-p))
+
+      :openai-completions
+      (cond-> {:prompt prompt
+               :stream false}
+        model-id (assoc :model model-id)
+        (number? temp) (assoc :temperature temp)
+        (number? max-toks) (assoc :max_tokens max-toks)
+        (number? top-p) (assoc :top_p top-p))
+
+      ;; default: chat/completions payload
+      (let [messages (cond-> []
+                       system (conj {:role "system"
+                                     :content system})
+                       true   (conj {:role "user"
+                                     :content prompt}))]
+        (cond-> {:messages messages
+                 :stream false}
+          model-id (assoc :model model-id)
+          (number? temp) (assoc :temperature temp)
+          (number? max-toks) (assoc :max_tokens max-toks)
+          (number? top-p) (assoc :top_p top-p))))))
+
+(defn- maybe-json-response
+  [body]
+  (try
+    (json/parse-string (or body "") true)
+    (catch Throwable _ nil)))
+
+(defn- pick-response-text
+  [response-map worker-config]
+  (let [cfg (invoke-http-config worker-config)
+        path (:response/path cfg)
+        from-path (when (and (vector? path) (seq path))
+                    (get-in response-map path))
+        candidates [(when (string? from-path) from-path)
+                    (get-in response-map [:choices 0 :message :content])
+                    (get-in response-map [:choices 0 :text])
+                    (:text response-map)
+                    (:response response-map)]]
+    (some->> candidates
+             (filter string?)
+             (map #(some-> % str/trim not-empty))
+             (filter some?)
+             first)))
+
+(defn- send-http-json!
+  [url body-map worker-config]
+  (let [cfg                 (invoke-http-config worker-config)
+        connect-timeout-ms  (parse-positive-long (:connect-timeout-ms cfg) 2000)
+        request-timeout-ms  (parse-positive-long (:timeout-ms cfg) 120000)
+        method              (-> (or (:method cfg) :post) name str/lower-case)
+        headers             (if (map? (:headers cfg)) (:headers cfg) {})
+        request-body        (json/generate-string body-map)
+        req-map             (cond-> {:method :post
+                                     :url url
+                                     :headers (merge {"content-type" "application/json; charset=utf-8"
+                                                      "accept" "application/json"}
+                                                     (into {}
+                                                           (comp
+                                                            (filter (fn [[k v]]
+                                                                      (and (some? k)
+                                                                           (some? v))))
+                                                            (map (fn [[k v]]
+                                                                   [(-> k str str/lower-case)
+                                                                    (str v)])))
+                                                           headers))
+                                     :timeout request-timeout-ms
+                                     :http-client {:connect-timeout connect-timeout-ms}
+                                     :throw-exceptions false}
+                              (= "get" method) (assoc :method :get)
+                              (not= "get" method) (assoc :body request-body))
+        resp                (hato/request req-map)
+        status              (:status resp)
+        resp-body           (some-> (:body resp) str)
+        parsed              (maybe-json-response resp-body)]
+    (when-not (<= 200 status 299)
+      (throw (ex-info "Model HTTP invoke failed with non-success status."
+                      {:error :invoke-http-status
+                       :status status
+                       :url url
+                       :response parsed
+                       :body (some-> resp-body (subs 0 (min 4000 (count resp-body))))})))
+    {:status status
+     :body resp-body
+     :response parsed}))
+
+(defn- retryable-http-error?
+  [t]
+  (let [data (when (instance? clojure.lang.ExceptionInfo t)
+               (ex-data t))
+        status (:status data)]
+    (or (instance? ConnectException t)
+        (instance? NoRouteToHostException t)
+        (instance? SocketTimeoutException t)
+        (instance? UnknownHostException t)
+        (instance? HttpConnectTimeoutException t)
+        (instance? HttpTimeoutException t)
+        (contains? #{502 503 504} status))))
+
+(defn invoke-runtime-http!
+  "Invokes runtime model endpoint over HTTP using `:invoke/http` configuration."
+  [payload _session worker-config]
+  (let [url (invoke-http-url worker-config)
+        ready-url (invoke-http-ready-url worker-config)
+        cfg (invoke-http-config worker-config)
+        body-map (invoke-http-body payload worker-config)
+        startup-timeout-ms (parse-positive-long (:startup-timeout-ms cfg) 30000)
+        retry-ms (parse-positive-long (:retry-ms cfg) 250)
+        deadline (+ (System/currentTimeMillis) startup-timeout-ms)]
+    (when-not (some? url)
+      (throw (ex-info "Missing HTTP invoke URL for runtime model."
+                      {:error :invoke-http-url-missing
+                       :config (select-keys cfg [:url :base-url :endpoint])})))
+    (loop [attempt 1]
+      (let [outcome (try
+                      {:ok? true
+                       :value (let [{:keys [status response body]} (send-http-json! url body-map worker-config)
+                                    text (or (when (map? response)
+                                               (pick-response-text response worker-config))
+                                             (some-> body str str/trim not-empty)
+                                             "")]
+                                {:text text
+                                 :status status
+                                 :url url
+                                 :attempt attempt
+                                 :transport :http
+                                 :response response})}
+                      (catch Throwable t
+                        {:ok? false
+                         :error t}))]
+        (if (:ok? outcome)
+          (:value outcome)
+          (let [t (:error outcome)]
+            (if (and (retryable-http-error? t)
+                     (< (System/currentTimeMillis) deadline))
+              (do
+                ;; Optional readiness probe for server-style backends.
+                (when ready-url
+                  (try
+                    (send-http-json! ready-url {} (assoc worker-config :invoke/http (assoc cfg :method :get)))
+                    (catch Throwable _ nil)))
+                (Thread/sleep retry-ms)
+                (recur (inc attempt)))
+              (throw (ex-info "Failed to invoke runtime model over HTTP."
+                              {:error :invoke-http-failed
+                               :url url
+                               :ready-url ready-url
+                               :attempt attempt
+                               :startup-timeout-ms startup-timeout-ms
+                               :retry-ms retry-ms}
+                              t)))))))))
 
 (defn invoke-command!
   "Invokes model command in one-shot mode for bot `:invoke` request."
@@ -284,12 +622,27 @@
         wid      (or (:id cfg) k)
         name'    (or (:name cfg) (str (name wid) " runtime"))
         session' (or (:session cfg) {:sid "ferment-model-runtime"})
-        invoke-mode (or (:invoke/mode cfg) :runtime-process)
+        invoke-http? (map? (:invoke/http cfg))
+        invoke-mode (or (:invoke/mode cfg)
+                        (when invoke-http? :runtime-http)
+                        :runtime-process)
         invoke-fn' (or (:invoke-fn cfg)
-                       (when (seq (:command cfg))
-                         (if (= :oneshot invoke-mode)
+                       (case invoke-mode
+                         :oneshot
+                         (when (seq (:command cfg))
                            (fn [payload _session worker-config]
-                             (invoke-command! worker-config payload))
+                             (invoke-command! worker-config payload)))
+
+                         :runtime-http
+                         (fn [payload session worker-config]
+                           (invoke-runtime-http! payload session worker-config))
+
+                         :runtime-process
+                         (when (seq (:command cfg))
+                           (fn [payload session worker-config]
+                             (invoke-runtime-process! payload session worker-config)))
+
+                         (when (seq (:command cfg))
                            (fn [payload session worker-config]
                              (invoke-runtime-process! payload session worker-config)))))]
     (-> cfg
@@ -298,6 +651,7 @@
                :name (str name')
                :session session'
                :enabled? (not= false (:enabled? cfg))
+               :invoke/mode invoke-mode
                :invoke-fn invoke-fn')
         (update :ns #(or % 'ferment.model)))))
 
@@ -408,6 +762,7 @@
           selection (normalize-io-selection (:inherit-io? worker-config))
           max-chars (or (:io/max-buffer-chars worker-config)
                         default-io-buffer-max-chars)
+          _         (assert-runtime-port-available! worker-config)
           ^java.util.List command (mapv str cmd)
           pb (ProcessBuilder. ^java.util.List command)
           _  (configure-process-io! pb (:inherit-io? worker-config))
@@ -442,16 +797,16 @@
       (future-cancel p)))
   nil)
 
-(defn- quit-command
-  [worker-config]
-  (when-some [^String cmd (some-> (:cmd/quit worker-config) str str/trim not-empty)]
+(defn- runtime-command-string
+  [worker-config command-key]
+  (when-some [^String cmd (some-> (get worker-config command-key) str str/trim not-empty)]
     (if (str/ends-with? cmd "\n")
       cmd
       (str cmd "\n"))))
 
-(defn- send-quit-command!
-  [session worker-config]
-  (if-some [cmd (quit-command worker-config)]
+(defn- send-runtime-command!
+  [session worker-config command-key]
+  (if-some [cmd (runtime-command-string worker-config command-key)]
     (if-some [^Process process (get-in session [:runtime/state :process])]
       (try
         (let [lock (or (get-in session [:runtime/state :io :lock]) (Object.))]
@@ -461,15 +816,33 @@
               (.write out ^bytes bytes)
               (.flush out)
               {:ok? true
-               :sent cmd})))
+               :sent cmd
+               :command-key command-key})))
         (catch Throwable t
           {:ok? false
-           :error :quit-write-failed
+           :error :runtime-command-write-failed
+           :command-key command-key
            :message (.getMessage t)}))
       {:ok? false
-       :error :runtime-process-missing})
+       :error :runtime-process-missing
+       :command-key command-key})
     {:ok? false
-     :error :quit-not-configured}))
+     :error :runtime-command-not-configured
+     :command-key command-key}))
+
+(defn- send-quit-command!
+  [session worker-config]
+  (let [response (send-runtime-command! session worker-config :cmd/quit)]
+    (if (= :runtime-command-not-configured (:error response))
+      (assoc response :error :quit-not-configured)
+      response)))
+
+(defn- send-reset-command!
+  [session worker-config]
+  (let [response (send-runtime-command! session worker-config :cmd/reset)]
+    (if (= :runtime-command-not-configured (:error response))
+      (assoc response :error :reset-not-configured)
+      response)))
 
 (defn- tail-text
   [s n]
@@ -655,6 +1028,7 @@
   - :status
   - :runtime (safe runtime snapshot for operators)
   - :quit (writes configured `:cmd/quit` + newline to runtime process stdin)
+  - :reset (writes configured `:cmd/reset` + newline to runtime process stdin)
   - :invoke (if `:invoke-fn` is configured)"
   [session wrk req worker-config]
   (let [worker-config (if (and (sequential? worker-config)
@@ -673,27 +1047,33 @@
                :runtime/error  (public-runtime-error (:runtime/error session))}
       :runtime (runtime-snapshot session wrk worker-config)
       :quit (send-quit-command! session worker-config)
-      :invoke (if (fn? invoke-fn)
-                (let [payload (first req-args)]
-                  (try
-                    {:ok? true
-                     :result (invoke-fn payload session worker-config)}
-                    (catch Throwable t
-                      {:ok? false
-                       :error :invoke-failed
-                       :message (.getMessage t)
-                       :details (when (instance? clojure.lang.ExceptionInfo t)
-                                  (select-keys (ex-data t)
-                                               [:error
-                                                :exit
-                                                :command
-                                                :stderr
-                                                :stdout
-                                                :timeout-ms
-                                                :stdout/truncated?
-                                                :stderr/truncated?]))})))
+      :reset (send-reset-command! session worker-config)
+      :invoke (if-some [runtime-error (:runtime/error session)]
                 {:ok? false
-                 :error :invoke-not-configured})
+                 :error :runtime-not-ready
+                 :message "Model runtime is not ready."
+                 :details (public-runtime-error runtime-error)}
+                (if (fn? invoke-fn)
+                  (let [payload (first req-args)]
+                    (try
+                      {:ok? true
+                       :result (invoke-fn payload session worker-config)}
+                      (catch Throwable t
+                        {:ok? false
+                         :error :invoke-failed
+                         :message (.getMessage t)
+                         :details (when (instance? clojure.lang.ExceptionInfo t)
+                                    (select-keys (ex-data t)
+                                                 [:error
+                                                  :exit
+                                                  :command
+                                                  :stderr
+                                                  :stdout
+                                                  :timeout-ms
+                                                  :stdout/truncated?
+                                                  :stderr/truncated?]))})))
+                  {:ok? false
+                   :error :invoke-not-configured}))
       {:ok? false
        :error :unsupported-command
        :command command})))
@@ -715,9 +1095,16 @@
                             (try
                               (start-fn worker-config bot-session)
                               (catch Throwable t
-                                {:error :runtime-start-failed
-                                 :class (str (class t))
-                                 :message (.getMessage t)})))
+                                (let [data (when (instance? clojure.lang.ExceptionInfo t)
+                                             (ex-data t))]
+                                  (merge
+                                   {:error (or (:error data) :runtime-start-failed)
+                                    :class (str (class t))
+                                    :message (.getMessage t)}
+                                   (when (some? (:type data))
+                                     {:type (:type data)})
+                                   (when (map? data)
+                                     {:details (dissoc data :error :type :class :message)}))))))
             initial-state (cond-> (merge bot-session
                                          {:stage :RUNNING
                                           :started-at (str (Instant/now))})
@@ -988,6 +1375,13 @@
       (when (instance? clojure.lang.IDeref v)
         v))))
 
+(defn- runtime-last-session-registry
+  [runtime]
+  (when (map? runtime)
+    (let [v (:ferment.model.session/last-id-by-model runtime)]
+      (when (instance? clojure.lang.IDeref v)
+        v))))
+
 (defn- runtime-session-lock
   [runtime]
   (if (map? runtime)
@@ -1217,6 +1611,35 @@
                           :runtime-process-io-unavailable}
                         (:error details))))))
 
+(defn- maybe-reset-shared-worker-for-session!
+  [runtime model-k sid worker-state]
+  (let [sid'       (normalize-runtime-session-id sid)
+        registry   (runtime-last-session-registry runtime)
+        worker     (some-> worker-state :worker)
+        cfg        (or (some-> worker-state :config) worker-state)
+        reset-cmd? (and (map? cfg)
+                        (some-> (:cmd/reset cfg) str str/trim not-empty))]
+    (when (and sid'
+               (not (session-mode-enabled? runtime))
+               registry
+               worker
+               reset-cmd?)
+      (let [lock (runtime-session-lock runtime)]
+        (locking lock
+          (let [prev-sid (get @registry model-k)]
+            (when (and (some? prev-sid)
+                       (not= prev-sid sid'))
+              (let [response (command-bot-worker! worker :reset)]
+                (when (and (map? response)
+                           (= false (:ok? response)))
+                  (throw (ex-info "Model runtime reset failed for session switch."
+                                  {:error :runtime-session-reset-failed
+                                   :model model-k
+                                   :previous-session/id prev-sid
+                                   :session/id sid'
+                                   :reset-response response})))))
+            (swap! registry assoc model-k sid')))))))
+
 (defn invoke-model!
   "Invokes model runtime worker with optional session-aware worker lifecycle.
 
@@ -1237,7 +1660,22 @@
          invoke!       (fn [wrk]
                          (when wrk
                            (command-bot-worker! wrk :invoke payload)))
-         response0     (invoke! worker)
+         response0     (when worker
+                         (try
+                           (maybe-reset-shared-worker-for-session! runtime model-k sid worker-state)
+                           (invoke! worker)
+                           (catch Throwable t
+                             {:ok? false
+                              :error :invoke-failed
+                              :message (.getMessage t)
+                              :details (merge {:error :runtime-session-reset-failed}
+                                              (when (instance? clojure.lang.ExceptionInfo t)
+                                                (select-keys (ex-data t)
+                                                             [:error
+                                                              :model
+                                                              :previous-session/id
+                                                              :session/id
+                                                              :reset-response])))})))
          response      (if (and sid (restartable-invoke-error? response0))
                          (do
                            (drop-session-worker! runtime model-k sid :session/restart)

@@ -98,6 +98,7 @@
                 attach-router-to-resolver)]
     (assoc cfg
            :ferment.model.session/workers (atom {})
+           :ferment.model.session/last-id-by-model (atom {})
            :ferment.model.session/lock (Object.))))
 
 (defn stop-runtime

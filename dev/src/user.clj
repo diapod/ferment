@@ -92,7 +92,7 @@
   (or (get ns->profile (ns-name *ns*)) :dev))
 
 (defn- start-for-profile!
-  [profile keys]
+  [profile & keys]
   (case profile
     :dev   (apply app/start-dev! keys)
     :test  (apply app/start-test! keys)
@@ -104,11 +104,11 @@
                      :supported (set (vals ns->profile))}))))
 
 (defn- stop-for-profile!
-  [_profile keys]
+  [_profile & keys]
   (apply app/stop! keys))
 
 (defn- restart-for-profile!
-  [profile keys]
+  [profile & keys]
   ;; Deterministic restart for selected profile:
   ;; stop selected keys and start the same key-set using profile-specific config dirs.
   (apply stop-for-profile! profile keys)
@@ -130,17 +130,17 @@
 (defn start!
   "Starts app for profile inferred from caller namespace."
   [& keys]
-  (start-for-profile! (current-profile) keys))
+  (apply start-for-profile! (current-profile) keys))
 
 (defn stop!
   "Stops app (or selected keys)."
   [& keys]
-  (stop-for-profile! (current-profile) keys))
+  (apply stop-for-profile! (current-profile) keys))
 
 (defn restart!
   "Restarts app for profile inferred from caller namespace."
   [& keys]
-  (restart-for-profile! (current-profile) keys))
+  (apply restart-for-profile! (current-profile) keys))
 
 (defn status!
   "Returns a concise runtime status map for profile inferred from caller namespace."
@@ -154,11 +154,11 @@
       (binding [*ns* target-ns]
         (clojure.core/refer 'clojure.core)
         (intern *ns* 'start! (fn [& keys]
-                               (start-for-profile! profile keys)))
+                               (apply start-for-profile! profile keys)))
         (intern *ns* 'stop! (fn [& keys]
-                              (stop-for-profile! profile keys)))
+                              (apply stop-for-profile! profile keys)))
         (intern *ns* 'restart! (fn [& keys]
-                                 (restart-for-profile! profile keys)))
+                                 (apply restart-for-profile! profile keys)))
         (intern *ns* 'status! (fn []
                                 (status-for-profile profile ns-sym)))))))
 

@@ -131,7 +131,10 @@
    :freeze/allow-delete?     true
    :limits/max-vars          256
    :limits/max-key-chars     191
-   :limits/max-value-bytes   131072})
+   :limits/max-value-bytes   131072
+   :policy/default           {}
+   :policy/by-intent         {}
+   :policy/by-operation      {}})
 
 (def ^:private session-var-value-key :session.var/value)
 (def ^:private session-var-meta-key  :session.var/meta)
@@ -172,6 +175,17 @@
                            (-> v str/trim str/lower-case))
     :else (boolean v)))
 
+(defn- keywordish
+  [v]
+  (cond
+    (keyword? v) v
+    (string? v) (let [s (some-> v str/trim not-empty)]
+                  (when s
+                    (if (str/starts-with? s ":")
+                      (keyword (subs s 1))
+                      (keyword s))))
+    :else nil))
+
 (defn- normalize-key-namespace
   [v]
   (cond
@@ -190,6 +204,31 @@
     (if (seq src)
       (into #{} (keep normalize-key-namespace) src)
       #{})))
+
+(defn- normalize-vars-policy-entry
+  [entry]
+  (let [entry' (if (map? entry) entry {})
+        read? (contains? entry' :read-namespaces)
+        write? (contains? entry' :write-namespaces)
+        delete? (contains? entry' :delete-namespaces)]
+    (cond-> {}
+      read? (assoc :read-namespaces
+                   (normalize-key-namespace-set (:read-namespaces entry')))
+      write? (assoc :write-namespaces
+                    (normalize-key-namespace-set (:write-namespaces entry')))
+      delete? (assoc :delete-namespaces
+                     (normalize-key-namespace-set (:delete-namespaces entry'))))))
+
+(defn- normalize-vars-policy-map
+  [m]
+  (if (map? m)
+    (reduce-kv (fn [acc k v]
+                 (if-some [k' (keywordish k)]
+                   (assoc acc k' (normalize-vars-policy-entry v))
+                   acc))
+               {}
+               m)
+    {}))
 
 (defn- normalize-session-vars-contract
   [cfg]
@@ -227,6 +266,15 @@
                           (positive-int (:limits/max-value-bytes src)
                                         (:limits/max-value-bytes default-session-vars-contract))
                           (:limits/max-value-bytes default-session-vars-contract))
+        policy-default (if (contains? src :policy/default)
+                         (normalize-vars-policy-entry (:policy/default src))
+                         (:policy/default default-session-vars-contract))
+        policy-by-intent (if (contains? src :policy/by-intent)
+                           (normalize-vars-policy-map (:policy/by-intent src))
+                           (:policy/by-intent default-session-vars-contract))
+        policy-by-operation (if (contains? src :policy/by-operation)
+                              (normalize-vars-policy-map (:policy/by-operation src))
+                              (:policy/by-operation default-session-vars-contract))
         default-ttl-ms' (when (some? default-ttl-ms)
                           (if (pos? max-ttl-ms)
                             (min default-ttl-ms max-ttl-ms)
@@ -239,7 +287,10 @@
      :freeze/allow-delete? allow-delete?
      :limits/max-vars max-vars
      :limits/max-key-chars max-key-chars
-     :limits/max-value-bytes max-value-bytes}))
+     :limits/max-value-bytes max-value-bytes
+     :policy/default policy-default
+     :policy/by-intent policy-by-intent
+     :policy/by-operation policy-by-operation}))
 
 (defn- parse-var-key
   [k]
@@ -296,6 +347,55 @@
                        :key-length (count key-text)
                        :max-key-chars max-key-chars})))
     key'))
+
+(defn- vars-policy-for
+  [store opts]
+  (let [contract (or (:session-vars/contract store) default-session-vars-contract)
+        opts' (if (map? opts) opts {})
+        intent (some-> (:intent opts') keywordish)
+        operation (some-> (:operation opts') keywordish)]
+    (merge (:policy/default contract)
+           (when (keyword? operation)
+             (get-in contract [:policy/by-operation operation]))
+           (when (keyword? intent)
+             (get-in contract [:policy/by-intent intent])))))
+
+(defn- mode->policy-key
+  [mode]
+  (case mode
+    :read :read-namespaces
+    :put  :write-namespaces
+    :del  :delete-namespaces
+    nil))
+
+(defn- mode->policy-error
+  [mode]
+  (case mode
+    :read :session.vars/policy-read-forbidden
+    :put  :session.vars/policy-write-forbidden
+    :del  :session.vars/policy-delete-forbidden
+    :session.vars/policy-forbidden))
+
+(defn- ensure-policy-permitted!
+  [store sid key mode opts]
+  (let [k' (validate-var-key! store sid key)
+        ns' (or (namespace k') (name k'))
+        policy (vars-policy-for store opts)
+        policy-key (mode->policy-key mode)
+        has-policy? (contains? policy policy-key)
+        allowed (get policy policy-key)]
+    (when (and has-policy?
+               (not (contains? allowed ns')))
+      (throw (ex-info "Session var access is forbidden by policy."
+                      {:error (mode->policy-error mode)
+                       :session/id sid
+                       :key k'
+                       :namespace ns'
+                       :mode mode
+                       :intent (some-> opts :intent keywordish)
+                       :operation (some-> opts :operation keywordish)
+                       :allowed-namespaces allowed})))
+    k'))
 
 (defn- ensure-write-permitted!
   [store sid mode]
@@ -747,56 +847,61 @@
          vec)))
 
 (defn get-var
-  [store sid k]
-  (let [sid' (normalize-session-id sid)
-        k'   (validate-var-key! store sid' k)]
-    (expire-session-vars! store sid')
-    (if-let [entry (some-> (get (normalize-raw-vars-map (read-all-raw-vars store sid')) k')
-                           normalize-var-entry)]
-      (if (var-entry-expired? entry (now-ms))
-        (do
-          (delete-raw-vars! store sid' [k'])
-          nil)
-        (var-entry-value entry))
-      nil)))
+  ([store sid k]
+   (get-var store sid k nil))
+  ([store sid k opts]
+   (let [sid' (normalize-session-id sid)
+         k'   (ensure-policy-permitted! store sid' k :read opts)]
+     (expire-session-vars! store sid')
+     (if-let [entry (some-> (get (normalize-raw-vars-map (read-all-raw-vars store sid')) k')
+                            normalize-var-entry)]
+       (if (var-entry-expired? entry (now-ms))
+         (do
+           (delete-raw-vars! store sid' [k'])
+           nil)
+         (var-entry-value entry))
+       nil))))
 
 (defn get-vars
-  [store sid ks]
-  (let [sid' (normalize-session-id sid)
-        ks'  (when (sequential? ks)
-               (->> ks
-                    (map #(validate-var-key! store sid' %))
-                    distinct
-                    vec))]
-    (if-not (seq ks')
-      {}
-      (do
-        (expire-session-vars! store sid')
-        (let [raw (normalize-raw-vars-map (read-all-raw-vars store sid'))
-              now (now-ms)]
-          (reduce (fn [m k]
-                    (if-let [entry (some-> (get raw k) normalize-var-entry)]
-                      (if (var-entry-expired? entry now)
-                        (do
-                          (delete-raw-vars! store sid' [k])
-                          m)
-                        (assoc m k (var-entry-value entry)))
-                      m))
-                  {}
-                  ks'))))))
+  ([store sid ks]
+   (get-vars store sid ks nil))
+  ([store sid ks opts]
+   (let [sid' (normalize-session-id sid)
+         ks'  (when (sequential? ks)
+                (->> ks
+                     (map #(ensure-policy-permitted! store sid' % :read opts))
+                     distinct
+                     vec))]
+     (if-not (seq ks')
+       {}
+       (do
+         (expire-session-vars! store sid')
+         (let [raw (normalize-raw-vars-map (read-all-raw-vars store sid'))
+               now (now-ms)]
+           (reduce (fn [m k]
+                     (if-let [entry (some-> (get raw k) normalize-var-entry)]
+                       (if (var-entry-expired? entry now)
+                         (do
+                           (delete-raw-vars! store sid' [k])
+                           m)
+                         (assoc m k (var-entry-value entry)))
+                       m))
+                   {}
+                   ks')))))))
 
 (defn put-var!
   ([store sid k v]
    (put-var! store sid k v nil))
   ([store sid k v opts]
    (let [sid' (normalize-session-id sid)
-         k' (validate-var-key! store sid' k)
+         opts' (if (map? opts) opts {})
+         k' (ensure-policy-permitted! store sid' k :put opts')
          _ (ensure-write-permitted! store sid' :put)
          _ (expire-session-vars! store sid')
          existing (keys (normalize-raw-vars-map (read-all-raw-vars store sid')))
          _ (enforce-vars-count-limit! store sid' existing [k'])
          _ (enforce-value-limit! store sid' k' v)
-         entry (make-var-entry store v opts)]
+         entry (make-var-entry store v opts')]
      (if (db-store? store)
        ((:var-setter store) (:db store) sid' k' entry)
        (update-session! store sid'
@@ -809,10 +914,11 @@
    (put-vars! store sid kvs nil))
   ([store sid kvs opts]
    (let [sid' (normalize-session-id sid)
+         opts' (if (map? opts) opts {})
          kvs' (if (map? kvs) kvs {})
          normalized
          (reduce-kv (fn [m k v]
-                      (let [k' (validate-var-key! store sid' k)]
+                      (let [k' (ensure-policy-permitted! store sid' k :put opts')]
                         (enforce-value-limit! store sid' k' v)
                         (assoc m k' v)))
                     {}
@@ -826,7 +932,7 @@
                incoming (keys normalized)
                _ (enforce-vars-count-limit! store sid' existing incoming)
                entries (reduce-kv (fn [m k v]
-                                    (assoc m k (make-var-entry store v opts)))
+                                    (assoc m k (make-var-entry store v opts')))
                                   {}
                                   normalized)]
            (if (db-store? store)
@@ -837,41 +943,49 @@
            true))))))
 
 (defn del-var!
-  [store sid k]
-  (let [sid' (normalize-session-id sid)
-        k'   (validate-var-key! store sid' k)]
-    (ensure-write-permitted! store sid' :del)
-    (expire-session-vars! store sid')
-    (delete-raw-vars! store sid' [k'])
-    true))
+  ([store sid k]
+   (del-var! store sid k nil))
+  ([store sid k opts]
+   (let [sid' (normalize-session-id sid)
+         k'   (ensure-policy-permitted! store sid' k :del opts)]
+     (ensure-write-permitted! store sid' :del)
+     (expire-session-vars! store sid')
+     (delete-raw-vars! store sid' [k'])
+     true)))
 
 (defn del-vars!
-  [store sid ks]
-  (let [sid' (normalize-session-id sid)
-        ks'  (when (sequential? ks)
-               (->> ks
-                    (map #(validate-var-key! store sid' %))
-                    distinct
-                    vec))]
-    (if-not (seq ks')
-      false
-      (do
-        (ensure-write-permitted! store sid' :del)
-        (expire-session-vars! store sid')
-        (delete-raw-vars! store sid' ks')
-        true))))
+  ([store sid ks]
+   (del-vars! store sid ks nil))
+  ([store sid ks opts]
+   (let [sid' (normalize-session-id sid)
+         ks'  (when (sequential? ks)
+                (->> ks
+                     (map #(ensure-policy-permitted! store sid' % :del opts))
+                     distinct
+                     vec))]
+     (if-not (seq ks')
+       false
+       (do
+         (ensure-write-permitted! store sid' :del)
+         (expire-session-vars! store sid')
+         (delete-raw-vars! store sid' ks')
+         true)))))
 
 (defn del-all-vars!
-  [store sid]
-  (let [sid' (normalize-session-id sid)]
-    (ensure-write-permitted! store sid' :del)
-    (expire-session-vars! store sid')
-    (if (db-store? store)
-      ((:var-deleter store) (:db store) sid')
-      (update-session! store sid'
-                       (fn [session]
-                         (assoc session :session/facts {}))))
-    true))
+  ([store sid]
+   (del-all-vars! store sid nil))
+  ([store sid opts]
+   (let [sid' (normalize-session-id sid)]
+     (expire-session-vars! store sid')
+     (doseq [k (keys (normalize-raw-vars-map (read-all-raw-vars store sid')))]
+       (ensure-policy-permitted! store sid' k :del opts))
+     (ensure-write-permitted! store sid' :del)
+     (if (db-store? store)
+       ((:var-deleter store) (:db store) sid')
+       (update-session! store sid'
+                        (fn [session]
+                          (assoc session :session/facts {}))))
+     true)))
 
 (derive ::store-value :ferment.system/value)
 (derive :ferment.session.store/default ::store-value)

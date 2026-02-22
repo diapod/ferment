@@ -14,7 +14,28 @@
    :freeze/allow-delete?    false
    :limits/max-vars         256
    :limits/max-key-chars    191
-   :limits/max-value-bytes  131072}
+   :limits/max-value-bytes  131072
+   :policy/default
+   {:read-namespaces   #{"session" "context"}
+    :write-namespaces  #{"session" "context" "user" "agent" "runtime" "request"}
+    :delete-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}
+   :policy/by-intent
+   {:route/decide  {:read-namespaces #{"session" "context" "request"}}
+    :text/respond  {:read-namespaces #{"session" "context"}}
+    :problem/solve {:read-namespaces #{"session" "context"}}
+    :code/generate {:read-namespaces #{"session" "context"}}
+    :code/patch    {:read-namespaces #{"session" "context"}}
+    :code/explain  {:read-namespaces #{"session" "context"}}
+    :code/review   {:read-namespaces #{"session" "context"}}
+    :eval/grade    {:read-namespaces #{"session" "context"}}}
+   :policy/by-operation
+   {:session/get-var      {:read-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}
+    :session/get-vars     {:read-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}
+    :session/put-var      {:write-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}
+    :session/put-vars     {:write-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}
+    :session/del-var      {:delete-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}
+    :session/del-vars     {:delete-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}
+    :session/del-all-vars {:delete-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}}}
   :max-sessions   4096}
 
  :ferment.session.context/default

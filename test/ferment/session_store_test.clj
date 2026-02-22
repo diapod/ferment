@@ -271,3 +271,67 @@
       (is (true? (session-store/put-var! store "s-limit" :session/a 11)))
       (is (= {:session/a 11 :session/b 2}
              (session-store/get-vars store "s-limit" [:session/a :session/b]))))))
+
+(deftest session-vars-contract-enforces-per-intent-policy
+  (testing "Session vars policy can restrict read/write/delete namespaces per intent."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:keys/require-qualified? true
+                   :keys/allowed-namespaces #{"session" "context"}
+                   :freeze/allow-write? true
+                   :freeze/allow-delete? true
+                   :policy/default {:read-namespaces #{"session" "context"}
+                                    :write-namespaces #{"session" "context"}
+                                    :delete-namespaces #{"session" "context"}}
+                   :policy/by-intent {:text/respond {:read-namespaces #{"session"}
+                                                     :write-namespaces #{"session"}
+                                                     :delete-namespaces #{"session"}}}}})]
+      (session-store/ensure-session! store "s-policy")
+
+      (is (true? (session-store/put-var! store
+                                         "s-policy"
+                                         :context/summary
+                                         "ctx"
+                                         {:intent :route/decide})))
+
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"forbidden by policy"
+           (session-store/put-var! store
+                                   "s-policy"
+                                   :context/summary
+                                   "ctx2"
+                                   {:intent :text/respond})))
+
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"forbidden by policy"
+           (session-store/get-var store
+                                  "s-policy"
+                                  :context/summary
+                                  {:intent :text/respond})))
+
+      (is (= "ctx"
+             (session-store/get-var store
+                                    "s-policy"
+                                    :context/summary
+                                    {:intent :route/decide})))
+
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"forbidden by policy"
+           (session-store/del-var! store
+                                   "s-policy"
+                                   :context/summary
+                                   {:intent :text/respond})))
+
+      (is (true? (session-store/del-var! store
+                                         "s-policy"
+                                         :context/summary
+                                         {:intent :route/decide})))
+      (is (nil? (session-store/get-var store
+                                       "s-policy"
+                                       :context/summary
+                                       {:intent :route/decide}))))))

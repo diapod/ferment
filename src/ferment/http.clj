@@ -167,13 +167,17 @@
                   cap-id   (keywordish (:cap/id routing'))
                   meta?    (->bool (:meta? routing'))
                   strict?  (->bool (:strict? routing'))
-                  force?   (->bool (:force? routing'))]
+                  force?   (->bool (:force? routing'))
+                  debug-plan? (->bool (or (:debug/plan? routing')
+                                          (:debug-plan? routing')
+                                          (get-in routing' [:debug :plan?])))]
               (cond-> routing'
                 (keyword? intent) (assoc :intent intent)
                 (keyword? cap-id) (assoc :cap/id cap-id)
                 (some? meta?) (assoc :meta? meta?)
                 (some? strict?) (assoc :strict? strict?)
-                (some? force?) (assoc :force? force?))))
+                (some? force?) (assoc :force? force?)
+                (some? debug-plan?) (assoc :debug/plan? debug-plan?))))
           (normalize-top
             [request]
             (let [intent (or (some-> request :task :intent keywordish)
@@ -358,6 +362,10 @@
   (when (and (integer? v) (pos? v))
     (int v)))
 
+(defn- request-debug-plan?
+  [request]
+  (true? (get-in request [:routing :debug/plan?])))
+
 (defn- act-request->invoke-opts
   [runtime request cap-id]
   (let [intent (get-in request [:task :intent])
@@ -401,7 +409,86 @@
       (assoc :temperature (:temperature budget))
       (map? auth-user) (assoc :auth/user auth-user)
       (map? (:roles runtime)) (assoc :roles (:roles runtime))
-      (map? session-meta) (assoc :session/meta session-meta))))
+      (map? session-meta) (assoc :session/meta session-meta)
+      (request-debug-plan? request) (assoc :debug/plan? true))))
+
+(def ^:private default-session-vars-keys
+  [:session/language
+   :session/style
+   :session/system-prompt
+   :session/context-summary])
+
+(defn- session-var-value
+  [vars k]
+  (or (get vars k)
+      (get vars (name k))
+      (get vars (str (namespace k) "/" (name k)))))
+
+(defn- session-default-language
+  [vars]
+  (let [raw (session-var-value vars :session/language)]
+    (or (keywordish raw)
+        (trim-s raw))))
+
+(defn- session-default-style
+  [vars]
+  (let [raw (session-var-value vars :session/style)]
+    (or (keywordish raw)
+        (trim-s raw))))
+
+(defn- session-default-system-prompt
+  [vars]
+  (trim-s (session-var-value vars :session/system-prompt)))
+
+(defn- session-default-context-summary
+  [vars]
+  (trim-s (session-var-value vars :session/context-summary)))
+
+(defn- apply-session-var-defaults
+  [request vars]
+  (let [lang'   (session-default-language vars)
+        style'  (session-default-style vars)
+        system' (session-default-system-prompt vars)
+        summary' (session-default-context-summary vars)]
+    (cond-> request
+      (and (some? lang')
+           (nil? (get-in request [:constraints :language])))
+      (assoc-in [:constraints :language] lang')
+
+      (and (some? style')
+           (nil? (get-in request [:constraints :style])))
+      (assoc-in [:constraints :style] style')
+
+      (and (some? system')
+           (nil? (get-in request [:input :system])))
+      (assoc-in [:input :system] system')
+
+      (and (some? summary')
+           (nil? (get-in request [:context :summary])))
+      (assoc-in [:context :summary] summary'))))
+
+(defn- request-with-session-defaults
+  [runtime request]
+  (let [service (when (map? runtime) (:session runtime))
+        sid     (or (some-> request :session/id trim-s)
+                    (some-> request :session-id trim-s))
+        intent  (some-> request :task :intent keywordish)
+        opts    (cond-> {:operation :act/defaults}
+                  (keyword? intent) (assoc :intent intent))]
+    (if (and (map? request)
+             (map? service)
+             (fn? (:get-vars! service))
+             sid)
+      (let [vars (try
+                   (session/get-vars! service sid default-session-vars-keys opts)
+                   (catch clojure.lang.ArityException _
+                     (session/get-vars! service sid default-session-vars-keys))
+                   (catch Throwable _
+                     nil))]
+        (if (map? vars)
+          (apply-session-var-defaults request vars)
+          request))
+      request)))
 
 (defn- response-error-type
   [response]
@@ -459,6 +546,51 @@
                          (seq (:user/roles principal))
                          (assoc :principal-roles (vec (:user/roles principal))))))))))
 
+(defn- invocation->participant
+  [invocation]
+  (when (map? invocation)
+    (let [role      (keywordish (:role invocation))
+          intent    (keywordish (:intent invocation))
+          cap-id    (keywordish (:cap/id invocation))
+          model-key (keywordish (:model-key invocation))
+          model-id  (trim-s (:model invocation))]
+      (cond-> {}
+        (keyword? role) (assoc :role role)
+        (keyword? intent) (assoc :intent intent)
+        (keyword? cap-id) (assoc :cap/id cap-id)
+        (keyword? model-key) (assoc :model-key model-key)
+        (some? model-id) (assoc :model model-id)))))
+
+(defn- slot-invocation
+  [slot]
+  (or (when (map? slot) (:invoke/meta slot))
+      (when (map? slot) (get-in slot [:result :invoke/meta]))))
+
+(defn- collect-response-participants
+  [body]
+  (let [top-invocation (or (:invoke/meta body)
+                           (get-in body [:result :invoke/meta]))
+        run-participants (or (get-in body [:result :plan/run :participants]) [])
+        run-env        (or (get-in body [:result :plan/run :env]) {})
+        run-invocations (if (map? run-env)
+                          (keep slot-invocation (vals run-env))
+                          [])
+        participants   (->> (concat [top-invocation] run-participants run-invocations)
+                            (keep invocation->participant)
+                            distinct
+                            vec)]
+    participants))
+
+(defn- attach-response-participants
+  [response]
+  (let [body (if (map? response) (:body response) nil)
+        participants (if (map? body)
+                       (collect-response-participants body)
+                       [])]
+    (if (seq participants)
+      (assoc-in response [:body :models/used] participants)
+      response)))
+
 (defn- keyword-vec
   [v]
   (->> (cond
@@ -482,11 +614,161 @@
       (some? same-cap-max) (assoc :same-cap-max same-cap-max)
       (some? fallback-max) (assoc :fallback-max fallback-max))))
 
+(def ^:private tool-call-tag-pattern
+  #"(?is)<tool_call\b[^>]*>\s*(\{.*?\})\s*</tool_call>")
+
+(def ^:private route-tool-call-names
+  #{"solve_question" "ask_solver" "route_to_solver"})
+
+(defn- parse-structured-text
+  [s]
+  (when (string? s)
+    (let [s' (trim-s s)]
+      (when s'
+        (or (try
+              (json/parse-string s' true)
+              (catch Throwable _ nil))
+            (try
+              (edn/read-string s')
+              (catch Throwable _ nil)))))))
+
+(defn- parse-tool-call-arguments
+  [v]
+  (cond
+    (map? v) v
+    (string? v) (or (parse-structured-text v) {})
+    :else {}))
+
+(defn- extract-tool-call
+  [text]
+  (when (string? text)
+    (when-some [[_ payload] (re-find tool-call-tag-pattern text)]
+      (let [parsed (parse-structured-text payload)]
+        (when (map? parsed) parsed)))))
+
+(defn- route-tool-call-question
+  [tool-call]
+  (when (map? tool-call)
+    (let [name' (or (trim-s (:name tool-call))
+                    (trim-s (get tool-call "name")))
+          args  (parse-tool-call-arguments
+                 (or (:arguments tool-call)
+                     (get tool-call "arguments")))
+          q     (or (trim-s (:question args))
+                    (trim-s (get args "question"))
+                    (trim-s (:prompt args))
+                    (trim-s (get args "prompt"))
+                    (trim-s (:query args))
+                    (trim-s (get args "query")))]
+      (when (and (some? name')
+                 (contains? route-tool-call-names name')
+                 (some? q))
+        q))))
+
+(defn- route-request-prompt
+  [request]
+  (or (trim-s (get-in request [:input :request :input :prompt]))
+      (trim-s (get-in request [:input :request :input :text]))
+      (trim-s (get-in request [:input :request :input :content]))
+      (trim-s (get-in request [:input :request :prompt]))
+      (trim-s (get-in request [:input :request :text]))
+      (trim-s (get-in request [:input :request :content]))
+      (trim-s (get-in request [:input :prompt]))
+      (trim-s (get-in request [:input :text]))
+      (trim-s (get-in request [:input :content]))
+      (trim-s (:prompt request))))
+
+(defn- route-solver->voice-plan
+  [user-prompt]
+  {:nodes [{:op :call
+            :intent :problem/solve
+            :cap/id :llm/solver
+            :input {:prompt user-prompt}
+            :as :solver}
+           {:op :call
+            :intent :text/respond
+            :cap/id :llm/voice
+            :input {:prompt {:slot/id [:solver :out :text]}}
+            :as :voice}
+           {:op :emit
+            :input {:slot/id [:voice :out]}}]})
+
+(defn- route-solver->voice-plan?
+  [plan]
+  (let [nodes (when (map? plan) (:nodes plan))
+        [node0 node1 node2] (if (vector? nodes) nodes [])]
+    (and (= 3 (count nodes))
+         (= :call (:op node0))
+         (= :problem/solve (:intent node0))
+         (= :llm/solver (:cap/id node0))
+         (= :solver (:as node0))
+         (= :call (:op node1))
+         (= :text/respond (:intent node1))
+         (= :llm/voice (:cap/id node1))
+         (= :voice (:as node1))
+         (= [:solver :out :text] (get-in node1 [:input :prompt :slot/id]))
+         (= :emit (:op node2))
+         (= [:voice :out] (get-in node2 [:input :slot/id])))))
+
+(defn- invalid-route-decide-result
+  [request]
+  {:proto  (request-proto request)
+   :trace  (request-trace request)
+   :result {:type :value}})
+
+(defn- route-decide-result-parser
+  [text {:keys [request mode]}]
+  (let [text'      (trim-s text)
+        parsed     (parse-structured-text text')
+        route-plan* (cond
+                      (map? (:plan parsed))
+                      (:plan parsed)
+
+                      (map? (get-in parsed [:result :plan]))
+                      (get-in parsed [:result :plan])
+
+                      :else nil)
+        route-plan (when (route-solver->voice-plan? route-plan*)
+                     route-plan*)
+        tool-call  (extract-tool-call text')
+        prompt'    (if (map? tool-call)
+                     (route-tool-call-question tool-call)
+                     (route-request-prompt request))]
+    (cond
+      (map? route-plan)
+      {:proto  (request-proto request)
+       :trace  (request-trace request)
+       :result {:type :plan
+                :plan route-plan
+                :usage {:mode mode}}}
+
+      (and (map? tool-call) (nil? prompt'))
+      (invalid-route-decide-result request)
+
+      (some? prompt')
+      {:proto  (request-proto request)
+       :trace  (request-trace request)
+       :result {:type :plan
+                :plan (route-solver->voice-plan prompt')
+                :usage {:mode mode}}}
+
+      :else
+      (invalid-route-decide-result request))))
+
 (defn- routing-config
   [request]
   (if (map? (:routing request))
     (:routing request)
     {}))
+
+(defn- meta-routing-target-intent
+  [request]
+  (or (some-> request :task :intent keywordish)
+      :text/respond))
+
+(defn- meta-routing-supported-intent?
+  [request]
+  (= :text/respond (meta-routing-target-intent request)))
 
 (defn- meta-routing-enabled?
   [runtime request]
@@ -594,6 +876,8 @@
      :session-version (:session/version request)
      :auth/user (:auth/user request)
      :roles (:roles runtime)
+     :debug/plan? (request-debug-plan? request)
+     :result-parser route-decide-result-parser
      :resolver resolver}))
 
 (defn- maybe-apply-meta-routing
@@ -609,6 +893,14 @@
        :strict? strict?
        :attempted? false
        :reason :meta-disabled}
+
+      (not (meta-routing-supported-intent? request))
+      {:request request
+       :mode :none
+       :enabled? true
+       :strict? strict?
+       :attempted? false
+       :reason :meta-intent-unsupported}
 
       (= route-intent (get-in request [:task :intent]))
       {:request request
@@ -674,7 +966,7 @@
                                        :route/decide-failed
                                        (.getMessage e)
                                        (select-keys (or (ex-data e) {})
-                                                    [:error :reason :failure/type])
+                                                    [:error :reason :failure/type :attempts :last-check])
                                        true)}
                 {:request request
                  :mode :none
@@ -736,12 +1028,14 @@
          auth-session-id (or (some-> auth-session :session/id trim-s)
                              (some-> auth-session :id trim-s))
          request0  (coerce-act-request payload)
-         request   (cond-> request0
+         request1  (cond-> request0
                      (map? auth-user) (assoc :auth/user auth-user)
                      (keyword? auth-source-k) (assoc :auth/source auth-source-k)
-                     (and auth-session-id
+                     (and (map? request0)
+                          auth-session-id
                           (nil? (:session/id request0)))
                      (assoc :session/id auth-session-id))
+         request   (request-with-session-defaults runtime request1)
          protocol (or (:protocol runtime) {})
          resolver (effective-resolver runtime)
          req-check (contracts/validate-request protocol request)
@@ -878,11 +1172,16 @@
                                                 (.getMessage e)
                                                 (select-keys data [:tool/id :known-tools]))}
 
-                       {:status 502
-                        :body   (error-envelope request*
-                                                :runtime/invoke-failed
-                                                (.getMessage e)
-                                                (select-keys data [:error :reason]))})))
+                       (let [invoke-response (:invoke-response data)
+                             details' (merge (select-keys data [:error :reason :cap-id :intent :model-key :session/id])
+                                             (when (map? invoke-response)
+                                               (select-keys invoke-response [:error :message :details])))]
+                         {:status 502
+                          :body   (error-envelope request*
+                                                  :runtime/invoke-failed
+                                                  (.getMessage e)
+                                                  (when (seq details')
+                                                    details'))}))))
                  (catch Throwable t
                    {:status 500
                     :body   (error-envelope request*
@@ -912,10 +1211,11 @@
          response'   (if (and (map? (:body response))
                               (map? session-view))
                        (update response :body merge session-view)
-                       response)]
-     (record-act-telemetry! telemetry response' elapsed-ms route-telemetry)
-     (report-act! runtime request* response' auth elapsed-ms)
-     response')))
+                       response)
+         response''  (attach-response-participants response')]
+     (record-act-telemetry! telemetry response'' elapsed-ms route-telemetry)
+     (report-act! runtime request* response'' auth elapsed-ms)
+     response'')))
 
 (def ^:private session-public-keys
   [:session/id
@@ -942,6 +1242,154 @@
   (when (map? session-state)
     (select-keys session-state session-public-keys)))
 
+(defn- session-var-key
+  [payload]
+  (or (some-> payload :key keywordish)
+      (some-> payload :var/key keywordish)
+      (some-> payload :k keywordish)))
+
+(defn- session-var-keys
+  [payload]
+  (let [ks (or (:keys payload)
+               (:var/keys payload))]
+    (when (or (set? ks) (sequential? ks))
+      (->> ks
+           (keep keywordish)
+           distinct
+           vec))))
+
+(defn- session-var-pairs
+  [payload]
+  (let [pairs (or (:vars payload)
+                  (:kvs payload))]
+    (when (map? pairs)
+      (->> pairs
+           (reduce-kv (fn [m k v]
+                        (if-some [k' (keywordish k)]
+                          (assoc m k' v)
+                          m))
+                      {})
+           not-empty))))
+
+(defn- session-var-value-present?
+  [payload]
+  (or (contains? payload :value)
+      (contains? payload :var/value)))
+
+(defn- session-var-value-from-payload
+  [payload]
+  (if (contains? payload :value)
+    (:value payload)
+    (:var/value payload)))
+
+(defn- session-action
+  [payload]
+  (some-> payload :action keywordish))
+
+(defn- session-var-op-opts
+  [payload action opts]
+  (let [opts'  (if (map? opts) opts {})
+        intent (or (some-> opts' :intent keywordish)
+                   (some-> payload :intent keywordish))
+        op     (or (some-> opts' :operation keywordish)
+                   action)]
+    (cond-> opts'
+      (keyword? intent) (assoc :intent intent)
+      (keyword? op) (assoc :operation op))))
+
+(defn- session-op-var-keys
+  [action payload]
+  (let [keys* (case action
+                (:session/get-var :session/put-var :session/del-var)
+                (some-> (session-var-key payload) vector)
+
+                (:session/get-vars :session/del-vars)
+                (session-var-keys payload)
+
+                :session/put-vars
+                (some-> (session-var-pairs payload) keys vec)
+
+                nil)]
+    (when (seq keys*)
+      (->> keys* (keep keywordish) distinct sort vec))))
+
+(defn- report-session!
+  [runtime payload response auth elapsed-ms]
+  (let [logger (oplog/logger :act runtime)]
+    (when (fn? logger)
+      (let [principal  (audit-principal auth payload)
+            action     (session-action payload)
+            status     (int (or (:status response) 500))
+            outcome    (response-outcome response)
+            error-type (response-error-type response)
+            message    (or (some-> response :body :message trim-s)
+                           (some-> response :body :error :message trim-s)
+                           (when (= :ok outcome) "Session request processed.")
+                           "Session request failed.")
+            sid        (session-id-from-payload payload)
+            trace-id   (some-> payload :trace :id trim-s)
+            request-id (some-> payload :request/id trim-s)
+            var-keys   (session-op-var-keys action payload)]
+        (apply logger
+               (mapcat identity
+                       (cond-> {:endpoint "/v1/session"
+                                :operation action
+                                :trace-id trace-id
+                                :request-id request-id
+                                :session-id sid
+                                :outcome outcome
+                                :status status
+                                :error-type error-type
+                                :latency-ms elapsed-ms
+                                :message message}
+                         (seq var-keys) (assoc :session/var-keys var-keys)
+                         (some? (:user/id principal))
+                         (assoc :principal-id (:user/id principal))
+                         (some? (:user/email principal))
+                         (assoc :principal-email (:user/email principal))
+                         (some? (:user/account-type principal))
+                         (assoc :principal-account-type (:user/account-type principal))
+                         (seq (:user/roles principal))
+                         (assoc :principal-roles (vec (:user/roles principal))))))))))
+
+(defn- session-op-error-status
+  [error-k]
+  (case error-k
+    :session.vars/policy-read-forbidden 403
+    :session.vars/policy-write-forbidden 403
+    :session.vars/policy-delete-forbidden 403
+    :session.vars/session-frozen 409
+    :session.vars/limit-exceeded 409
+    :session.vars/key-too-long 422
+    :session.vars/value-too-large 422
+    :session.vars/key-namespace-forbidden 422
+    400))
+
+(defn- session-op-error-response
+  [e]
+  (let [data (or (ex-data e) {})
+        err-k (or (some-> (:error data) keywordish)
+                  :runtime/internal)
+        details (when (map? data)
+                  (dissoc data :error))]
+    {:status (session-op-error-status err-k)
+     :body (cond-> {:ok? false
+                    :error err-k
+                    :message (.getMessage e)}
+             (seq details) (assoc :details details))}))
+
+(defn- with-session-op
+  [f]
+  (try
+    (f)
+    (catch clojure.lang.ExceptionInfo e
+      (session-op-error-response e))
+    (catch Throwable t
+      {:status 500
+       :body {:ok? false
+              :error :runtime/internal
+              :message (.getMessage t)}})))
+
 (defn- session-action-response
   [runtime payload]
   (let [action      (keywordish (:action payload))
@@ -950,6 +1398,7 @@
                         (:model-id payload)
                         (:model/id payload))
         opts        (if (map? (:opts payload)) (:opts payload) {})
+        var-opts    (session-var-op-opts payload action opts)
         service     (runtime-session-service runtime)]
     (case action
       :state
@@ -1032,6 +1481,110 @@
                 :error :input/invalid
                 :message "Missing session service in runtime."}})
 
+      :session/get-var
+      (let [k (session-var-key payload)]
+        (if (and service session-id (keyword? k))
+          (with-session-op
+            (fn []
+              {:status 200
+               :body {:ok? true
+                      :session/id session-id
+                      :key k
+                      :value (session/get-var! service session-id k var-opts)}}))
+          {:status 400
+           :body {:ok? false
+                  :error :input/invalid
+                  :message "Missing required keys: :session/id and :key (keyword-like)."}}))
+
+      :session/get-vars
+      (let [ks (session-var-keys payload)]
+        (if (and service session-id (seq ks))
+          (with-session-op
+            (fn []
+              {:status 200
+               :body {:ok? true
+                      :session/id session-id
+                      :keys ks
+                      :vars (session/get-vars! service session-id ks var-opts)}}))
+          {:status 400
+           :body {:ok? false
+                  :error :input/invalid
+                  :message "Missing required keys: :session/id and :keys (sequential keyword-like values)."}}))
+
+      :session/put-var
+      (let [k (session-var-key payload)
+            value-present? (session-var-value-present? payload)
+            value' (session-var-value-from-payload payload)]
+        (if (and service session-id (keyword? k) value-present?)
+          (with-session-op
+            (fn []
+              {:status 200
+               :body {:ok? true
+                      :session/id session-id
+                      :key k
+                      :written? (session/put-var! service session-id k value' var-opts)}}))
+          {:status 400
+           :body {:ok? false
+                  :error :input/invalid
+                  :message "Missing required keys: :session/id, :key and :value."}}))
+
+      :session/put-vars
+      (let [vars' (session-var-pairs payload)]
+        (if (and service session-id (map? vars') (seq vars'))
+          (with-session-op
+            (fn []
+              {:status 200
+               :body {:ok? true
+                      :session/id session-id
+                      :written? (session/put-vars! service session-id vars' var-opts)}}))
+          {:status 400
+           :body {:ok? false
+                  :error :input/invalid
+                  :message "Missing required keys: :session/id and :vars (map with keyword-like keys)."}}))
+
+      :session/del-var
+      (let [k (session-var-key payload)]
+        (if (and service session-id (keyword? k))
+          (with-session-op
+            (fn []
+              {:status 200
+               :body {:ok? true
+                      :session/id session-id
+                      :key k
+                      :deleted? (session/del-var! service session-id k var-opts)}}))
+          {:status 400
+           :body {:ok? false
+                  :error :input/invalid
+                  :message "Missing required keys: :session/id and :key (keyword-like)."}}))
+
+      :session/del-vars
+      (let [ks (session-var-keys payload)]
+        (if (and service session-id (seq ks))
+          (with-session-op
+            (fn []
+              {:status 200
+               :body {:ok? true
+                      :session/id session-id
+                      :keys ks
+                      :deleted? (session/del-vars! service session-id ks var-opts)}}))
+          {:status 400
+           :body {:ok? false
+                  :error :input/invalid
+                  :message "Missing required keys: :session/id and :keys (sequential keyword-like values)."}}))
+
+      :session/del-all-vars
+      (if (and service session-id)
+        (with-session-op
+          (fn []
+            {:status 200
+             :body {:ok? true
+                    :session/id session-id
+                    :deleted? (session/del-all-vars! service session-id var-opts)}}))
+        {:status 400
+         :body {:ok? false
+                :error :input/invalid
+                :message "Missing required key: :session/id."}})
+
       {:status 400
        :body {:ok? false
               :error :input/invalid
@@ -1041,7 +1594,11 @@
                                      :worker/thaw :worker/freeze
                                      :session/open :session/get
                                      :session/thaw :session/freeze
-                                     :session/list}}}})))
+                                     :session/list
+                                     :session/get-var :session/get-vars
+                                     :session/put-var :session/put-vars
+                                     :session/del-var :session/del-vars
+                                     :session/del-all-vars}}}})))
 
 (def ^:private admin-action-aliases
   {:create-user            :admin/create-user
@@ -1830,21 +2387,35 @@
                            (encode-response {:ok? false
                                              :error :method-not-allowed
                                              :allowed ["POST"]}))
-          (let [ctype         (content-type exchange)
-                body-str      (read-body exchange)
-                auth-payload  (safe-decode-request-body body-str ctype)]
-            (if-some [{:keys [status body headers]} (authorize-request runtime exchange auth-payload :http.v1/session)]
-              (write-response! exchange status (encode-response body) headers)
+          (let [started-at   (System/nanoTime)
+                ctype        (content-type exchange)
+                body-str     (read-body exchange)
+                auth-payload (safe-decode-request-body body-str ctype)
+                authn        (authenticate-request runtime exchange auth-payload :http.v1/session)]
+            (if-not (:ok? authn)
+              (let [{:keys [status body headers]} (:response authn)
+                    response {:status status :body body}
+                    elapsed-ms (nanos->millis started-at)]
+                (report-session! runtime auth-payload response (:auth authn) elapsed-ms)
+                (write-response! exchange status (encode-response body) headers))
               (try
                 (let [payload (decode-request-body body-str ctype)
-                      {:keys [status body]} (session-action-response runtime payload)]
-                  (write-response! exchange status (encode-response body)))
-                (catch Throwable t
+                      response (session-action-response runtime payload)
+                      elapsed-ms (nanos->millis started-at)]
+                  (report-session! runtime payload response (:auth authn) elapsed-ms)
                   (write-response! exchange
-                                   500
-                                   (encode-response {:ok? false
-                                                     :error :runtime/internal
-                                                     :message (.getMessage t)})))))))))))
+                                   (:status response)
+                                   (encode-response (:body response))))
+                (catch Throwable t
+                  (let [response {:status 500
+                                  :body {:ok? false
+                                         :error :runtime/internal
+                                         :message (.getMessage t)}}
+                        elapsed-ms (nanos->millis started-at)]
+                    (report-session! runtime auth-payload response (:auth authn) elapsed-ms)
+                    (write-response! exchange
+                                     500
+                                     (encode-response (:body response)))))))))))))
 
 (defn- admin-handler
   [runtime]
