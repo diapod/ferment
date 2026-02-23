@@ -1,64 +1,64 @@
-# Domenowy Backlog
+# Domain Backlog
 
-Stan: po wdrożeniu kontraktów, sesji, RBAC/effects i flow `/v1/act`.
+Status: after delivering contracts, sessions, RBAC/effects, and `/v1/act` flow.
 
-## Priorytety
+## Priorities
 
-1. [x] Per-intent quality tuning (operacyjnie)
-   - Dostrajać `:done`, `:checks`, `judge` i prompty per-intent w `resources/config/common/prod/protocol.edn`.
-   - Cel: mniej retry/fallback i stabilniejsze wyniki `meta -> solver -> voice`.
-   - Wdrożone:
-     - prompty systemowe dla `:route/decide`, `:context/summarize`, `:problem/solve`, `:code/*`, `:eval/grade`,
-     - doprecyzowane limity `:constraints/:max-chars` per intent,
-     - korekta polityk jakości dla intentów kodowych (`:checks` i `:done`) oraz defaultowego `:done/:should`.
+1. [x] Per-intent quality tuning (operational)
+   - Tune `:done`, `:checks`, `judge`, and per-intent prompts in `resources/config/common/prod/protocol.edn`.
+   - Goal: fewer retries/fallbacks and more stable `meta -> solver -> voice` behavior.
+   - Delivered:
+     - system prompts for `:route/decide`, `:context/summarize`, `:problem/solve`, `:code/*`, `:eval/grade`,
+     - refined per-intent `:constraints/:max-chars` limits,
+     - quality policy updates for coding intents (`:checks` and `:done`) and default `:done/:should`.
 
-2. [x] Polityka routingu jako decyzja produktowa
-   - Ustalić domyślne `routing.meta?`, `routing.strict?`, `routing.force?` dla `dev/test-live/prod`.
-   - Określić, kiedy fail-open vs fail-closed.
-   - Cel: przewidywalne zachowanie `/v1/act`.
-   - Wdrożone:
+2. [x] Routing policy as a product decision
+   - Define default `routing.meta?`, `routing.strict?`, `routing.force?` for `dev/test-live/prod`.
+   - Define when to fail-open vs fail-closed.
+   - Goal: predictable `/v1/act` behavior.
+   - Delivered:
      - `resources/config/common/prod/router.edn`: `:defaults {:meta? true :strict? false :force? false :on-error :fail-open}`,
      - `resources/config/common/dev/router.edn`: `:defaults {:meta? true :strict? true :force? false :on-error :fail-closed}`,
      - `resources/config/common/test-live/router.edn`: `:defaults {:meta? true :strict? false :force? false :on-error :fail-open}`,
-     - runtime HTTP korzysta z efektywnej konfiguracji (merge `router/defaults` + request `:routing`),
-     - semantyka błędu routingu: `:on-error :fail-closed` => 502, `:on-error :fail-open` => fallback do statycznego routingu,
-     - request może nadpisać `:on-error` i wymusić tryb inny niż default profilu.
+     - HTTP runtime uses effective config (`router/defaults` + request `:routing`),
+     - routing error semantics: `:on-error :fail-closed` => 502, `:on-error :fail-open` => fallback to static routing,
+     - request-level `:on-error` can override profile defaults.
 
-3. [x] Kontrakt pamięci roboczej sesji
-   - Uporządkować namespace'y session-vars (co wolno zapisywać, co automatycznie trafia do kontekstu).
-   - Doprecyzować TTL i zasady freeze/thaw dla klas danych.
-   - Cel: spójna pamięć kontekstowa bez przecieków semantycznych.
-   - Wdrożone:
-     - kontrakt `session-vars` rozszerzony o `:class/default`, `:class/by-namespace`, `:class/policy` (TTL i freeze policy per klasa danych),
-     - `put/del` przy zamrożonej sesji sprawdzają uprawnienia per klucz/klasę (z fallbackiem do globalnych `:freeze/*`),
-     - TTL zmiennej jest wyliczane per klasa danych (`:ttl/default-ms` / `:ttl/max-ms`) z możliwością nadpisania `:ttl-ms` w opcji zapisu,
-     - kontrakt wspiera `:request/default-bindings`, które deklaratywnie określają jakie `session-vars` automatycznie wstrzykiwać do requestu (`:constraints`, `:input`, `:context`),
-     - `/v1/act` czyta bindingi z kontraktu store zamiast z hardcodowanej listy kluczy.
+3. [x] Working-memory session contract
+   - Standardize session-vars namespaces (what can be written, what is auto-injected into context).
+   - Clarify TTL and freeze/thaw rules by data class.
+   - Goal: coherent contextual memory without semantic leakage.
+   - Delivered:
+     - `session-vars` contract extended with `:class/default`, `:class/by-namespace`, `:class/policy` (TTL and freeze policy by data class),
+     - frozen-session `put/del` now checks permissions by key/class (with fallback to global `:freeze/*`),
+     - variable TTL is computed per data class (`:ttl/default-ms` / `:ttl/max-ms`) with optional per-write `:ttl-ms` override,
+     - contract supports `:request/default-bindings` for declarative auto-injection of `session-vars` into request paths (`:constraints`, `:input`, `:context`),
+     - `/v1/act` reads bindings from store contract instead of a hardcoded key list.
 
-4. [x] Polityka ról i efektów na planach narzędziowych
-   - Dopracować macierz `role -> operation/effect` (szczególnie `:process/run`, `:net/http`, `:fs/write`).
-   - Dopiąć scenariusze graniczne i jednoznaczne kody błędów.
-   - Cel: jeden model autoryzacji end-to-end w całym planie wykonania.
-   - Wdrożone:
-     - produkcyjna polityka ról przestawiona na `:authorize-default? false` (default-deny dla nieznanych operacji/efektów),
-     - ujednolicenie kodu błędu dla braku deklaracji efektów w `:tool` (`:effects/invalid-input` + `:reason :effects/not-declared`),
-     - testy graniczne dla `workflow`, `effects`, `http` i `roles` pod kątem autoryzacji efektów i mapowania kodów błędów.
+4. [x] Role/effect policy for tool plans
+   - Refine the `role -> operation/effect` matrix (especially `:process/run`, `:net/http`, `:fs/write`).
+   - Close edge-case scenarios and enforce unambiguous error codes.
+   - Goal: one authorization model end-to-end for the full execution plan.
+   - Delivered:
+     - production role policy switched to `:authorize-default? false` (default-deny for unknown operations/effects),
+     - unified error code for missing effect declaration in `:tool` (`:effects/invalid-input` + `:reason :effects/not-declared`),
+     - edge-case tests added for `workflow`, `effects`, `http`, and `roles` around effect authorization and error mapping.
 
-5. [x] Konsolidacja telemetrii jakości
-   - Ustalić kanoniczne KPI: parse-rate, retry-rate, fallback-rate, judge pass-rate, failure taxonomy dla `/v1/act`.
-   - Cel: sterowanie tuningiem na metrykach.
-   - Wdrożone:
-     - `/diag/telemetry` zwraca gałąź `:kpi` z metrykami: `:parse-rate`, `:retry-rate`, `:fallback-rate`, `:judge-pass-rate`,
-     - `:kpi/:failure-taxonomy` agreguje błędy po typie (`:by-type`) i domenie (`:by-domain`),
-     - workflow telemetry rozszerzone o `:quality/judge-pass` i `:quality/judge-fail`,
-     - testy regresji KPI/taxonomy dla `http`, `workflow` i endpointu diagnostycznego.
+5. [x] Quality telemetry consolidation
+   - Define canonical KPIs: parse-rate, retry-rate, fallback-rate, judge pass-rate, failure taxonomy for `/v1/act`.
+   - Goal: drive tuning from metrics.
+   - Delivered:
+     - `/diag/telemetry` now returns `:kpi` branch with `:parse-rate`, `:retry-rate`, `:fallback-rate`, `:judge-pass-rate`,
+     - `:kpi/:failure-taxonomy` aggregates errors by type (`:by-type`) and by domain (`:by-domain`),
+     - workflow telemetry extended with `:quality/judge-pass` and `:quality/judge-fail`,
+     - KPI/taxonomy regression tests added for `http`, `workflow`, and diagnostics endpoint.
 
-6. [x] Pakiety promptów dla ról
-   - Dopracować prompty systemowe `meta`, `solver`, `voice` pod kontrakty (bez `<think>`, mniej driftu formatu).
-   - Cel: mniejsza halucynacja i lepsza zgodność z protokołem w trybie live.
-   - Wdrożone:
-     - `resources/config/common/prod/protocol.edn` ma pakiety promptów pod `:prompts/:default`, `:prompts/:roles`, `:prompts/:intents`,
-     - intencje `:route/decide`, `:context/summarize`, `:text/respond`, `:problem/solve` korzystają z pakietów zamiast długich promptów inline,
-     - budowanie promptu w runtime wspiera kompozycję `default + role + intent` (z zachowaniem kompatybilnego override przez `:system` i `:system/prompt`),
-     - testy regresji pokrywają zarówno kompozycję pakietów, jak i legacy override,
-     - tuning operacyjny iteracja 2: zaostrzone prompty i limity znaków dla `route/decide`, `context/summarize`, `text/respond`, `problem/solve` oraz twarde `:no-list-expansion` dla `text/respond`.
+6. [x] Role prompt packages
+   - Refine system prompts for `meta`, `solver`, `voice` against contracts (no `<think>`, less format drift).
+   - Goal: lower hallucination rate and better protocol conformance in live mode.
+   - Delivered:
+     - `resources/config/common/prod/protocol.edn` includes prompt packages under `:prompts/:default`, `:prompts/:roles`, `:prompts/:intents`,
+     - intents `:route/decide`, `:context/summarize`, `:text/respond`, `:problem/solve` use prompt packages instead of long inline prompts,
+     - runtime prompt builder supports composition `default + role + intent` while keeping full override compatibility via `:system` and `:system/prompt`,
+     - regression tests cover both package composition and legacy overrides,
+     - operational tuning iteration 2: stricter prompts and output limits for `route/decide`, `context/summarize`, `text/respond`, `problem/solve`, plus hard `:no-list-expansion` for `text/respond`.

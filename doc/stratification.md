@@ -1,121 +1,121 @@
-# Stratyfikacja wywołań (LLM i non-LLM) przez capabilities + IR + aplikator jakości
+# Stratification of Calls (LLM and non-LLM) via capabilities + IR + quality applicator
 
-Poniższe założenia i wnioski opisują architekturę „stratified design” dla systemu wieloagentowego, w którym:
-- jednostki wykonawcze mogą być LLM-ami lub solverami nie-LLM,
-- wywołania mogą się zagnieżdżać dowolnie głęboko (A→B→C→…),
-- delegacja jest *late-bound* (lazy aplikator może zmienić wykonawcę, gdy adres/capability jest niedostępny),
-- routing jest **quality-aware** (fallback również na podstawie jakości, nie tylko dostępności/latencji).
+The assumptions and conclusions below describe a stratified design architecture for a multi-agent system where:
+- execution units can be LLMs or non-LLM solvers,
+- calls can nest to arbitrary depth (A->B->C->...),
+- delegation is *late-bound* (lazy applicator may switch executor when address/capability is unavailable),
+- routing is **quality-aware** (fallback based on quality, not only availability/latency).
 
-## 1) Kluczowe założenia
+## 1) Key assumptions
 
-### 1.1. Abstrakcja: „wszystko jest capability”
-Każdy wykonawca (LLM, silnik szachowy, parser, SAT solver, test runner) jest opakowany jako **capability** o zunifikowanym interfejsie wywołania.
+### 1.1. Abstraction: "everything is a capability"
+Each executor (LLM, chess engine, parser, SAT solver, test runner) is wrapped as a **capability** with a unified invocation interface.
 
-- Wnętrze wykonawcy nie jest istotne dla warstwy wyższej.
-- Istotne są: typ wejścia/wyjścia, kontrakty, koszty, polityki.
+- Internal implementation is irrelevant to higher layers.
+- Relevant parts are input/output type, contracts, cost, and policies.
 
-**Konsekwencja:** LLM i non-LLM są wymienialne w tym samym mechanizmie delegacji.
+**Consequence:** LLM and non-LLM executors are interchangeable within one delegation mechanism.
 
-### 1.2. Jedna konwencja wywołania: `invoke(cap, ctx, req) -> result`
-- `cap` – uchwyt do capability (nie „nazwa modelu”, tylko wartość/capability-id + meta).
-- `ctx` – kontekst wykonania (trace, budżet, call stack, cache policy, dostępność).
-- `req` – request zawsze **strukturalny**, nie „goły prompt”.
+### 1.2. One invocation convention: `invoke(cap, ctx, req) -> result`
+- `cap` - capability handle (not a model name; a value/capability-id + metadata).
+- `ctx` - execution context (trace, budget, call stack, cache policy, availability).
+- `req` - always a **structured** request, not a raw prompt.
 
-**Konsekwencja:** system skaluje się na dowolną głębokość wywołań i heterogenicznych wykonawców.
+**Consequence:** system scales to arbitrary call depth and heterogeneous executors.
 
-### 1.3. Stratyfikacja przez IR: program jako dane (AST/Plan)
-Zamiast „tekstu z dziurami” używamy IR (np. EDN), gdzie odpowiedź/rozwiązanie jest reprezentowane jako **AST** zawierające węzły wywołań (`CallNode`).
+### 1.3. Stratification by IR: program as data (AST/Plan)
+Instead of "text with holes", use IR (for example EDN), where answer/solution is represented as an **AST** containing call nodes (`CallNode`).
 
-**Konsekwencja:** delegacja i składanie wyników jest deterministyczne, walidowalne i debugowalne.
+**Consequence:** delegation and composition are deterministic, validatable, and debuggable.
 
-### 1.4. Wynik ma jeden z kształtów: `Value | Plan | Stream`
-Każde capability może zwrócić:
-- `Value` – gotową wartość w schemacie wyjścia,
-- `Plan` – kolejny plan do wykonania (rekurencja; A→B→C bez specjalnych case’ów),
-- `Stream` – opcjonalnie: inkrementalne wyniki (dla równoległości/latencji).
+### 1.4. Result has one of the forms: `Value | Plan | Stream`
+Every capability can return:
+- `Value` - final value in output schema,
+- `Plan` - next plan to execute (recursion; A->B->C without special cases),
+- `Stream` - optional incremental results (for latency/concurrency).
 
-**Konsekwencja:** nie potrzebujesz osobnego mechanizmu dla „agentów”; capability może być kompilatorem (zwraca Plan) lub solverem (zwraca Value).
+**Consequence:** no separate mechanism is required for "agents"; a capability can be a compiler (returns Plan) or solver (returns Value).
 
-### 1.5. Aplikator (runtime) jest ewaluatorem (eval/apply)
-Runtime wykonuje IR:
-- wykrywa `CallNode`,
-- rozwiązuje wykonawcę (late binding),
-- wykonuje,
-- waliduje wynik,
-- podstawia do środowiska,
-- kontynuuje eval (rekurencyjnie).
+### 1.5. Applicator (runtime) is evaluator (eval/apply)
+Runtime executes IR:
+- detects `CallNode`,
+- resolves executor (late binding),
+- executes,
+- validates result,
+- injects into environment,
+- continues eval (recursively).
 
-**Konsekwencja:** jeden mechanizm działa dla:
-- interleaved/strict (wykonuj call natychmiast),
-- plan-first/lazy (zbieraj i wykonuj później),
-- hybrydy (prefetch/race + reszta strict).
+**Consequence:** one mechanism supports:
+- interleaved/strict (execute call immediately),
+- plan-first/lazy (collect and execute later),
+- hybrid (prefetch/race + strict remainder).
 
-### 1.6. Delegacja jest deklaratywna (intent + requires), a nie „adresowa”
-W planie zapisujesz:
-- `:intent` (co ma być zrobione),
-- `:requires` (kontrakty i schemat wyjścia),
-- `:dispatch` (kandydaci i polityki),
-a nie „na sztywno: użyj modelu B”.
+### 1.6. Delegation is declarative (`intent + requires`), not address-based
+Plan should include:
+- `:intent` (what to do),
+- `:requires` (contracts and output schema),
+- `:dispatch` (candidates and policies),
+not "hardcode model B".
 
-**Konsekwencja:** aplikator może zmienić wykonawcę, gdy:
-- capability niedostępne,
-- budżet/latencja ograniczona,
-- wynik nie przechodzi bramki jakości.
-
----
-
-## 2) Wnioski: co daje największą użyteczność
-
-### 2.1. Uniformizacja problemu „wkomponowania w rozumowanie”
-Nie próbujemy wstrzykiwać stanów wewnętrznych między modelami.
-Uniformizacja zachodzi przez:
-- **schemat wyjścia** (`:out/schema`)
-- **kontrakty** (`:quality/must`, walidatory, testy)
-- opcjonalnie **judge rubric** (LLM-judge)
-
-**Efekt praktyczny:** dowolny wykonawca może być podmieniony, jeśli dostarcza wynik w tym samym schemacie i przechodzi te same bramki.
-
-### 2.2. Funkcje wyższego rzędu (HOF) w tym systemie
-- Capability jest wartością (jak funkcja).
-- „Przekazywanie funkcji” = przekazywanie capability-handle + schematów + kontraktu.
-- Model/agent na poziomie wyższym może **produkować plan** (funkcję w postaci AST) zawierający wywołania innych capabilities.
-
-**Efekt praktyczny:** A może pełnić rolę „kompilatora polityki”, B „solvera”, C „naprawiacza”, a runtime to „eval”.
-
-### 2.3. Lazy aplikator jako warstwa odpornościowa (resilience)
-Late binding umożliwia:
-- fallback po dostępności,
-- fallback po kosztach,
-- fallback po jakości (ponowienie / zmiana wykonawcy / repair loop),
-- race (spekulacyjne wykonanie kilku i wybór najlepszego).
-
-**Efekt praktyczny:** system nie jest kruchy wobec niedostępności jednego modelu/usługi.
-
-### 2.4. Quality-aware dispatch (routing też po jakości)
-Aplikator nie tylko „wybiera działającego”, ale:
-- odpala kandydatów (kaskadowo lub turniejowo),
-- weryfikuje przez `must` + `score`,
-- dopiero potem commituje wynik.
-
-**Efekt praktyczny:** jakość staje się częścią semantyki wywołania, a nie przypadkowym efektem wykonawcy.
+**Consequence:** applicator may switch executor when:
+- capability is unavailable,
+- budget/latency is constrained,
+- result fails quality gate.
 
 ---
 
-## 3) Minimalne schematy (EDN) – kanoniczna konwencja
+## 2) Conclusions: what gives the highest utility
 
-### 3.1. Registry capability (meta)
+### 2.1. Uniformizing "composition into reasoning"
+Do not attempt to inject internal state between models.
+Uniformization should happen through:
+- **output schema** (`:out/schema`)
+- **contracts** (`:quality/must`, validators, tests)
+- optional **judge rubric** (LLM judge)
+
+**Practical effect:** any executor can be replaced if it returns the same schema and passes the same gates.
+
+### 2.2. Higher-order functions (HOF) in this system
+- Capability is a value (like a function).
+- "Passing functions" means passing capability handle + schemas + contract.
+- A higher-level model/agent can **produce a plan** (function as AST data) with calls to other capabilities.
+
+**Practical effect:** A can be a policy compiler, B a solver, C a repairer, while runtime is eval.
+
+### 2.3. Lazy applicator as resilience layer
+Late binding enables:
+- availability fallback,
+- cost fallback,
+- quality fallback (retry / executor switch / repair loop),
+- race (speculative multi-run + choose best).
+
+**Practical effect:** system is not brittle when one model/service is unavailable.
+
+### 2.4. Quality-aware dispatch (routing by quality too)
+Applicator does not only "pick one that works", it:
+- executes candidates (cascade or tournament),
+- verifies using `must` + `score`,
+- commits only after validation.
+
+**Practical effect:** quality becomes part of call semantics, not an accidental executor side effect.
+
+---
+
+## 3) Minimal schemas (EDN) - canonical convention
+
+### 3.1. Capability registry (metadata)
 ```edn
 {:cap/id :llm/code
  :cap/kind :llm
  :io/in-schema  :req/code
  :io/out-schema :res/patch+tests
- :cap/version "2026-02-15"          ;; opcjonalne, ale zalecane
- :cap/cost {:latency-ms 1200}       ;; opcjonalne
- :cap/limits {:timeout-ms 15000}    ;; opcjonalne
- :cap/tags #{:coding :clojure}}     ;; opcjonalne
+ :cap/version "2026-02-15"          ;; optional but recommended
+ :cap/cost {:latency-ms 1200}       ;; optional
+ :cap/limits {:timeout-ms 15000}    ;; optional
+ :cap/tags #{:coding :clojure}}     ;; optional
 ```
 
-### 3.2. Request (zunifikowany)
+### 3.2. Request (unified)
 ```edn
 {:proto 1
  :trace {:id "r-4a2b" :turn 17}
@@ -125,8 +125,8 @@ Aplikator nie tylko „wybiera działającego”, ale:
                     :policy :quality-aware}}
  :input {:task "Fix NPE in foo()"
          :lang :clojure}
- :context {:summary "krótki kontekst"}
- :constraints {:no-web true :language :pl}
+ :context {:summary "short context"}
+ :constraints {:no-web true :language :en}
  :done {:must #{:schema-valid :patch-applies}
         :should #{:tests-pass}
         :score-min 0.8}
@@ -134,8 +134,8 @@ Aplikator nie tylko „wybiera działającego”, ale:
  :effects {:allowed #{:none}}}
 ```
 
-### 3.3. Response (zunifikowany)
-Sukces:
+### 3.3. Response (unified)
+Success:
 ```edn
 {:proto 1
  :trace {:id "r-4a2b" :turn 17}
@@ -149,11 +149,11 @@ Plan:
 {:proto 1
  :trace {:id "r-4a2b" :turn 17}
  :result {:type :plan
-          :plan {:id "p-01" :nodes [...]}
-          :bindings {:summary "NPE w foo()"}}}
+          :plan {:id "p-01" :nodes [...]} 
+          :bindings {:summary "NPE in foo()"}}}
 ```
 
-Błąd:
+Error:
 ```edn
 {:proto 1
  :trace {:id "r-4a2b" :turn 17}
@@ -163,7 +163,7 @@ Błąd:
          :details {:path [:result :out]}}}
 ```
 
-### 3.4. Plan/AST z CallNode (rekurencja A→B→C)
+### 3.4. Plan/AST with CallNode (recursive A->B->C)
 ```edn
 {:id "p-01"
  :nodes
@@ -187,9 +187,9 @@ Błąd:
    :input {:final :answer}}]}
 ```
 
-`{:slot/id ...}` to miejsce wstrzyknięcia wartości z `:bindings` albo z kontekstu aplikatora.
+`{:slot/id ...}` is an injection point for values from `:bindings` or applicator context.
 
-### 3.5. CallNode dla non-LLM (ten sam IR)
+### 3.5. CallNode for non-LLM (same IR)
 ```edn
 {:op :call
  :id "c-chess-01"
@@ -202,34 +202,34 @@ Błąd:
  :as :move1}
 ```
 
-## 4) Semantyka wykonania (warianty)
+## 4) Execution semantics (variants)
 
 ### 4.1. Interleaved/strict
-- runtime wykonuje `CallNode` natychmiast,
-- wynik trafia do env,
-- kolejne kroki zależą od poprzednich.
+- runtime executes `CallNode` immediately,
+- result is put into env,
+- next steps depend on previous ones.
 
 ### 4.2. Plan-first/lazy
-- wykonawca produkuje większy plan,
-- runtime wykonuje batch (równoległość, late binding).
+- executor produces a larger plan,
+- runtime executes batch (parallelism, late binding).
 
-### 4.3. Hybryda (zalecane)
-- strict dla zależności,
-- lazy dla fragmentów niezależnych,
-- race/prefetch dla krytycznych ścieżek.
+### 4.3. Hybrid (recommended)
+- strict for dependencies,
+- lazy for independent fragments,
+- race/prefetch for critical paths.
 
-## 5) MVP i status implementacji
+## 5) MVP and implementation status
 
-1. Capability registry (ID -> meta, schematy): wdrożone (flattened `:ferment.caps.registry/*` + metadane `:cap/version`, `:cap/cost`, `:cap/limits`, `:cap/tags`).
-2. IR/Plan + CallNode: wdrożone (`:plan`, materializacja slotów, `CallNode`, `:requires` jako twardy filtr kontraktowy przy doborze capability).
-3. Aplikator/evaluator (resolve/execute/rekurencja): wdrożone (`:let`, `:call`, `:emit`, plan->plan, retry/fallback/switch-on, telemetry, egzekucja efektów przez runtime scope + RBAC).
-4. Walidatory kontraktów: wdrożone (`request` i `response` envelope + walidacja `:in-schema`/`:out-schema` per intent + walidacja planów routingu).
-5. Judge capability: wdrożone opcjonalnie; globalny default jest wyłączony, a w `prod` działa canary per-intent (`:text/respond`, `:code/patch`, `:max-attempts 1`).
+1. Capability registry (ID -> metadata, schemas): delivered (flattened `:ferment.caps.registry/*` + metadata `:cap/version`, `:cap/cost`, `:cap/limits`, `:cap/tags`).
+2. IR/Plan + CallNode: delivered (`:plan`, slot materialization, `CallNode`, `:requires` as hard contract filter for capability selection).
+3. Applicator/evaluator (resolve/execute/recursion): delivered (`:let`, `:call`, `:emit`, plan->plan, retry/fallback/switch-on, telemetry, effect execution via runtime scope + RBAC).
+4. Contract validators: delivered (`request` and `response` envelope + per-intent `:in-schema`/`:out-schema` validation + routing plan validation).
+5. Judge capability: delivered as optional; global default is disabled, while `prod` runs canary per intent (`:text/respond`, `:code/patch`, `:max-attempts 1`).
 
-## 6) Dlaczego to jest stratified
+## 6) Why this is stratified
 
-- Wyższe warstwy operują na `:intent` i kontraktach, nie na nazwach modeli.
-- Niższa warstwa (aplikator) wiąże wywołania do konkretnych wykonawców w runtime.
-- “Funkcje jako wartości” realizują się przez capability-handle i plany jako dane.
+- Higher layers operate on `:intent` and contracts, not model names.
+- Lower layer (applicator) binds calls to concrete executors at runtime.
+- "Functions as values" are realized via capability handles and plans-as-data.
 
-To daje kompozycyjność, odporność (late binding) i kontrolę jakości w jednym mechanizmie.
+This gives composability, resilience (late binding), and quality control in one mechanism.
