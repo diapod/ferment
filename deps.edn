@@ -117,6 +117,16 @@
                                      org.slf4j/slf4j-nop    {:mvn/version "1.7.36"}
                                      codox/codox            {:mvn/version "0.10.8"}}
                        :exec-fn     ferment.codox.main/-main}
+           :build     {:paths       ["."]
+                       :extra-paths ["aliases/build"]
+                       :deps        {io.github.clojure/tools.build {:mvn/version "0.10.12"}
+                                     org.clojure/data.zip          {:mvn/version "1.1.1"}
+                                     org.clojure/data.xml          {:mvn/version "0.2.0-alpha10"}}
+                       :ns-default  ferment.build.main}
+           :deploy    {:paths       ["."]
+                       :extra-paths ["aliases/deploy"]
+                       :extra-deps  {slipset/deps-deploy {:mvn/version "0.2.2"}}
+                       :ns-default  ferment.deploy.main}
            :dev-nrepl {:jvm-opts    ["-Dnrepl.load=true","--enable-native-access=ALL-UNNAMED"]
                        :extra-paths ["aliases/nrepl"]
                        :extra-deps  {cider/cider-nrepl         {:mvn/version "0.58.0"}

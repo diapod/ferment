@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?><project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>io.randomseed</groupId>
+  <groupId>ai.orbiplex</groupId>
   <artifactId>ferment</artifactId>
   <packaging>jar</packaging>
-  <version>2.2.4</version>
+  <version>1.0.0</version>
   <name>ferment</name>
-  <description>Money as data, done right.</description>
+  <description>AI orchestration system for multi-model workflows</description>
   <url>https://randomseed.io/software/ferment/</url>
   <licenses>
     <license>
@@ -14,16 +14,121 @@
     </license>
   </licenses>
   <scm>
-    <connection>scm:git:git://github.com/randomseed-io/ferment.git</connection>
-    <developerConnection>scm:git:ssh://git@github.com/randomseed-io/ferment.git</developerConnection>
-    <tag>2.2.4</tag>
-    <url>https://github.com/randomseed-io/ferment/</url>
+    <connection>scm:git:git://https://github.com/diapod/ferment.git</connection>
+    <developerConnection>scm:git:ssh://git@https://github.com/diapod/ferment.git</developerConnection>
+    <tag>1.0.0</tag>
+    <url>https://https://github.com/diapod/ferment/</url>
   </scm>
   <dependencies>
     <dependency>
-      <groupId>commons-io</groupId>
-      <artifactId>commons-io</artifactId>
-      <version>2.21.0</version>
+      <groupId>cambium</groupId>
+      <artifactId>cambium.codec-cheshire</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>cambium</groupId>
+      <artifactId>cambium.core</artifactId>
+      <version>1.1.1</version>
+    </dependency>
+    <dependency>
+      <groupId>cambium</groupId>
+      <artifactId>cambium.logback.core</artifactId>
+      <version>0.4.6</version>
+    </dependency>
+    <dependency>
+      <groupId>cambium</groupId>
+      <artifactId>cambium.logback.json</artifactId>
+      <version>0.4.6</version>
+    </dependency>
+    <dependency>
+      <groupId>camel-snake-kebab</groupId>
+      <artifactId>camel-snake-kebab</artifactId>
+      <version>0.4.3</version>
+    </dependency>
+    <dependency>
+      <groupId>cheshire</groupId>
+      <artifactId>cheshire</artifactId>
+      <version>6.1.0</version>
+    </dependency>
+    <dependency>
+      <groupId>clojure-interop</groupId>
+      <artifactId>javax.security</artifactId>
+      <version>1.0.5</version>
+    </dependency>
+    <dependency>
+      <groupId>clojurewerkz</groupId>
+      <artifactId>balagan</artifactId>
+      <version>1.0.5</version>
+    </dependency>
+    <dependency>
+      <groupId>com.github.seancorfield</groupId>
+      <artifactId>next.jdbc</artifactId>
+      <version>1.3.1086</version>
+    </dependency>
+    <dependency>
+      <groupId>com.lambdaworks</groupId>
+      <artifactId>scrypt</artifactId>
+      <version>1.4.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.taoensso</groupId>
+      <artifactId>nippy</artifactId>
+      <version>3.1.1</version>
+    </dependency>
+    <dependency>
+      <groupId>com.zaxxer</groupId>
+      <artifactId>HikariCP</artifactId>
+      <version>7.0.2</version>
+    </dependency>
+    <dependency>
+      <groupId>commons-validator</groupId>
+      <artifactId>commons-validator</artifactId>
+      <version>1.10.1</version>
+    </dependency>
+    <dependency>
+      <groupId>crypto-equality</groupId>
+      <artifactId>crypto-equality</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>danlentz</groupId>
+      <artifactId>clj-uuid</artifactId>
+      <version>0.2.0</version>
+    </dependency>
+    <dependency>
+      <groupId>dev.weavejester</groupId>
+      <artifactId>ragtime</artifactId>
+      <version>0.12.1</version>
+    </dependency>
+    <dependency>
+      <groupId>fipp</groupId>
+      <artifactId>fipp</artifactId>
+      <version>0.6.29</version>
+    </dependency>
+    <dependency>
+      <groupId>hato</groupId>
+      <artifactId>hato</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>integrant</groupId>
+      <artifactId>integrant</artifactId>
+      <version>1.0.1</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>bankster</artifactId>
+      <version>2.2.4</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>lazy-map</artifactId>
+      <version>1.0.3</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>phone-number</artifactId>
+      <version>8.13.6-3</version>
     </dependency>
     <dependency>
       <groupId>io.randomseed</groupId>
@@ -31,14 +136,74 @@
       <version>1.0.4</version>
     </dependency>
     <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>utils</artifactId>
+      <version>2.0.5</version>
+    </dependency>
+    <dependency>
+      <groupId>logback-bundle</groupId>
+      <artifactId>json-bundle</artifactId>
+      <version>0.3.0</version>
+    </dependency>
+    <dependency>
+      <groupId>meta-merge</groupId>
+      <artifactId>meta-merge</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>metosin</groupId>
+      <artifactId>jsonista</artifactId>
+      <version>0.3.13</version>
+    </dependency>
+    <dependency>
+      <groupId>metosin</groupId>
+      <artifactId>maailma</artifactId>
+      <version>1.1.0</version>
+    </dependency>
+    <dependency>
+      <groupId>metosin</groupId>
+      <artifactId>potpuri</artifactId>
+      <version>0.5.3</version>
+    </dependency>
+    <dependency>
+      <groupId>mvxcvi</groupId>
+      <artifactId>alphabase</artifactId>
+      <version>2.1.0</version>
+    </dependency>
+    <dependency>
       <groupId>mvxcvi</groupId>
       <artifactId>puget</artifactId>
       <version>1.3.4</version>
     </dependency>
     <dependency>
+      <groupId>net.java.dev.jna</groupId>
+      <artifactId>jna</artifactId>
+      <version>5.11.0</version>
+    </dependency>
+    <dependency>
       <groupId>org.clojure</groupId>
-      <artifactId>data.csv</artifactId>
-      <version>1.1.1</version>
+      <artifactId>core.async</artifactId>
+      <version>1.8.741</version>
+    </dependency>
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>core.cache</artifactId>
+      <version>1.1.234</version>
+    </dependency>
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>core.match</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>core.memoize</artifactId>
+      <version>1.1.266</version>
+    </dependency>
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>data.avl</artifactId>
+      <version>0.2.0</version>
     </dependency>
     <dependency>
       <groupId>org.clojure</groupId>
@@ -47,13 +212,38 @@
     </dependency>
     <dependency>
       <groupId>org.clojure</groupId>
-      <artifactId>tools.logging</artifactId>
-      <version>1.3.1</version>
+      <artifactId>java.data</artifactId>
+      <version>1.3.113</version>
+    </dependency>
+    <dependency>
+      <groupId>org.mariadb.jdbc</groupId>
+      <artifactId>mariadb-java-client</artifactId>
+      <version>3.5.7</version>
+    </dependency>
+    <dependency>
+      <groupId>potemkin</groupId>
+      <artifactId>potemkin</artifactId>
+      <version>0.4.8</version>
+    </dependency>
+    <dependency>
+      <groupId>spootnik</groupId>
+      <artifactId>unilog</artifactId>
+      <version>0.7.32</version>
+    </dependency>
+    <dependency>
+      <groupId>tick</groupId>
+      <artifactId>tick</artifactId>
+      <version>1.0</version>
     </dependency>
     <dependency>
       <groupId>trptr</groupId>
       <artifactId>java-wrapper</artifactId>
       <version>0.2.3</version>
+    </dependency>
+    <dependency>
+      <groupId>zprint</groupId>
+      <artifactId>zprint</artifactId>
+      <version>1.3.0</version>
     </dependency>
   </dependencies>
   <build>
