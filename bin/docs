@@ -2,4 +2,5 @@
 
 set -eu
 
+mkdir -p docs 2>/dev/null || true
 exec clojure -X:docs "$@"
