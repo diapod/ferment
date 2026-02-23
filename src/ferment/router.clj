@@ -10,7 +10,7 @@
             [ferment.system :as system]))
 
 (def ^:private router-top-keys
-  #{:routing :profiles :policy})
+  #{:routing :profiles :policy :defaults})
 
 (def ^:private routing-keys
   #{:intent->cap
@@ -26,6 +26,12 @@
 
 (def ^:private retry-keys
   #{:same-cap-max :fallback-max})
+
+(def ^:private routing-default-keys
+  #{:meta? :strict? :force? :on-error})
+
+(def ^:private routing-on-error-modes
+  #{:fail-open :fail-closed})
 
 (defn- fail-router!
   [message data]
@@ -88,6 +94,27 @@
                     {:path path
                      :expected :keyword
                      :value entry}))))
+
+(defn- validate-router-defaults!
+  [defaults path]
+  (ensure-keyword-map! defaults path)
+  (ensure-only-keys! defaults routing-default-keys path)
+  (doseq [k [:meta? :strict? :force?]]
+    (when (contains? defaults k)
+      (let [v (get defaults k)]
+        (when-not (boolean? v)
+          (fail-router! "Router defaults flags must be booleans."
+                        {:path (conj path k)
+                         :expected :boolean
+                         :value v})))))
+  (when (contains? defaults :on-error)
+    (let [mode (:on-error defaults)]
+      (when-not (contains? routing-on-error-modes mode)
+        (fail-router! "Router defaults :on-error must be :fail-open or :fail-closed."
+                      {:path (conj path :on-error)
+                       :expected routing-on-error-modes
+                       :value mode}))))
+  defaults)
 
 (defn validate-router-config!
   "Validates router configuration shape and throws `ex-info` when invalid."
@@ -158,6 +185,8 @@
                       {:path [:policy]
                        :expected :keyword
                        :value (:policy cfg)})))
+    (when (contains? cfg :defaults)
+      (validate-router-defaults! (:defaults cfg) [:defaults]))
     cfg))
 
 (defn preconfigure-router
@@ -197,6 +226,12 @@
   "Returns router config from runtime branch."
   [runtime]
   (some-> (runtime-config runtime) :router))
+
+(defn routing-defaults
+  "Returns normalized routing defaults map from router config."
+  [runtime]
+  (let [defaults (some-> (router-config runtime) :defaults)]
+    (if (map? defaults) defaults {})))
 
 (defn resolver-routing
   "Returns routing map from dedicated router branch."

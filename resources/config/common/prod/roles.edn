@@ -4,7 +4,7 @@
 
  :ferment.roles/default
  {:enabled?            true
-  :authorize-default?  true
+  :authorize-default?  false
   :global-context      :!
   :anonymous-role      :role/anonymous
   :logged-in-role      :role/user

@@ -139,3 +139,22 @@
       (is (= :auth/forbidden-effect (:failure/type ex-data)))
       (is (= #{:fs/write} (:requested-effects ex-data)))
       (is (= #{:fs/write} (:denied-effects ex-data))))))
+
+(deftest invoke-tool-requires-declared-effects
+  (testing "Tool invocation fails with canonical invalid-input when :effects/:allowed is missing."
+    (let [root (temp-dir)
+          cfg  {:fs/write {:enabled? true
+                           :root root
+                           :allow ["sandbox/"]}}
+          node {:tool/id :fs/write-file
+                :input {:path "sandbox/out.txt"
+                        :content "abc"
+                        :mkdirs? true}}
+          ex-data (try
+                    (effects/invoke-tool! cfg node)
+                    nil
+                    (catch clojure.lang.ExceptionInfo e
+                      (ex-data e)))]
+      (is (= :effects/invalid-input (:failure/type ex-data)))
+      (is (= :effects/not-declared (:reason ex-data)))
+      (is (= :fs/write-file (:tool/id ex-data))))))

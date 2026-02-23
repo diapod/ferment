@@ -170,7 +170,8 @@
                 nil
                 (catch clojure.lang.ExceptionInfo e
                   (ex-data e)))]
-      (is (= :eval/low-score (get-in err [:outcome :failure/type])))
+      (is (= :eval/must-failed (get-in err [:outcome :failure/type])))
+      (is (= [:tests-pass] (get-in err [:outcome :done/eval :must-failed])))
       (is (false? (get-in err [:outcome :failure/recover?]))))))
 
 (deftest execute-plan-fails-on-invalid-result-without-switch-policy
@@ -389,6 +390,76 @@
       (is (= 0 (get-in run [:telemetry :calls/failed])))
       (is (= 1 (get-in run [:telemetry :calls/retries])))
       (is (= 1 (get-in run [:telemetry :calls/fallback-hops]))))))
+
+(deftest execute-plan-emits-judge-pass-fail-telemetry
+  (testing "Telemetry tracks judge usage and pass/fail split per evaluated call."
+    (let [run (workflow/execute-plan
+               {:plan {:nodes [{:op :call
+                                :intent :text/respond
+                                :dispatch {:candidates [:llm/voice-a :llm/voice-b]
+                                           :retry {:fallback-max 1}
+                                           :switch-on #{:eval/low-score}}
+                                :done {:score-min 0.8}
+                                :as :answer}
+                               {:op :emit :input {:slot/id [:answer :out]}}]}
+                :resolver {}
+                :judge-fn (fn [call-node _env _result]
+                            (if (= :llm/voice-a (:cap/id call-node))
+                              {:score 0.2}
+                              {:score 0.9}))
+                :invoke-call (fn [call-node _env]
+                               {:result {:type :value
+                                         :out {:text (name (:cap/id call-node))}}})})]
+      (is (:ok? run))
+      (is (= {:text "voice-b"} (:emitted run)))
+      (is (= 0 (get-in run [:telemetry :quality/must-failed])))
+      (is (= 2 (get-in run [:telemetry :quality/judge-used])))
+      (is (= 1 (get-in run [:telemetry :quality/judge-pass])))
+      (is (= 1 (get-in run [:telemetry :quality/judge-fail]))))))
+
+(deftest execute-plan-emits-must-failed-telemetry
+  (testing "Telemetry tracks hard quality gate failures via :quality/must-failed."
+    (let [calls (atom [])
+          run   (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :dispatch {:candidates [:llm/voice-a :llm/voice-b]
+                                             :retry {:fallback-max 1}
+                                             :switch-on #{:eval/must-failed}}
+                                  :done {:must #{:tests-pass}
+                                         :score-min 0.0}
+                                  :as :answer}
+                                 {:op :emit
+                                  :input {:slot/id [:answer :out]}}]}
+                  :resolver {}
+                  :check-fns {:tests-pass (fn [call-node _env _result]
+                                            (= :llm/voice-b (:cap/id call-node)))}
+                  :invoke-call (fn [call-node _env]
+                                 (swap! calls conj (:cap/id call-node))
+                                 {:result {:type :value
+                                           :out {:text (name (:cap/id call-node))}}})})]
+      (is (:ok? run))
+      (is (= [:llm/voice-a :llm/voice-b] @calls))
+      (is (= {:text "voice-b"} (:emitted run)))
+      (is (= 1 (get-in run [:telemetry :quality/must-failed]))))))
+
+(deftest execute-plan-fails-tool-node-with-missing-effects-declaration
+  (testing "Tool node without :effects/:allowed fails with canonical invalid-input error."
+    (let [err (try
+                (workflow/execute-plan
+                 {:plan {:nodes [{:op :tool
+                                  :tool/id :fs/write-file
+                                  :input {:path "x.txt"}}]}
+                  :resolver {}
+                  :invoke-tool (fn [_ _]
+                                 {:result {:type :value
+                                           :out {:wrote? true}}})})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :effects/invalid-input (:error err)))
+      (is (= :effects/invalid-input (:failure/type err)))
+      (is (= :effects/not-declared (:reason err))))))
 
 (deftest execute-plan-runs-tool-node-through-runtime-invoker
   (testing "Tool node executes through :invoke-tool handler and exposes normalized slot output."

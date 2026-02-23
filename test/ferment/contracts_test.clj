@@ -39,15 +39,24 @@
              (get-in protocol [:intents :route/decide :result/contract :type])))
       (is (= #{:schema-valid}
              (get-in protocol [:policy/intents :route/decide :done :must])))
-      (is (= [:schema-valid :no-hallucinated-apis]
+      (is (= #{:schema-valid :no-list-expansion}
+             (get-in protocol [:policy/intents :text/respond :done :must])))
+      (is (= [:schema-valid :no-hallucinated-apis :no-list-expansion]
              (get-in protocol [:policy/intents :text/respond :checks])))
+      (is (= 900
+             (get-in protocol [:intents :text/respond :constraints :max-chars])))
+      (is (string? (get-in protocol [:prompts :default])))
+      (is (string? (get-in protocol [:prompts :roles :voice])))
+      (is (string? (get-in protocol [:prompts :intents :text/respond])))
       (is (contains? (:error/catalog protocol) :schema/invalid))
+      (is (contains? (:error/catalog protocol) :eval/must-failed))
       (is (= :builtin/schema-valid
              (get-in protocol [:policy/checks :schema-valid])))
       (is (= :eval/grade
              (get-in protocol [:policy/default :judge :intent])))
       (is (= :llm/judge
              (get-in protocol [:policy/default :judge :cap/id])))
+      (is (contains? (get-in protocol [:policy/default :switch-on]) :eval/must-failed))
       (is (= [:value :plan :stream :error]
              (:result/types protocol))))))
 

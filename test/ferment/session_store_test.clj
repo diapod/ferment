@@ -335,3 +335,72 @@
                                        "s-policy"
                                        :context/summary
                                        {:intent :route/decide}))))))
+
+(deftest session-vars-contract-uses-class-based-ttl
+  (testing "Session vars TTL can be selected by namespace class."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:keys/require-qualified? true
+                   :keys/allowed-namespaces #{"request" "context"}
+                   :ttl/default-ms 1000
+                   :ttl/max-ms 5000
+                   :freeze/allow-write? true
+                   :freeze/allow-delete? true
+                   :class/default :session.vars/default
+                   :class/by-namespace {"request" :session.vars/request-data}
+                   :class/policy {:session.vars/request-data {:ttl/default-ms 100
+                                                              :ttl/max-ms 250}}}})]
+      (session-store/ensure-session! store "s-class-ttl")
+      (with-redefs [session-store/now-ms (constantly 1000)]
+        (is (true? (session-store/put-var! store "s-class-ttl" :request/topic "acid")))
+        (is (true? (session-store/put-var! store "s-class-ttl" :context/summary "ctx"))))
+      (with-redefs [session-store/now-ms (constantly 1150)]
+        (is (nil? (session-store/get-var store "s-class-ttl" :request/topic)))
+        (is (= "ctx" (session-store/get-var store "s-class-ttl" :context/summary))))
+      (with-redefs [session-store/now-ms (constantly 2101)]
+        (is (nil? (session-store/get-var store "s-class-ttl" :context/summary)))))))
+
+(deftest session-vars-contract-uses-class-based-freeze-policy
+  (testing "Session vars freeze write/delete can be overridden per namespace class."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:keys/require-qualified? true
+                   :keys/allowed-namespaces #{"runtime" "session"}
+                   :freeze/allow-write? false
+                   :freeze/allow-delete? false
+                   :class/default :session.vars/default
+                   :class/by-namespace {"runtime" :session.vars/runtime-data}
+                   :class/policy {:session.vars/runtime-data {:freeze/allow-write? true
+                                                              :freeze/allow-delete? true}}}})]
+      (session-store/ensure-session! store "s-class-freeze")
+      (is (true? (session-store/put-var! store "s-class-freeze" :runtime/diag "ok")))
+      (is (= "ok" (session-store/get-var store "s-class-freeze" :runtime/diag)))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"read-only while session is frozen"
+           (session-store/put-var! store "s-class-freeze" :session/note "x")))
+      (is (true? (session-store/del-var! store "s-class-freeze" :runtime/diag)))
+      (is (nil? (session-store/get-var store "s-class-freeze" :runtime/diag))))))
+
+(deftest session-vars-contract-exposes-request-default-bindings
+  (testing "Session vars contract normalizes request default bindings."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:request/default-bindings
+                   {"session/language" {:target ["constraints" "language"]
+                                        :coerce "keyword-or-string"}
+                    :session/context-summary {:target [:context :summary]
+                                              :coerce :trimmed-string}}}})
+          bindings (session-store/request-default-bindings store)]
+      (is (= {:target [:constraints :language]
+              :coerce :keyword-or-string}
+             (get bindings :session/language)))
+      (is (= {:target [:context :summary]
+              :coerce :trimmed-string}
+             (get bindings :session/context-summary))))))

@@ -1,0 +1,7 @@
+{
+ :ferment.router/default
+ {:defaults {:meta? true
+             :strict? false
+             :force? false
+             :on-error :fail-open}}
+}

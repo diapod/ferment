@@ -80,3 +80,13 @@
               :denied #{:fs/write}
               :roles #{:role/user}}
              (roles/authorize-effects cfg #{:none :fs/write} {:user/account-type :user}))))))
+
+(deftest default-deny-policy-denies-unknown-operations-and-effects
+  (testing "With :authorize-default? false, unknown operations/effects are denied."
+    (let [cfg {:enabled? true
+               :authorize-default? false
+               :account-type->roles {:admin #{:role/admin}}
+               :operations {:http.v1/act {:any #{:role/admin}}}
+               :effects {:none {:any #{:role/admin}}}}]
+      (is (false? (roles/allowed? cfg :http.v1/session {:user/account-type :admin})))
+      (is (false? (roles/effect-allowed? cfg :net/http {:user/account-type :admin}))))))

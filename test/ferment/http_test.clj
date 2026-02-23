@@ -47,11 +47,11 @@
       (letfn [(get-vars-fn
                 ([sid ks]
                  (is (= "sess-ctx-1" sid))
-                 (is (= [:session/language
-                         :session/style
-                         :session/system-prompt
-                         :session/context-summary]
-                        ks))
+                 (is (= #{:session/language
+                          :session/style
+                          :session/system-prompt
+                          :session/context-summary}
+                        (set ks)))
                  {:session/language :pl
                   :session/style :concise
                   :session/system-prompt "SYS-FROM-SESSION"
@@ -80,6 +80,46 @@
           (is (= :concise (get-in @seen [:constraints :style])))
           (is (= "SYS-FROM-SESSION" (get-in @seen [:input :system])))
           (is (= "ctx-from-session" (get-in @seen [:context :summary]))))))))
+
+(deftest invoke-act-applies-session-var-defaults-from-contract-bindings
+  (testing "invoke-act reads request default bindings from session contract."
+    (let [seen (atom nil)]
+      (letfn [(get-vars-fn
+                ([sid ks]
+                 (is (= "sess-ctx-2" sid))
+                 (is (= #{:request/topic
+                          :runtime/language}
+                        (set ks)))
+                 {:request/topic "  acid  "
+                  :runtime/language "pl"})
+                ([sid ks opts]
+                 (is (= :text/respond (:intent opts)))
+                 (is (= :act/defaults (:operation opts)))
+                 (get-vars-fn sid ks)))]
+        (let [runtime {:protocol {}
+                       :resolver {}
+                       :session {:store {:session-vars/contract
+                                         {:request/default-bindings
+                                          {:request/topic {:target [:context :topic]
+                                                           :coerce :trimmed-string}
+                                           :runtime/language {:target [:constraints :language]
+                                                              :coerce :keyword-or-string}}}}
+                                 :get-vars! get-vars-fn}}
+              payload {:proto 1
+                       :trace {:id "t-session-defaults-2"}
+                       :session/id "sess-ctx-2"
+                       :task {:intent :text/respond
+                              :cap/id :llm/voice}
+                       :input {:prompt "hej"}}
+              response (with-redefs [core/execute-capability!
+                                     (fn [_runtime _resolver opts]
+                                       (reset! seen opts)
+                                       {:result {:type :value
+                                                 :out {:text "ok"}}})]
+                         (http/invoke-act runtime payload nil nil))]
+          (is (= 200 (:status response)))
+          (is (= :pl (get-in @seen [:constraints :language])))
+          (is (= "acid" (get-in @seen [:context :topic]))))))))
 
 (deftest invoke-act-maps-forbidden-effect-to-403
   (testing "auth/forbidden-effect error from workflow/core is exposed as HTTP 403 envelope."
@@ -133,6 +173,28 @@
       (is (= 403 (:status response)))
       (is (= :effects/scope-denied (get-in response [:body :error :type])))
       (is (= :path-not-allowed
+             (get-in response [:body :error :details :reason]))))))
+
+(deftest invoke-act-maps-effects-invalid-input-to-400
+  (testing "Invalid effect declaration is exposed as HTTP 400 envelope with canonical details."
+    (let [runtime {:protocol {}
+                   :resolver {}}
+          payload {:proto 1
+                   :trace {:id "t-3b"}
+                   :task {:intent :code/patch
+                          :cap/id :llm/code}
+                   :input {:prompt "run tool"}}
+          response (with-redefs [core/execute-capability!
+                                 (fn [_runtime _resolver _opts]
+                                   (throw (ex-info "Invalid tool input"
+                                                   {:error :effects/invalid-input
+                                                    :failure/type :effects/invalid-input
+                                                    :reason :effects/not-declared
+                                                    :tool/id :fs/write-file})))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 400 (:status response)))
+      (is (= :effects/invalid-input (get-in response [:body :error :type])))
+      (is (= :effects/not-declared
              (get-in response [:body :error :details :reason]))))))
 
 (deftest invoke-act-supports-stream-response-mode
@@ -440,6 +502,155 @@
       (is (= :route/decide-failed (get-in response [:body :error :type])))
       (is (false? @main-called?)))))
 
+(deftest invoke-act-meta-routing-request-strict-overrides-default-fail-open
+  (testing "request :routing/:strict? true enforces fail-closed even when router default :on-error is :fail-open."
+    (let [routing {:intent->cap {:route/decide :llm/meta
+                                 :text/respond :llm/voice}}
+          main-called? (atom false)
+          runtime {:protocol {}
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing
+                            :defaults {:meta? true
+                                       :on-error :fail-open}}}
+          payload {:proto 1
+                   :trace {:id "t-6-request-strict-overrides-default"}
+                   :task {:intent :text/respond}
+                   :routing {:strict? true}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/execute-capability!
+                                 (fn [_runtime _resolver opts]
+                                   (if (= :route/decide (:intent opts))
+                                     (throw (ex-info "route failed" {:error :runtime/invoke-failed}))
+                                     (do
+                                       (reset! main-called? true)
+                                       {:result {:type :value
+                                                 :out {:text "should-not-happen"}}})))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 502 (:status response)))
+      (is (= :route/decide-failed (get-in response [:body :error :type])))
+      (is (false? @main-called?)))))
+
+(deftest invoke-act-meta-routing-strict-fail-closed-includes-rich-details
+  (testing "strict fail-closed includes compact routing failure context in error details."
+    (let [routing {:intent->cap {:route/decide :llm/meta
+                                 :text/respond :llm/voice}}
+          runtime {:protocol {}
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing
+                            :defaults {:meta? true
+                                       :on-error :fail-open}}}
+          payload {:proto 1
+                   :trace {:id "t-6-rich-details"}
+                   :task {:intent :text/respond}
+                   :routing {:strict? true}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/execute-capability!
+                                 (fn [_runtime _resolver opts]
+                                   (if (= :route/decide (:intent opts))
+                                     (throw (ex-info
+                                             "Call node failed quality/dispatch policy"
+                                             {:error :runtime/invoke-failed
+                                              :failure/type :schema/invalid
+                                              :node {:op :call
+                                                     :intent :route/decide
+                                                     :cap/id :llm/meta
+                                                     :as :router}
+                                              :outcome {:ok? false
+                                                        :cap/id :llm/meta
+                                                        :attempt 2
+                                                        :failure/type :schema/invalid
+                                                        :failure/recover? true
+                                                        :done/eval {:ok? false
+                                                                    :must-failed [:no-list-expansion]
+                                                                    :should-failed []
+                                                                    :judge/pass? true
+                                                                    :checks [{:check :schema-valid
+                                                                              :ok? false
+                                                                              :reason :schema/invalid}]}}
+                                              :switch-on #{:schema/invalid}
+                                              :retry-policy {:same-cap-max 1
+                                                             :fallback-max 1}
+                                              :candidates [:llm/meta :llm/solver]
+                                              :rejected-candidates [{:cap/id :llm/solver
+                                                                     :reason :intent/not-supported}]}))
+                                     {:result {:type :value
+                                               :out {:text "should-not-happen"}}}))]
+                     (http/invoke-act runtime payload nil nil))
+          details (get-in response [:body :error :details])]
+      (is (= 502 (:status response)))
+      (is (= :route/decide-failed (get-in response [:body :error :type])))
+      (is (= :route/decide (:route/intent details)))
+      (is (= :llm/meta (:route/cap-id details)))
+      (is (= :schema/invalid (:failure/type details)))
+      (is (= :schema/invalid (get-in details [:outcome :failure/type])))
+      (is (= {:same-cap-max 1 :fallback-max 1} (:retry-policy details)))
+      (is (= [:llm/meta :llm/solver] (:candidates details)))
+      (is (= [:schema/invalid] (:switch-on details)))
+      (is (= :call (get-in details [:node :op])))
+      (is (= [:no-list-expansion] (get-in details [:outcome :done/eval :must-failed])))
+      (is (= [] (get-in details [:outcome :done/eval :should-failed])))
+      (is (= true (get-in details [:outcome :done/eval :judge/pass?])))
+      (is (= :schema-valid (get-in details [:outcome :done/eval :checks 0 :check]))))))
+
+(deftest invoke-act-meta-routing-fails-closed-by-router-default-on-error
+  (testing "router :defaults/:on-error :fail-closed enforces fail-closed even without request :routing/:strict?."
+    (let [routing {:intent->cap {:route/decide :llm/meta
+                                 :text/respond :llm/voice}}
+          main-called? (atom false)
+          runtime {:protocol {}
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing
+                            :defaults {:meta? true
+                                       :on-error :fail-closed}}}
+          payload {:proto 1
+                   :trace {:id "t-6-defaults"}
+                   :task {:intent :text/respond}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/execute-capability!
+                                 (fn [_runtime _resolver opts]
+                                   (if (= :route/decide (:intent opts))
+                                     (throw (ex-info "route failed" {:error :runtime/invoke-failed}))
+                                     (do
+                                       (reset! main-called? true)
+                                       {:result {:type :value
+                                                 :out {:text "should-not-happen"}}})))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 502 (:status response)))
+      (is (= :route/decide-failed (get-in response [:body :error :type])))
+      (is (false? @main-called?)))))
+
+(deftest invoke-act-meta-routing-request-on-error-overrides-defaults
+  (testing "request :routing/:on-error may override router defaults and force fail-open behavior."
+    (let [routing {:intent->cap {:route/decide :llm/meta
+                                 :text/respond :llm/voice}}
+          seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing
+                            :defaults {:meta? true
+                                       :on-error :fail-closed}}}
+          payload {:proto 1
+                   :trace {:id "t-6-override"}
+                   :task {:intent :text/respond}
+                   :routing {:on-error :fail-open}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/execute-capability!
+                                 (fn [_runtime _resolver opts]
+                                   (if (= :route/decide (:intent opts))
+                                     (throw (ex-info "route failed" {:error :runtime/invoke-failed}))
+                                     (do
+                                       (reset! seen opts)
+                                       {:result {:type :value
+                                                 :out {:text "fallback-ok"}}})))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= :llm/voice (:cap-id @seen)))
+      (is (= "fallback-ok" (get-in response [:body :result :out :text]))))))
+
 (deftest invoke-act-meta-routing-falls-back-when-not-strict
   (testing "non-strict meta routing falls back to static resolver routing when decider fails."
     (let [routing {:intent->cap {:route/decide :llm/meta
@@ -530,6 +741,92 @@
       (is (= 1 (get-in @telemetry [:act :routing :route/fail-open])))
       (is (= 1 (get-in @telemetry [:act :routing :route/fail-closed])))
       (is (= 1 (get-in @telemetry [:act :routing :route/strict]))))))
+
+(deftest telemetry-snapshot-exposes-kpi-and-failure-taxonomy
+  (testing "Telemetry snapshot computes canonical KPI and normalized failure taxonomy."
+    (let [runtime {:protocol {}
+                   :resolver {}}
+          telemetry (atom {})
+          payload {:proto 1
+                   :trace {:id "t-kpi-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/execute-capability!
+                    (fn [_runtime _resolver _opts]
+                      {:result {:type :value
+                                :out {:text "ok"}
+                                :plan/run {:telemetry {:calls/total 4
+                                                       :calls/succeeded 2
+                                                       :calls/failed 2
+                                                       :calls/retries 2
+                                                       :calls/fallback-hops 1
+                                                       :calls/failure-types {:schema/invalid 1
+                                                                             :runtime/invoke-failed 1}
+                                                       :quality/must-failed 1
+                                                       :quality/judge-used 2
+                                                       :quality/judge-pass 1
+                                                       :quality/judge-fail 1}}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry nil)))))
+      (let [snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= :workflow (get-in snapshot [:kpi :parse-rate :source])))
+        (is (= 0.75 (get-in snapshot [:kpi :parse-rate :value])))
+        (is (= 0.5 (get-in snapshot [:kpi :retry-rate :value])))
+        (is (= 0.25 (get-in snapshot [:kpi :fallback-rate :value])))
+        (is (= 0.25 (get-in snapshot [:kpi :must-failed-rate :value])))
+        (is (= 1 (get-in snapshot [:kpi :must-failed-rate :must-failed])))
+        (is (= 0.5 (get-in snapshot [:kpi :judge-pass-rate :value])))
+        (is (= 1 (get-in snapshot [:kpi :failure-taxonomy :by-type :schema/invalid])))
+        (is (= 1 (get-in snapshot [:kpi :failure-taxonomy :by-type :runtime/invoke-failed])))
+        (is (= 1 (get-in snapshot [:kpi :failure-taxonomy :by-domain :schema])))
+        (is (= 1 (get-in snapshot [:kpi :failure-taxonomy :by-domain :runtime])))))))
+
+(deftest telemetry-snapshot-includes-must-failed-from-error-details
+  (testing "Strict fail-closed errors contribute workflow must-failed telemetry."
+    (let [routing {:intent->cap {:route/decide :llm/meta
+                                 :text/respond :llm/voice}}
+          runtime {:protocol {}
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing
+                            :defaults {:meta? true
+                                       :on-error :fail-open}}}
+          telemetry (atom {})
+          payload {:proto 1
+                   :trace {:id "t-kpi-must-1"}
+                   :task {:intent :text/respond}
+                   :routing {:strict? true}
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/execute-capability!
+                    (fn [_runtime _resolver opts]
+                      (if (= :route/decide (:intent opts))
+                        (throw (ex-info
+                                "Call node failed quality/dispatch policy"
+                                {:error :runtime/invoke-failed
+                                 :failure/type :eval/must-failed
+                                 :node {:op :call
+                                        :intent :text/respond
+                                        :cap/id :llm/voice
+                                        :as :voice}
+                                 :outcome {:ok? false
+                                           :cap/id :llm/voice
+                                           :attempt 2
+                                           :failure/type :eval/must-failed
+                                           :failure/recover? true
+                                           :done/eval {:ok? false
+                                                       :score 1.0
+                                                       :score-min 0.85
+                                                       :must-failed [:no-list-expansion]
+                                                       :should-failed []}}}))
+                        {:result {:type :value
+                                  :out {:text "should-not-happen"}}}))]
+        (is (= 502 (:status (http/invoke-act runtime payload telemetry nil)))))
+      (let [snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= 1 (get-in snapshot [:workflow :quality/must-failed])))
+        (is (= 1 (get-in snapshot [:workflow :calls/total])))
+        (is (= 1 (get-in snapshot [:workflow :calls/failed])))
+        (is (= 1 (get-in snapshot [:workflow :calls/failure-types :eval/must-failed])))
+        (is (= 1.0 (get-in snapshot [:kpi :must-failed-rate :value])))))))
 
 (deftest invoke-act-writes-audit-trail-event
   (testing "invoke-act emits persistent audit event with trace/request/session/principal/intent/capability/outcome."

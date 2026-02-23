@@ -60,14 +60,27 @@
       (if (map? cfg) cfg {}))
     {}))
 
+(defn- join-system-prompt
+  [parts]
+  (let [parts' (->> parts
+                    (keep #(some-> % str str/trim not-empty))
+                    vec)]
+    (when (seq parts')
+      (str/join "\n\n" parts'))))
+
 (defn- intent-system-prompt
   [protocol intent role]
   (let [intent-cfg (intent-config protocol intent)]
-    (or (some-> (:system intent-cfg) str str/trim not-empty)
-        (some-> (:system/prompt intent-cfg) str str/trim not-empty)
-        (some-> (get-in protocol [:prompts :intents intent]) str str/trim not-empty)
-        (some-> (get-in protocol [:prompts :roles role]) str str/trim not-empty)
-        (some-> (get-in protocol [:prompts :default]) str str/trim not-empty))))
+    (or
+     ;; Backward-compatible full override.
+     (some-> (:system intent-cfg) str str/trim not-empty)
+     ;; Backward-compatible legacy full prompt key.
+     (some-> (:system/prompt intent-cfg) str str/trim not-empty)
+     ;; Prompt package composition (default + role + intent + addendum).
+     (join-system-prompt [(get-in protocol [:prompts :default])
+                          (get-in protocol [:prompts :roles role])
+                          (get-in protocol [:prompts :intents intent])
+                          (:system/addendum intent-cfg)]))))
 
 (defn- intent-policy-config
   [protocol intent]

@@ -8,28 +8,51 @@
                            :optional [:constraints :done :context :budget :effects]}
   :envelope/response      {:required-one-of [:result :error]}
 
+  :prompts                {:default "Pracujesz jako komponent systemu Ferment. Trzymaj się kontraktu intencji. Zwracaj wyłącznie treść wyniku, bez meta-komentarzy."
+                           :roles {:router "Rola: ROUTER (meta-decider). Podejmuj decyzję routingu i jakości. Nie twórz odpowiedzi użytkowej. Bez markdown, bez komentarzy, bez <think> i bez <tool_call>."
+                                   :solver "Rola: SOLVER. Rozwiązuj problem rzeczowo i zwięźle po polsku. Gdy brakuje danych, podaj jawne założenia zamiast zgadywać. Nie używaj <think> ani <tool_call>."
+                                   :voice "Rola: VOICE. Formułuj finalną odpowiedź dla użytkownika po polsku: jasno, konkretnie, bez dygresji i bez autoprezentacji. Nie ujawniaj rozumowania i nie używaj <think>."
+                                   :coder "Rola: CODER. Twórz rozwiązania techniczne zgodne z kontraktem i zwięzłe opisy zmian. Nie używaj <think>."
+                                   :judge "Rola: JUDGE. Oceniaj wyłącznie względem kryteriów kontraktu. Bez dygresji i bez <think>."}
+                           :intents {:route/decide "Dla :route/decide zwracaj wyłącznie strukturę decyzji/planu zgodną z kontraktem. Preferuj canonical solver->voice->emit."
+                                     :context/summarize "Dla :context/summarize zwróć krótkie, rzeczowe summary po polsku (1-3 zdania). Bez list i bez pytań. Termin 'Ferment' oznacza ten projekt (orkiestrator modeli AI), nie temat fermentacji żywności."
+                                     :text/respond "Dla :text/respond nie generuj rozmowy pomocniczej ani pytań, jeśli użytkownik o to nie prosi. Termin 'Ferment' oznacza ten projekt (nie bibliotekę JavaScript). Odpowiedź maks. 4 zdania, chyba że użytkownik wymaga dłuższej."
+                                     :problem/solve "Dla :problem/solve zwróć merytoryczne rozwiązanie po polsku oraz najważniejsze założenia. Unikaj rozwlekłości i list, o ile użytkownik ich nie wymaga. Nie zwracaj znaczników narzędziowych ani pseudo-XML (np. <tool_call>)."}}
+
   :intents                {:route/decide      {:in-schema :req/route
                                                :out-schema :res/route
+                                               :constraints {:max-chars 1400}
                                                :result/contract {:type :plan
                                                                  :contract/kind :route/solver->voice}}
                            :context/summarize {:in-schema :req/context
-                                               :out-schema :res/context-summary}
+                                               :out-schema :res/context-summary
+                                               :constraints {:max-chars 500}}
                            :text/respond      {:in-schema :req/text
                                                :out-schema :res/text
-                                               :constraints {:max-chars 1200}
-                                               :system "Jesteś VOICE w projekcie Ferment (Clojure: orkiestrator modeli AI, routing, kontrakty).\nOdpowiadaj po polsku, krótko i rzeczowo.\nTermin 'Ferment' interpretuj jako ten projekt, nie jako funkcję/bibliotekę JavaScript.\nNie ujawniaj wewnętrznego rozumowania i nigdy nie zwracaj znaczników <think>.\nJeśli kontekst jest niejednoznaczny, poproś o doprecyzowanie zamiast zgadywać."}
+                                               :constraints {:max-chars 900}}
                            :problem/solve     {:in-schema :req/problem
-                                               :out-schema :res/problem}
+                                               :out-schema :res/problem
+                                               :constraints {:max-chars 1600}}
                            :code/generate     {:in-schema :req/code
-                                               :out-schema :res/code}
+                                               :out-schema :res/code
+                                               :constraints {:max-chars 8000}
+                                               :system "Jesteś CODEREM w projekcie Ferment.\nGeneruj idiomatyczne rozwiązania (preferuj Clojure, gdy kontekst nie wskazuje inaczej).\nPodawaj konkret, unikaj lania wody. Nie używaj <think>."}
                            :code/patch        {:in-schema :req/code
-                                               :out-schema :res/patch+tests}
+                                               :out-schema :res/patch+tests
+                                               :constraints {:max-chars 12000}
+                                               :system "Jesteś CODEREM w projekcie Ferment.\nDla zmian preferuj patch/diff oraz testy.\nNie używaj <think>. Zwracaj tylko treść merytoryczną."}
                            :code/explain      {:in-schema :req/code
-                                               :out-schema :res/explanation}
+                                               :out-schema :res/explanation
+                                               :constraints {:max-chars 3000}
+                                               :system "Jesteś CODEREM wyjaśniającym kod.\nWyjaśnij krótko i precyzyjnie: co, dlaczego i jakie są konsekwencje.\nNie używaj <think>."}
                            :code/review       {:in-schema :req/code
-                                               :out-schema :res/review}
+                                               :out-schema :res/review
+                                               :constraints {:max-chars 5000}
+                                               :system "Jesteś CODEREM recenzującym kod.\nNajpierw podaj problemy/ryzyka (od najważniejszych), potem krótkie rekomendacje.\nNie używaj <think>."}
                            :eval/grade        {:in-schema :req/eval
                                                :out-schema :res/eval
+                                               :constraints {:max-chars 1200}
+                                               :system "Jesteś JUDGE w projekcie Ferment.\nZwróć ocenę jakości zgodną z kontraktem: score 0.0-1.0 oraz ewentualne violations/retry?.\nBez komentarzy niezwiązanych z oceną i bez <think>."
                                                :result/contract {:type :value
                                                                  :required [:score]
                                                                  :score/range [0.0 1.0]}}}
@@ -40,7 +63,7 @@
                            :no-list-expansion    :builtin/no-list-expansion}
 
   :policy/default         {:done {:must      #{:schema-valid}
-                                   :should    #{:tests-pass :no-hallucinated-apis}
+                                   :should    #{:no-hallucinated-apis}
                                    :score-min 0.80}
                            :checks [:schema-valid]
                            :judge {:enabled? false
@@ -52,52 +75,62 @@
                            :retry {:max-attempts 3
                                    :same-cap-max 1
                                    :fallback-max 1}
-                           :switch-on #{:schema/invalid :format/drift :eval/low-score}
-                           :fallback  [:llm/solver :llm/code :llm/meta :llm/judge :llm/mock]}
+                           :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
+                           :fallback  []}
 
   :policy/intents         {:route/decide      {:done {:must #{:schema-valid}
                                                       :score-min 1.0}
                                                :checks [:schema-valid]
+                                               :fallback [:llm/meta]
                                                :judge {:enabled? false}}
                            :context/summarize {:done {:must #{:schema-valid}
-                                                      :score-min 1.0}
-                                               :checks [:schema-valid]
-                                               :judge {:enabled? false}}
-                           :text/respond      {:done {:must #{:schema-valid}
                                                       :should #{:no-hallucinated-apis :no-list-expansion}
-                                                      :score-min 0.8}
+                                                      :score-min 0.9}
                                                :checks [:schema-valid :no-hallucinated-apis]
+                                               :fallback [:llm/meta]
+                                               :judge {:enabled? false}}
+                           :text/respond      {:done {:must #{:schema-valid :no-list-expansion}
+                                                      :should #{:no-hallucinated-apis}
+                                                      :score-min 0.85}
+                                               :checks [:schema-valid :no-hallucinated-apis :no-list-expansion]
+                                               :fallback [:llm/voice :llm/solver]
                                                :judge {:enabled? true
                                                        :max-attempts 1}}
                            :problem/solve     {:done {:must #{:schema-valid}
                                                       :should #{:no-hallucinated-apis}
                                                       :score-min 0.8}
                                                :checks [:schema-valid :no-hallucinated-apis]
+                                               :fallback [:llm/solver :llm/meta]
                                                :judge {:enabled? false}}
                            :code/generate     {:done {:must #{:schema-valid}
                                                       :should #{:tests-pass :no-hallucinated-apis}
                                                       :score-min 0.8}
-                                               :checks [:schema-valid :tests-pass]
+                                               :checks [:schema-valid :no-hallucinated-apis]
+                                               :fallback [:llm/code]
                                                :judge {:enabled? false}}
                            :code/patch        {:done {:must #{:schema-valid}
                                                       :should #{:tests-pass :no-hallucinated-apis}
                                                       :score-min 0.8}
-                                               :checks [:schema-valid :tests-pass]
+                                               :checks [:schema-valid :tests-pass :no-hallucinated-apis]
+                                               :fallback [:llm/code]
                                                :judge {:enabled? true
                                                        :max-attempts 1}}
                            :code/explain      {:done {:must #{:schema-valid}
                                                       :should #{:tests-pass :no-hallucinated-apis}
                                                       :score-min 0.8}
-                                               :checks [:schema-valid :tests-pass]
+                                               :checks [:schema-valid :no-hallucinated-apis]
+                                               :fallback [:llm/code]
                                                :judge {:enabled? false}}
                            :code/review       {:done {:must #{:schema-valid}
                                                       :should #{:tests-pass :no-hallucinated-apis}
                                                       :score-min 0.8}
-                                               :checks [:schema-valid :tests-pass]
+                                               :checks [:schema-valid :no-hallucinated-apis]
+                                               :fallback [:llm/code]
                                                :judge {:enabled? false}}
                            :eval/grade        {:done {:must #{:schema-valid}
                                                       :score-min 1.0}
                                                :checks [:schema-valid]
+                                               :fallback [:llm/judge]
                                                :judge {:enabled? false}}}
 
   :roles                  {:router {:allowed [:route :checks :budget]}
@@ -117,6 +150,7 @@
                            :format/drift        {:retryable? true}
                            :timeout/soft        {:retryable? true}
                            :eval/low-score      {:retryable? true}
+                           :eval/must-failed    {:retryable? true}
                            :policy/blocked      {:retryable? false}
                            :timeout/hard        {:retryable? false}
                            :input/invalid       {:retryable? false}

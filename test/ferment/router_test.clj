@@ -64,6 +64,35 @@
           {:routing {:intent->cap {:problem/solve :llm/solver}
                      :switch-on :eval/low-score}})))))
 
+(deftest router-config-validation-validates-defaults
+  (testing "Router branch validates :defaults for meta/strict/force/on-error."
+    (let [cfg (router/init-router
+               :ferment.router/default
+               {:routing {:intent->cap {:problem/solve :llm/solver}}
+                :defaults {:meta? true
+                           :strict? false
+                           :force? false
+                           :on-error :fail-open}})]
+      (is (= {:meta? true
+              :strict? false
+              :force? false
+              :on-error :fail-open}
+             (:defaults cfg))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"flags must be booleans"
+         (router/init-router
+          :ferment.router/default
+          {:routing {:intent->cap {:problem/solve :llm/solver}}
+           :defaults {:strict? :yes}})))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #":on-error must be :fail-open or :fail-closed"
+         (router/init-router
+          :ferment.router/default
+          {:routing {:intent->cap {:problem/solve :llm/solver}}
+           :defaults {:on-error :panic}})))))
+
 (deftest router-config-validation-allows-integrant-refs
   (testing "Router branch accepts unresolved Integrant refs for :routing and :profiles."
     (let [cfg (router/init-router
@@ -74,6 +103,20 @@
       (is (ig/ref? (:routing cfg)))
       (is (ig/ref? (:profiles cfg)))
       (is (= :quality-aware (:policy cfg))))))
+
+(deftest routing-defaults-from-runtime
+  (testing "Routing defaults are read from runtime router branch."
+    (is (= {:meta? true
+            :strict? true
+            :force? false
+            :on-error :fail-closed}
+           (router/routing-defaults
+            {:router {:defaults {:meta? true
+                                 :strict? true
+                                 :force? false
+                                 :on-error :fail-closed}}})))
+    (is (= {} (router/routing-defaults {:router {}})))
+    (is (= {} (router/routing-defaults nil)))))
 
 (deftest resolve-model-key-precedence
   (testing "model key resolution uses capability dispatch, then router branch routing, then defaults."

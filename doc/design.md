@@ -102,7 +102,7 @@ Obecne klocki:
 - `ferment.router`, `ferment.resolver`, `ferment.contracts`, `ferment.protocol` – routing, registry capability i walidacja request/response,
 - `ferment.model` – runtime modeli (proces, HTTP invoke, sesyjne workery, freeze/thaw/TTL),
 - `ferment.http` – bridge HTTP (`/v1/act`, `/v1/session`, `/v1/admin`, `/health`, `/routes`, `/diag/telemetry`),
-- `ferment.session`, `ferment.session.store` – sesje i pamięć robocza (session vars, polityki, backend DB),
+- `ferment.session`, `ferment.session.store` – sesje i pamięć robocza (session vars, polityki, klasy danych TTL/freeze, backend DB),
 - `ferment.system`, `ferment.env`, `ferment.env.file`, `ferment.readers` – konfiguracja i lifecycle usług,
 - `ferment.db`, `ferment.auth*`, `ferment.roles`, `ferment.effects`, `ferment.oplog*` – warstwy DB/Auth/RBAC/efekty/audit.
 
@@ -113,6 +113,12 @@ Docelowe pączki:
 - `ferment.adapters.*` – dostawcy modeli i narzędzia,
 - `ferment.memory` – stan sesji, kontekst, cache,
 - `ferment.telemetry` – logi strukturalne, metryki, trace-id.
+  - bieżący snapshot `/diag/telemetry` obejmuje `:act`, `:workflow` oraz kanoniczne KPI w `:kpi` (`parse-rate`, `retry-rate`, `fallback-rate`, `judge-pass-rate`, `failure-taxonomy`).
+- pakiety promptów protokołu (`resources/config/common/prod/protocol.edn`) są stratyfikowane:
+  - `:prompts/:default` (globalny rdzeń),
+  - `:prompts/:roles` (router/solver/voice/coder/judge),
+  - `:prompts/:intents` (doprecyzowanie semantyki intencji).
+  Runtime składa prompt z tych warstw; `:intents/*/:system` i `:system/prompt` pozostają kompatybilnym pełnym override.
 
 ### 6.1. Stan implementacji (2026-02-22)
 
@@ -120,6 +126,10 @@ W systemie działa już podział na gałęzie konfiguracyjne Integranta:
 - `:ferment.runtime/default` – runtime input dla orkiestratora (refs do `:router`, `:resolver`, `:protocol`, `:roles`, `:session`, `:oplog`, `:models`, plus scope efektów),
 - `:ferment.core/default` – usługa core (`:invoke!`, `:solver!`, `:voice!`, `:respond!`) inicjalizowana z runtime,
 - `:ferment.model.defaults/*`, `:ferment.model.id/*`, `:ferment.model.runtime/*`, `:ferment.model/*`, `:ferment/models` – pełna konfiguracja doboru i runtime modeli.
+- `:ferment.session.store/default :session-vars/contract` obsługuje:
+  - `:policy/*` (read/write/delete per intent i operacja),
+  - `:class/by-namespace` + `:class/policy` (TTL/freeze per klasa danych),
+  - `:request/default-bindings` (automatyczne wstrzykiwanie session vars do requestu `/v1/act`).
 
 Aktualny bootstrap:
 - produkcyjny: `ferment.app/start!` (ładuje `resources/config/common/prod` + `resources/config/local/prod`),

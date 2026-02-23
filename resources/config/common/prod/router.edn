@@ -3,6 +3,10 @@
  :ferment.router/default
  {:routing  #ref :ferment.caps/routing
   :profiles #ref :ferment.caps/profiles
+  :defaults {:meta? true
+             :strict? false
+             :force? false
+             :on-error :fail-open}
   :policy   :meta-decider}
 
 }

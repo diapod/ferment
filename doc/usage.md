@@ -70,7 +70,22 @@ bin/rollback-db dev 0004-roles
 ```bash
 curl -s http://127.0.0.1:12002/health
 curl -s http://127.0.0.1:12002/routes
+curl -s http://127.0.0.1:12002/diag/telemetry
 ```
+
+`/diag/telemetry` includes canonical quality KPI under `telemetry.kpi`:
+- `parse-rate`
+- `retry-rate`
+- `fallback-rate`
+- `judge-pass-rate`
+- `failure-taxonomy` (`by-type` + `by-domain`)
+
+Prompt tuning source of truth:
+- `resources/config/common/prod/protocol.edn`
+  - `:prompts/:default`
+  - `:prompts/:roles`
+  - `:prompts/:intents`
+- intent-level `:system` / `:system/prompt` still work as explicit full override.
 
 ## 1) Local single-model chat (quickest path)
 
@@ -180,6 +195,20 @@ curl -s http://127.0.0.1:12002/v1/session \
 - `session/del-var`, `session/del-vars`, `session/del-all-vars`
 
 For vars operations, runtime enforces `session-vars` policy from config (`:policy/default`, `:policy/by-intent`, `:policy/by-operation`).
+
+Additional contract controls:
+- `:class/by-namespace` + `:class/policy`: classify vars by namespace and apply per-class TTL/freeze rules.
+- `:request/default-bindings`: declarative map of session vars auto-injected into `/v1/act` request paths (for example `[:constraints :language]`, `[:input :system]`, `[:context :summary]`).
+
+TTL resolution order on write:
+1. explicit request option `:ttl-ms`,
+2. class default (`:class/policy/* :ttl/default-ms`),
+3. global default (`:ttl/default-ms`),
+and then clamp by class/global max (`:ttl/max-ms`).
+
+Freeze behavior on write/delete:
+- when session is frozen, permission is checked per key class first,
+- if class rule is missing, runtime falls back to global `:freeze/allow-write?` / `:freeze/allow-delete?`.
 
 ```bash
 # Write a var in namespace "request" (allowed for put operation by default policy)

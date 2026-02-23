@@ -134,7 +134,11 @@
    :limits/max-value-bytes   131072
    :policy/default           {}
    :policy/by-intent         {}
-   :policy/by-operation      {}})
+   :policy/by-operation      {}
+   :class/default            :session.vars/default
+   :class/by-namespace       {}
+   :class/policy             {}
+   :request/default-bindings {}})
 
 (def ^:private session-var-value-key :session.var/value)
 (def ^:private session-var-meta-key  :session.var/meta)
@@ -186,6 +190,17 @@
                       (keyword s))))
     :else nil))
 
+(defn- parse-var-keyword
+  [k]
+  (cond
+    (keyword? k) k
+    (string? k) (let [s (some-> k str/trim not-empty)]
+                  (when s
+                    (if (str/starts-with? s ":")
+                      (keyword (subs s 1))
+                      (keyword s))))
+    :else nil))
+
 (defn- normalize-key-namespace
   [v]
   (cond
@@ -204,6 +219,88 @@
     (if (seq src)
       (into #{} (keep normalize-key-namespace) src)
       #{})))
+
+(defn- normalize-class-policy-entry
+  [entry]
+  (let [entry' (if (map? entry) entry {})
+        default-ttl? (contains? entry' :ttl/default-ms)
+        max-ttl? (contains? entry' :ttl/max-ms)
+        write? (contains? entry' :freeze/allow-write?)
+        delete? (contains? entry' :freeze/allow-delete?)
+        default-ttl (when default-ttl?
+                      (non-negative-int-or-nil (:ttl/default-ms entry')))
+        max-ttl (when max-ttl?
+                  (positive-int (:ttl/max-ms entry') nil))
+        default-ttl' (when (some? default-ttl)
+                       (if (some? max-ttl)
+                         (min default-ttl max-ttl)
+                         default-ttl))]
+    (cond-> {}
+      default-ttl? (assoc :ttl/default-ms default-ttl')
+      max-ttl? (assoc :ttl/max-ms max-ttl)
+      write? (assoc :freeze/allow-write? (truthy? (:freeze/allow-write? entry')))
+      delete? (assoc :freeze/allow-delete? (truthy? (:freeze/allow-delete? entry'))))))
+
+(defn- normalize-class-policy-map
+  [m]
+  (if (map? m)
+    (reduce-kv (fn [acc k v]
+                 (if-some [class-id (keywordish k)]
+                   (assoc acc class-id (normalize-class-policy-entry v))
+                   acc))
+               {}
+               m)
+    {}))
+
+(defn- normalize-class-by-namespace
+  [m]
+  (if (map? m)
+    (reduce-kv (fn [acc ns' class-id]
+                 (if-let [ns* (normalize-key-namespace ns')]
+                   (if-some [class* (keywordish class-id)]
+                     (assoc acc ns* class*)
+                     acc)
+                   acc))
+               {}
+               m)
+    {}))
+
+(defn- normalize-target-path
+  [v]
+  (let [src (cond
+              (vector? v) v
+              (sequential? v) (vec v)
+              (keyword? v) [v]
+              (string? v) (some-> (keywordish v) vector)
+              :else nil)
+        path (when (seq src)
+               (->> src (keep keywordish) vec))]
+    (when (seq path)
+      path)))
+
+(defn- normalize-request-default-binding-entry
+  [entry]
+  (let [entry' (cond
+                 (map? entry) entry
+                 :else {:target entry})
+        target (normalize-target-path (:target entry'))
+        coerce (some-> (:coerce entry') keywordish)]
+    (when (seq target)
+      (cond-> {:target target}
+        (keyword? coerce) (assoc :coerce coerce)))))
+
+(defn- normalize-request-default-bindings
+  [m]
+  (if (map? m)
+    (reduce-kv (fn [acc k v]
+                 (if-some [k' (parse-var-keyword k)]
+                   (if-some [binding (normalize-request-default-binding-entry v)]
+                     (assoc acc k' binding)
+                     acc)
+                   acc))
+               {}
+               m)
+    {}))
 
 (defn- normalize-vars-policy-entry
   [entry]
@@ -275,6 +372,20 @@
         policy-by-operation (if (contains? src :policy/by-operation)
                               (normalize-vars-policy-map (:policy/by-operation src))
                               (:policy/by-operation default-session-vars-contract))
+        class-default (if (contains? src :class/default)
+                        (or (keywordish (:class/default src))
+                            (:class/default default-session-vars-contract))
+                        (:class/default default-session-vars-contract))
+        class-by-namespace (if (contains? src :class/by-namespace)
+                             (normalize-class-by-namespace (:class/by-namespace src))
+                             (:class/by-namespace default-session-vars-contract))
+        class-policy (if (contains? src :class/policy)
+                       (normalize-class-policy-map (:class/policy src))
+                       (:class/policy default-session-vars-contract))
+        request-default-bindings (if (contains? src :request/default-bindings)
+                                   (normalize-request-default-bindings
+                                    (:request/default-bindings src))
+                                   (:request/default-bindings default-session-vars-contract))
         default-ttl-ms' (when (some? default-ttl-ms)
                           (if (pos? max-ttl-ms)
                             (min default-ttl-ms max-ttl-ms)
@@ -290,18 +401,15 @@
      :limits/max-value-bytes max-value-bytes
      :policy/default policy-default
      :policy/by-intent policy-by-intent
-     :policy/by-operation policy-by-operation}))
+     :policy/by-operation policy-by-operation
+     :class/default class-default
+     :class/by-namespace class-by-namespace
+     :class/policy class-policy
+     :request/default-bindings request-default-bindings}))
 
 (defn- parse-var-key
   [k]
-  (cond
-    (keyword? k) k
-    (string? k) (let [s (some-> k str/trim not-empty)]
-                  (when s
-                    (if (str/starts-with? s ":")
-                      (keyword (subs s 1))
-                      (keyword s))))
-    :else nil))
+  (parse-var-keyword k))
 
 (defn- var-key-text
   [k]
@@ -397,33 +505,104 @@
                        :allowed-namespaces allowed})))
     k'))
 
+(defn- var-class-id
+  [contract k]
+  (let [ns' (or (namespace k) (name k))]
+    (or (get-in contract [:class/by-namespace ns'])
+        (:class/default contract))))
+
+(defn- class-policy-for
+  [contract k]
+  (let [class-id (var-class-id contract k)
+        class-policy (if (keyword? class-id)
+                       (get-in contract [:class/policy class-id])
+                       nil)]
+    {:class/id class-id
+     :policy (if (map? class-policy) class-policy {})}))
+
+(defn- mode->freeze-policy-key
+  [mode]
+  (case mode
+    :put :freeze/allow-write?
+    :del :freeze/allow-delete?
+    nil))
+
+(defn- freeze-allow?
+  [contract mode k]
+  (let [class-info (class-policy-for contract k)
+        class-id (:class/id class-info)
+        policy (:policy class-info)
+        policy-key (mode->freeze-policy-key mode)
+        class-defined? (contains? policy policy-key)
+        class-allow? (when class-defined?
+                       (truthy? (get policy policy-key)))
+        global-allow? (case mode
+                        :put (:freeze/allow-write? contract)
+                        :del (:freeze/allow-delete? contract)
+                        false)]
+    {:class/id class-id
+     :allow? (if class-defined?
+               class-allow?
+               (truthy? global-allow?))}))
+
 (defn- ensure-write-permitted!
-  [store sid mode]
-  (let [contract (or (:session-vars/contract store) default-session-vars-contract)
-        allow? (case mode
-                 :put (:freeze/allow-write? contract)
-                 :del (:freeze/allow-delete? contract)
-                 false)
-        session (ensure-session! store sid nil)]
-    (when (and (true? (:session/frozen? session))
-               (not allow?))
-      (throw (ex-info "Session vars are read-only while session is frozen."
-                      {:error :session.vars/session-frozen
-                       :session/id sid
-                       :mode mode
-                       :session/state (:session/state session)
-                       :session/frozen? (:session/frozen? session)})))))
+  ([store sid mode]
+   (ensure-write-permitted! store sid mode nil))
+  ([store sid mode keys]
+   (let [contract (or (:session-vars/contract store) default-session-vars-contract)
+         keys' (when (sequential? keys)
+                 (->> keys
+                      (keep parse-var-key)
+                      distinct
+                      vec))
+         session (ensure-session! store sid nil)]
+     (when (true? (:session/frozen? session))
+       (if (seq keys')
+         (let [decisions (mapv #(assoc (freeze-allow? contract mode %) :key %) keys')
+               denied (->> decisions (remove :allow?) vec)]
+           (when (seq denied)
+             (throw (ex-info "Session vars are read-only while session is frozen."
+                             {:error :session.vars/session-frozen
+                              :session/id sid
+                              :mode mode
+                              :session/state (:session/state session)
+                              :session/frozen? (:session/frozen? session)
+                              :denied-keys (mapv :key denied)
+                              :denied-classes (->> denied (map :class/id) distinct vec)}))))
+         (let [allow? (case mode
+                        :put (:freeze/allow-write? contract)
+                        :del (:freeze/allow-delete? contract)
+                        false)]
+           (when-not (truthy? allow?)
+             (throw (ex-info "Session vars are read-only while session is frozen."
+                             {:error :session.vars/session-frozen
+                              :session/id sid
+                              :mode mode
+                              :session/state (:session/state session)
+                              :session/frozen? (:session/frozen? session)})))))))))
 
 (defn- resolve-var-ttl-ms
-  [store opts]
+  [store key opts]
   (let [contract (or (:session-vars/contract store) default-session-vars-contract)
+        key' (or (parse-var-key key)
+                 (parse-var-keyword key))
+        class-policy (if (keyword? key')
+                       (:policy (class-policy-for contract key'))
+                       {})
         requested (if (map? opts)
                     (non-negative-int-or-nil (:ttl-ms opts))
                     nil)
-        ttl-ms (or requested (:ttl/default-ms contract))
-        max-ttl-ms (:ttl/max-ms contract)]
+        class-default-ttl-ms (non-negative-int-or-nil (:ttl/default-ms class-policy))
+        ttl-ms (or requested
+                   class-default-ttl-ms
+                   (:ttl/default-ms contract))
+        class-max-ttl-ms (positive-int (:ttl/max-ms class-policy) nil)
+        max-ttl-ms (or class-max-ttl-ms
+                       (:ttl/max-ms contract))]
     (when (some? ttl-ms)
-      (min ttl-ms max-ttl-ms))))
+      (if (some? max-ttl-ms)
+        (min ttl-ms max-ttl-ms)
+        ttl-ms))))
 
 (defn- value-size-bytes
   [v]
@@ -444,15 +623,20 @@
                        :max-value-bytes limit})))))
 
 (defn- make-var-entry
-  [store value opts]
+  [store key value opts]
   (let [set-ms (now-ms)
-        ttl-ms (resolve-var-ttl-ms store opts)
+        key' (or (parse-var-key key) key)
+        contract (or (:session-vars/contract store) default-session-vars-contract)
+        class-id (when (keyword? key')
+                   (var-class-id contract key'))
+        ttl-ms (resolve-var-ttl-ms store key' opts)
         expires-ms (when (some? ttl-ms)
                      (+ set-ms ttl-ms))]
     {session-var-value-key value
      session-var-meta-key
      (cond-> {:set/ms set-ms
               :set/at (str (Instant/ofEpochMilli set-ms))}
+       (keyword? class-id) (assoc :class/id class-id)
        (some? ttl-ms) (assoc :ttl/ms ttl-ms)
        (some? expires-ms) (assoc :expires/ms expires-ms
                                  :expires/at (str (Instant/ofEpochMilli expires-ms))))}))
@@ -708,6 +892,19 @@
   [_k _state]
   nil)
 
+(defn request-default-bindings
+  "Returns normalized request default bindings for session vars.
+
+  Each entry maps a session var key to:
+  - `:target` vector path in request map,
+  - optional `:coerce` keyword."
+  [store]
+  (let [contract (or (:session-vars/contract store) default-session-vars-contract)
+        bindings (:request/default-bindings contract)]
+    (if (map? bindings)
+      bindings
+      {})))
+
 (defn store-state
   [store]
   (:state store))
@@ -896,12 +1093,12 @@
    (let [sid' (normalize-session-id sid)
          opts' (if (map? opts) opts {})
          k' (ensure-policy-permitted! store sid' k :put opts')
-         _ (ensure-write-permitted! store sid' :put)
+         _ (ensure-write-permitted! store sid' :put [k'])
          _ (expire-session-vars! store sid')
          existing (keys (normalize-raw-vars-map (read-all-raw-vars store sid')))
          _ (enforce-vars-count-limit! store sid' existing [k'])
          _ (enforce-value-limit! store sid' k' v)
-         entry (make-var-entry store v opts')]
+         entry (make-var-entry store k' v opts')]
      (if (db-store? store)
        ((:var-setter store) (:db store) sid' k' entry)
        (update-session! store sid'
@@ -926,13 +1123,13 @@
      (if-not (seq normalized)
        false
        (do
-         (ensure-write-permitted! store sid' :put)
+         (ensure-write-permitted! store sid' :put (keys normalized))
          (expire-session-vars! store sid')
          (let [existing (keys (normalize-raw-vars-map (read-all-raw-vars store sid')))
                incoming (keys normalized)
                _ (enforce-vars-count-limit! store sid' existing incoming)
                entries (reduce-kv (fn [m k v]
-                                    (assoc m k (make-var-entry store v opts')))
+                                    (assoc m k (make-var-entry store k v opts')))
                                   {}
                                   normalized)]
            (if (db-store? store)
@@ -948,7 +1145,7 @@
   ([store sid k opts]
    (let [sid' (normalize-session-id sid)
          k'   (ensure-policy-permitted! store sid' k :del opts)]
-     (ensure-write-permitted! store sid' :del)
+     (ensure-write-permitted! store sid' :del [k'])
      (expire-session-vars! store sid')
      (delete-raw-vars! store sid' [k'])
      true)))
@@ -966,7 +1163,7 @@
      (if-not (seq ks')
        false
        (do
-         (ensure-write-permitted! store sid' :del)
+         (ensure-write-permitted! store sid' :del ks')
          (expire-session-vars! store sid')
          (delete-raw-vars! store sid' ks')
          true)))))
@@ -977,9 +1174,10 @@
   ([store sid opts]
    (let [sid' (normalize-session-id sid)]
      (expire-session-vars! store sid')
-     (doseq [k (keys (normalize-raw-vars-map (read-all-raw-vars store sid')))]
-       (ensure-policy-permitted! store sid' k :del opts))
-     (ensure-write-permitted! store sid' :del)
+     (let [ks' (keys (normalize-raw-vars-map (read-all-raw-vars store sid')))]
+       (doseq [k ks']
+         (ensure-policy-permitted! store sid' k :del opts))
+       (ensure-write-permitted! store sid' :del ks'))
      (if (db-store? store)
        ((:var-deleter store) (:db store) sid')
        (update-session! store sid'

@@ -18,6 +18,7 @@
             [ferment.roles :as roles]
             [ferment.router :as router]
             [ferment.session :as session]
+            [ferment.session.store :as session-store]
             [ferment.system :as system]
             [ferment.admin :as admin]
             [ferment.workflow :as workflow]
@@ -168,6 +169,7 @@
                   meta?    (->bool (:meta? routing'))
                   strict?  (->bool (:strict? routing'))
                   force?   (->bool (:force? routing'))
+                  on-error (keywordish (:on-error routing'))
                   debug-plan? (->bool (or (:debug/plan? routing')
                                           (:debug-plan? routing')
                                           (get-in routing' [:debug :plan?])))]
@@ -177,6 +179,7 @@
                 (some? meta?) (assoc :meta? meta?)
                 (some? strict?) (assoc :strict? strict?)
                 (some? force?) (assoc :force? force?)
+                (contains? #{:fail-open :fail-closed} on-error) (assoc :on-error on-error)
                 (some? debug-plan?) (assoc :debug/plan? debug-plan?))))
           (normalize-top
             [request]
@@ -293,13 +296,139 @@
          :latency-ms {:count 0
                       :sum 0.0
                       :max 0.0}}
-   :workflow {}})
+   :workflow {:calls/total 0
+              :calls/succeeded 0
+              :calls/failed 0
+              :calls/retries 0
+              :calls/fallback-hops 0
+              :calls/failure-types {}
+              :quality/judge-used 0
+              :quality/judge-pass 0
+              :quality/judge-fail 0
+              :quality/must-failed 0}})
+
+(defn- workflow-telemetry-from-error
+  [body]
+  (let [outcome     (if (map? body) (get-in body [:error :details :outcome]) nil)
+        failure-type (when (map? outcome) (:failure/type outcome))
+        must-failed (when (map? outcome) (get-in outcome [:done/eval :must-failed]))]
+    (if (map? outcome)
+      (cond-> {:calls/total 1
+               :calls/failed 1}
+        (keyword? failure-type)
+        (assoc :calls/failure-types {failure-type 1})
+
+        (and (sequential? must-failed) (seq must-failed))
+        (assoc :quality/must-failed 1))
+      {})))
 
 (defn- telemetry-error-type
   [body]
   (let [err-type (or (get-in body [:error :type])
                      (get-in body [:result :error :type]))]
     (when (keyword? err-type) err-type)))
+
+(def ^:private parse-failure-types
+  #{:schema/invalid
+    :format/drift})
+
+(defn- counter-value
+  [v]
+  (long (or (parse-non-negative-long v) 0)))
+
+(defn- normalize-counter-map
+  [m]
+  (if (map? m)
+    (reduce-kv (fn [acc k v]
+                 (let [k' (keywordish k)
+                       n  (counter-value v)]
+                   (if (and (keyword? k') (pos? n))
+                     (assoc acc k' n)
+                     acc)))
+               {}
+               m)
+    {}))
+
+(defn- sum-counter
+  [counter ks]
+  (reduce (fn [acc k]
+            (+ acc (counter-value (get counter k))))
+          0
+          ks))
+
+(defn- safe-rate
+  [num den]
+  (when (pos? den)
+    (/ (double num) (double den))))
+
+(defn- failure-domain
+  [failure-type]
+  (case (some-> failure-type namespace)
+    "auth" :auth
+    "effects" :effects
+    "route" :route
+    "runtime" :runtime
+    "schema" :schema
+    "eval" :eval
+    "input" :input
+    "unsupported" :unsupported
+    "timeout" :timeout
+    "policy" :policy
+    "session" :session
+    :other))
+
+(defn- failure-taxonomy
+  [act-errors workflow-errors]
+  (let [by-type (merge-with + (or act-errors {}) (or workflow-errors {}))
+        by-domain (reduce-kv (fn [acc failure-type count']
+                               (update acc
+                                       (failure-domain failure-type)
+                                       (fnil + 0)
+                                       (counter-value count')))
+                             {}
+                             by-type)]
+    {:by-type by-type
+     :by-domain by-domain}))
+
+(defn- telemetry-kpi
+  [state]
+  (let [act            (if (map? (:act state)) (:act state) {})
+        workflow       (if (map? (:workflow state)) (:workflow state) {})
+        act-errors     (normalize-counter-map (:error-types act))
+        wf-errors      (normalize-counter-map (:calls/failure-types workflow))
+        act-requests   (counter-value (:requests act))
+        wf-calls-total (counter-value (:calls/total workflow))
+        retries        (counter-value (:calls/retries workflow))
+        fallback-hops  (counter-value (:calls/fallback-hops workflow))
+        must-failed    (counter-value (:quality/must-failed workflow))
+        judge-used     (counter-value (:quality/judge-used workflow))
+        judge-pass     (counter-value (:quality/judge-pass workflow))
+        judge-fail     (counter-value (:quality/judge-fail workflow))
+        parse-source   (if (pos? wf-calls-total) :workflow :act)
+        parse-total    (if (pos? wf-calls-total) wf-calls-total act-requests)
+        parse-failures (if (pos? wf-calls-total)
+                         (sum-counter wf-errors parse-failure-types)
+                         (sum-counter act-errors parse-failure-types))
+        parse-ok       (max 0 (- parse-total parse-failures))]
+    {:parse-rate {:value (safe-rate parse-ok parse-total)
+                  :ok parse-ok
+                  :failures parse-failures
+                  :total parse-total
+                  :source parse-source}
+     :retry-rate {:value (safe-rate retries wf-calls-total)
+                  :retries retries
+                  :total wf-calls-total}
+     :fallback-rate {:value (safe-rate fallback-hops wf-calls-total)
+                     :fallback-hops fallback-hops
+                     :total wf-calls-total}
+     :must-failed-rate {:value (safe-rate must-failed wf-calls-total)
+                        :must-failed must-failed
+                        :total wf-calls-total}
+     :judge-pass-rate {:value (safe-rate judge-pass judge-used)
+                       :pass judge-pass
+                       :fail judge-fail
+                       :used judge-used}
+     :failure-taxonomy (failure-taxonomy act-errors wf-errors)}))
 
 (defn- record-act-telemetry!
   ([telemetry response latency-ms]
@@ -310,7 +439,8 @@
            body   (:body response)
            ok?    (< (int status) 400)
            err-k  (telemetry-error-type body)
-           wf-telemetry (get-in body [:result :plan/run :telemetry])]
+           wf-telemetry (get-in body [:result :plan/run :telemetry])
+           wf-error-telemetry (workflow-telemetry-from-error body)]
        (swap! telemetry
               (fn [state]
                 (-> (merge-telemetry-counters (default-telemetry) state)
@@ -324,18 +454,22 @@
                       (update-in [:act :error-types err-k] (fnil inc 0)))
                     (cond-> (map? wf-telemetry)
                       (update :workflow merge-telemetry-counters wf-telemetry))
+                    (cond-> (map? wf-error-telemetry)
+                      (update :workflow merge-telemetry-counters wf-error-telemetry))
                     (cond-> (map? routing-telemetry)
                       (update-in [:act :routing] merge-telemetry-counters routing-telemetry)))))))))
 
 (defn- telemetry-snapshot
   [telemetry]
-  (let [state (if (instance? clojure.lang.IAtom telemetry)
-                @telemetry
-                (default-telemetry))
-        count (get-in state [:act :latency-ms :count] 0)
-        sum   (double (get-in state [:act :latency-ms :sum] 0.0))
-        avg   (if (pos? count) (/ sum count) 0.0)]
-    (assoc-in state [:act :latency-ms :avg] avg)))
+  (let [state0 (if (instance? clojure.lang.IAtom telemetry)
+                 @telemetry
+                 (default-telemetry))
+        state  (merge-telemetry-counters (default-telemetry) state0)
+        count  (counter-value (get-in state [:act :latency-ms :count]))
+        sum    (double (or (get-in state [:act :latency-ms :sum]) 0.0))
+        avg    (if (pos? count) (/ sum count) 0.0)
+        state' (assoc-in state [:act :latency-ms :avg] avg)]
+    (assoc state' :kpi (telemetry-kpi state'))))
 
 (defn- resolve-cap-id
   [resolver request]
@@ -412,11 +546,19 @@
       (map? session-meta) (assoc :session/meta session-meta)
       (request-debug-plan? request) (assoc :debug/plan? true))))
 
-(def ^:private default-session-vars-keys
-  [:session/language
+(def ^:private fallback-request-default-bindings
+  {:session/language
+   {:target [:constraints :language]
+    :coerce :keyword-or-string}
    :session/style
+   {:target [:constraints :style]
+    :coerce :keyword-or-string}
    :session/system-prompt
-   :session/context-summary])
+   {:target [:input :system]
+    :coerce :trimmed-string}
+   :session/context-summary
+   {:target [:context :summary]
+    :coerce :trimmed-string}})
 
 (defn- session-var-value
   [vars k]
@@ -424,52 +566,52 @@
       (get vars (name k))
       (get vars (str (namespace k) "/" (name k)))))
 
-(defn- session-default-language
-  [vars]
-  (let [raw (session-var-value vars :session/language)]
-    (or (keywordish raw)
-        (trim-s raw))))
+(defn- session-request-default-bindings
+  [runtime]
+  (let [service (when (map? runtime) (:session runtime))
+        store (when (map? service) (:store service))
+        bindings (when (map? store)
+                   (session-store/request-default-bindings store))]
+    (if (seq bindings)
+      bindings
+      fallback-request-default-bindings)))
 
-(defn- session-default-style
-  [vars]
-  (let [raw (session-var-value vars :session/style)]
-    (or (keywordish raw)
-        (trim-s raw))))
-
-(defn- session-default-system-prompt
-  [vars]
-  (trim-s (session-var-value vars :session/system-prompt)))
-
-(defn- session-default-context-summary
-  [vars]
-  (trim-s (session-var-value vars :session/context-summary)))
+(defn- coerce-session-default-value
+  [coerce raw]
+  (case (keywordish coerce)
+    :identity raw
+    :keyword (keywordish raw)
+    :trimmed-string (trim-s raw)
+    :string (some-> raw str)
+    :keyword-or-string (or (keywordish raw) (trim-s raw))
+    (or (keywordish raw) (trim-s raw))))
 
 (defn- apply-session-var-defaults
-  [request vars]
-  (let [lang'   (session-default-language vars)
-        style'  (session-default-style vars)
-        system' (session-default-system-prompt vars)
-        summary' (session-default-context-summary vars)]
-    (cond-> request
-      (and (some? lang')
-           (nil? (get-in request [:constraints :language])))
-      (assoc-in [:constraints :language] lang')
-
-      (and (some? style')
-           (nil? (get-in request [:constraints :style])))
-      (assoc-in [:constraints :style] style')
-
-      (and (some? system')
-           (nil? (get-in request [:input :system])))
-      (assoc-in [:input :system] system')
-
-      (and (some? summary')
-           (nil? (get-in request [:context :summary])))
-      (assoc-in [:context :summary] summary'))))
+  [request vars bindings]
+  (reduce-kv (fn [req k binding]
+               (let [target (when (map? binding) (:target binding))
+                     target' (when (or (vector? target)
+                                       (sequential? target))
+                               (vec target))
+                     raw (session-var-value vars k)
+                     value (coerce-session-default-value
+                            (when (map? binding) (:coerce binding))
+                            raw)]
+                 (if (and (seq target')
+                          (nil? (get-in req target'))
+                          (some? value))
+                   (assoc-in req target' value)
+                   req)))
+             request
+             (if (map? bindings) bindings {})))
 
 (defn- request-with-session-defaults
   [runtime request]
   (let [service (when (map? runtime) (:session runtime))
+        bindings (session-request-default-bindings runtime)
+        binding-keys (->> (keys bindings)
+                          (keep keywordish)
+                          vec)
         sid     (or (some-> request :session/id trim-s)
                     (some-> request :session-id trim-s))
         intent  (some-> request :task :intent keywordish)
@@ -478,15 +620,16 @@
     (if (and (map? request)
              (map? service)
              (fn? (:get-vars! service))
-             sid)
+             sid
+             (seq binding-keys))
       (let [vars (try
-                   (session/get-vars! service sid default-session-vars-keys opts)
+                   (session/get-vars! service sid binding-keys opts)
                    (catch clojure.lang.ArityException _
-                     (session/get-vars! service sid default-session-vars-keys))
+                     (session/get-vars! service sid binding-keys))
                    (catch Throwable _
                      nil))]
         (if (map? vars)
-          (apply-session-var-defaults request vars)
+          (apply-session-var-defaults request vars bindings)
           request))
       request)))
 
@@ -755,11 +898,16 @@
       :else
       (invalid-route-decide-result request))))
 
-(defn- routing-config
+(defn- request-routing-config
   [request]
   (if (map? (:routing request))
     (:routing request)
     {}))
+
+(defn- effective-routing-config
+  [runtime request]
+  (merge (router/routing-defaults runtime)
+         (request-routing-config request)))
 
 (defn- meta-routing-target-intent
   [request]
@@ -772,27 +920,50 @@
 
 (defn- meta-routing-enabled?
   [runtime request]
-  (let [cfg (routing-config request)]
+  (let [cfg (effective-routing-config runtime request)]
     (if (contains? cfg :meta?)
       (boolean (:meta? cfg))
       (= :meta-decider (get-in runtime [:router :policy])))))
 
+(defn- meta-routing-fail-mode
+  [runtime request]
+  (let [request-cfg          (request-routing-config request)
+        request-on-error     (keywordish (:on-error request-cfg))
+        request-strict?      (boolean (:strict? request-cfg))
+        request-strict-set?  (contains? request-cfg :strict?)
+        cfg                  (effective-routing-config runtime request)
+        on-error             (keywordish (:on-error cfg))
+        strict?              (boolean (:strict? cfg))]
+    (cond
+      ;; Explicit request on-error mode has top priority.
+      (= :fail-closed request-on-error) :fail-closed
+      (= :fail-open request-on-error) :fail-open
+
+      ;; Request strict flag should override router default fail-open.
+      (and request-strict-set? request-strict?) :fail-closed
+      (and request-strict-set? (not request-strict?)) :fail-open
+
+      (= :fail-closed on-error) :fail-closed
+      (= :fail-open on-error) :fail-open
+      strict? :fail-closed
+      :else :fail-open)))
+
 (defn- meta-routing-strict?
-  [request]
-  (boolean (:strict? (routing-config request))))
+  [runtime request]
+  (= :fail-closed (meta-routing-fail-mode runtime request)))
 
 (defn- meta-routing-force?
-  [request]
-  (boolean (:force? (routing-config request))))
+  [runtime request]
+  (boolean (:force? (effective-routing-config runtime request))))
 
 (defn- meta-routing-intent
   [request]
-  (or (some-> (routing-config request) :intent keywordish)
+  (or (some-> (request-routing-config request) :intent keywordish)
       :route/decide))
 
 (defn- meta-routing-cap-id
   [runtime resolver request route-intent]
-  (or (some-> (routing-config request) :cap/id keywordish)
+  (or (some-> (request-routing-config request) :cap/id keywordish)
       (some-> resolver :routing :intent->cap (get route-intent))
       (some-> (router/resolver-routing runtime resolver) :intent->cap (get route-intent))
       (when (= :route/decide route-intent) :llm/meta)))
@@ -811,8 +982,8 @@
          vec)))
 
 (defn- merge-routing-decision
-  [request decision]
-  (let [force?       (meta-routing-force? request)
+  [runtime request decision]
+  (let [force?       (meta-routing-force? runtime request)
         explicit-cap (keyword? (get-in request [:task :cap/id]))
         primary-cap  (keywordish (:cap/id decision))
         candidates   (routing-decision-candidates decision)
@@ -880,10 +1051,127 @@
      :result-parser route-decide-result-parser
      :resolver resolver}))
 
+(defn- compact-last-check
+  [last-check]
+  (when (map? last-check)
+    (let [details (when (map? (:details last-check))
+                    (:details last-check))
+          nested-details (when (map? details)
+                           (let [inner (when (map? (:details details))
+                                         (:details details))]
+                             (cond-> {}
+                               (keyword? (:reason details)) (assoc :reason (:reason details))
+                               (keyword? (:schema details)) (assoc :schema (:schema details))
+                               (and (map? inner) (keyword? (:reason inner)))
+                               (assoc :details {:reason (:reason inner)
+                                                :schema (:schema inner)}))))]
+      (cond-> {}
+        (contains? last-check :ok?) (assoc :ok? (boolean (:ok? last-check)))
+        (keyword? (:error last-check)) (assoc :error (:error last-check))
+        (keyword? (:reason last-check)) (assoc :reason (:reason last-check))
+        (keyword? (:intent last-check)) (assoc :intent (:intent last-check))
+        (keyword? (:result/type last-check)) (assoc :result/type (:result/type last-check))
+        (map? nested-details) (assoc :details nested-details)))))
+
+(defn- compact-done-eval
+  [done-eval]
+  (when (map? done-eval)
+    (let [checks (when (sequential? (:checks done-eval))
+                   (->> (:checks done-eval)
+                        (keep (fn [c]
+                                (when (map? c)
+                                  (cond-> {}
+                                    (contains? c :check) (assoc :check (:check c))
+                                    (contains? c :ok?) (assoc :ok? (boolean (:ok? c)))
+                                    (keyword? (:error c)) (assoc :error (:error c))
+                                    (keyword? (:reason c)) (assoc :reason (:reason c))
+                                    (number? (:score c)) (assoc :score (double (:score c)))))))
+                        vec))
+          must-failed (when (sequential? (:must-failed done-eval))
+                        (->> (:must-failed done-eval)
+                             (keep keywordish)
+                             vec))
+          should-failed (when (sequential? (:should-failed done-eval))
+                          (->> (:should-failed done-eval)
+                               (keep keywordish)
+                               vec))]
+      (cond-> {}
+        (contains? done-eval :ok?) (assoc :ok? (boolean (:ok? done-eval)))
+        (number? (:score done-eval)) (assoc :score (double (:score done-eval)))
+        (number? (:score-min done-eval)) (assoc :score-min (double (:score-min done-eval)))
+        (number? (:judge-score done-eval)) (assoc :judge-score (double (:judge-score done-eval)))
+        (contains? done-eval :judge/pass?) (assoc :judge/pass? (boolean (:judge/pass? done-eval)))
+        (set? (:violations done-eval)) (assoc :violations (->> (:violations done-eval) sort vec))
+        (some? must-failed) (assoc :must-failed must-failed)
+        (some? should-failed) (assoc :should-failed should-failed)
+        (seq checks) (assoc :checks checks)))))
+
+(defn- compact-outcome
+  [outcome]
+  (when (map? outcome)
+    (let [done-eval (compact-done-eval (:done/eval outcome))]
+      (cond-> {}
+        (contains? outcome :ok?) (assoc :ok? (boolean (:ok? outcome)))
+        (keyword? (:failure/type outcome)) (assoc :failure/type (:failure/type outcome))
+        (contains? outcome :failure/recover?) (assoc :failure/recover? (boolean (:failure/recover? outcome)))
+        (keyword? (:cap/id outcome)) (assoc :cap/id (:cap/id outcome))
+        (number? (:attempt outcome)) (assoc :attempt (long (:attempt outcome)))
+        (map? done-eval) (assoc :done/eval done-eval)))))
+
+(defn- compact-route-node
+  [node]
+  (when (map? node)
+    (cond-> {}
+      (keyword? (:op node)) (assoc :op (:op node))
+      (keyword? (:intent node)) (assoc :intent (:intent node))
+      (keyword? (:cap/id node)) (assoc :cap/id (:cap/id node))
+      (keyword? (:tool/id node)) (assoc :tool/id (:tool/id node))
+      (keyword? (:as node)) (assoc :as (:as node)))))
+
+(defn- compact-rejected-candidate
+  [entry]
+  (when (map? entry)
+    (cond-> {}
+      (keyword? (:cap/id entry)) (assoc :cap/id (:cap/id entry))
+      (keyword? (:reason entry)) (assoc :reason (:reason entry))
+      (keyword? (:intent entry)) (assoc :intent (:intent entry))
+      (keyword? (:result/type entry)) (assoc :result/type (:result/type entry))
+      (keyword? (:required-kind entry)) (assoc :required-kind (:required-kind entry))
+      (keyword? (:cap-kind entry)) (assoc :cap-kind (:cap-kind entry)))))
+
+(defn- route-decider-error-details
+  [data route-intent cap-id]
+  (let [data' (if (map? data) data {})
+        outcome (compact-outcome (:outcome data'))
+        node (compact-route-node (:node data'))
+        retry-policy (when (map? (:retry-policy data'))
+                       (let [p (:retry-policy data')]
+                         (cond-> {}
+                           (integer? (:same-cap-max p)) (assoc :same-cap-max (:same-cap-max p))
+                           (integer? (:fallback-max p)) (assoc :fallback-max (:fallback-max p)))))
+        last-check (compact-last-check (:last-check data'))]
+    (cond-> {:route/intent route-intent
+             :route/cap-id cap-id}
+      (keyword? (:error data')) (assoc :error (:error data'))
+      (keyword? (:reason data')) (assoc :reason (:reason data'))
+      (keyword? (:failure/type data')) (assoc :failure/type (:failure/type data'))
+      (number? (:attempts data')) (assoc :attempts (long (:attempts data')))
+      (map? last-check) (assoc :last-check last-check)
+      (map? outcome) (assoc :outcome outcome)
+      (map? node) (assoc :node node)
+      (set? (:switch-on data')) (assoc :switch-on (->> (:switch-on data') sort vec))
+      (sequential? (:candidates data')) (assoc :candidates (vec (filter keyword? (:candidates data'))))
+      (map? retry-policy) (assoc :retry-policy retry-policy)
+      (sequential? (:rejected-candidates data'))
+      (assoc :rejected-candidates
+             (->> (:rejected-candidates data')
+                  (keep compact-rejected-candidate)
+                  vec)))))
+
 (defn- maybe-apply-meta-routing
   [runtime resolver request]
   (let [route-intent (meta-routing-intent request)
-        strict?      (meta-routing-strict? request)
+        strict?      (meta-routing-strict? runtime request)
         enabled?     (meta-routing-enabled? runtime request)]
     (cond
       (not enabled?)
@@ -939,7 +1227,7 @@
                                   (route-decider-opts runtime resolver request cap-id route-intent))
                   route-out (contracts/result-out-of route-response)]
               (if (routing-decision? route-out)
-                {:request (merge-routing-decision request route-out)
+                {:request (merge-routing-decision runtime request route-out)
                  :mode :continue
                  :enabled? true
                  :strict? strict?
@@ -965,8 +1253,7 @@
                  :body (error-envelope request
                                        :route/decide-failed
                                        (.getMessage e)
-                                       (select-keys (or (ex-data e) {})
-                                                    [:error :reason :failure/type :attempts :last-check])
+                                       (route-decider-error-details (ex-data e) route-intent cap-id)
                                        true)}
                 {:request request
                  :mode :none
@@ -986,7 +1273,9 @@
                  :body (error-envelope request
                                        :route/decide-failed
                                        (.getMessage t)
-                                       nil
+                                       {:route/intent route-intent
+                                        :route/cap-id cap-id
+                                        :class (str (class t))}
                                        true)}
                 {:request request
                  :mode :none
@@ -1164,6 +1453,15 @@
                                                                    :tool/id
                                                                    :required-effect
                                                                    :requested-effects]))}
+
+                       :effects/not-declared
+                       {:status 400
+                        :body   (error-envelope request*
+                                                :effects/invalid-input
+                                                (.getMessage e)
+                                                (merge {:reason :effects/not-declared}
+                                                       (select-keys data [:tool/id
+                                                                          :requested-effects])))}
 
                        :effects/unsupported-tool
                        {:status 422

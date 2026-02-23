@@ -351,6 +351,56 @@
           (is (= :value (contracts/result-type-of result)))
           (is (= "SYS/VOICE" (:system @seen))))))))
 
+(deftest invoke-capability-composes-system-prompt-from-role-packages
+  (testing "When intent has no explicit system prompt, runtime composes prompt from default+role+intent packages."
+    (let [seen (atom nil)
+          runtime {:protocol {:prompts {:default "SYS/DEFAULT"
+                                        :roles {:voice "SYS/ROLE/VOICE"}
+                                        :intents {:text/respond "SYS/INTENT/TEXT"}}
+                              :intents {:text/respond {:in-schema :req/text
+                                                       :out-schema :res/text}}
+                              :result/types [:value]}}]
+      (with-redefs [core/ollama-generate!
+                    (fn [params]
+                      (reset! seen params)
+                      {:response "ok"})]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice
+                       :model "voice-model"
+                       :prompt "hej"
+                       :max-attempts 1})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= "SYS/DEFAULT\n\nSYS/ROLE/VOICE\n\nSYS/INTENT/TEXT"
+                 (:system @seen))))))))
+
+(deftest invoke-capability-intent-system-prompt-still-overrides-packages
+  (testing "Explicit :system/prompt in intent config still works as full override."
+    (let [seen (atom nil)
+          runtime {:protocol {:prompts {:default "SYS/DEFAULT"
+                                        :roles {:voice "SYS/ROLE/VOICE"}
+                                        :intents {:text/respond "SYS/INTENT/TEXT"}}
+                              :intents {:text/respond {:in-schema :req/text
+                                                       :out-schema :res/text
+                                                       :system/prompt "SYS/LEGACY-OVERRIDE"}}
+                              :result/types [:value]}}]
+      (with-redefs [core/ollama-generate!
+                    (fn [params]
+                      (reset! seen params)
+                      {:response "ok"})]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice
+                       :model "voice-model"
+                       :prompt "hej"
+                       :max-attempts 1})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= "SYS/LEGACY-OVERRIDE" (:system @seen))))))))
+
 (deftest execute-capability-evaluates-plan-in-runtime
   (testing "execute-capability! evaluates returned plan and normalizes final value output."
     (with-redefs [core/ollama-generate!

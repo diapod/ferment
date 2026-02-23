@@ -978,7 +978,11 @@
             (is (= 1 (or (get status-map 400)
                          (get status-map "400")
                          (get status-map :400))))
-            (is (= 1 (get-in diag-body [:telemetry :workflow :calls/total])))))
+            (is (= 1 (get-in diag-body [:telemetry :workflow :calls/total])))
+            (is (= "workflow" (str (get-in diag-body [:telemetry :kpi :parse-rate :source]))))
+            (is (= 1.0 (get-in diag-body [:telemetry :kpi :parse-rate :value])))
+            (is (= 0.0 (get-in diag-body [:telemetry :kpi :retry-rate :value])))
+            (is (= 0.0 (get-in diag-body [:telemetry :kpi :fallback-rate :value])))))
         (finally
           (fhttp/stop-http :ferment.http/default server-state))))))
 

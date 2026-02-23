@@ -432,6 +432,8 @@
         judge-score  (when (fn? judge-fn)
                        (-> (invoke-check-fn judge-fn call-node env result)
                            extract-judge-score))
+        judge-pass?  (when (number? judge-score)
+                       (>= judge-score score-min))
         score        (double (if (number? judge-score)
                                (/ (+ should-score judge-score) 2.0)
                                should-score))
@@ -439,6 +441,7 @@
                           (>= score score-min))
         failure-type (cond
                        (some #{:schema-valid} must-failed) :schema/invalid
+                       (seq must-failed) :eval/must-failed
                        (not ok?) :eval/low-score
                        :else nil)]
     {:ok? ok?
@@ -447,6 +450,7 @@
      :must-failed must-failed
      :should-failed should-failed
      :judge/score judge-score
+     :judge/pass? judge-pass?
      :score-min score-min}))
 
 (defn- call-failure-type
@@ -485,7 +489,10 @@
            :calls/retries 0
            :calls/fallback-hops 0
            :calls/failure-types {}
-           :quality/judge-used 0})))
+           :quality/judge-used 0
+           :quality/judge-pass 0
+           :quality/judge-fail 0
+           :quality/must-failed 0})))
 
 (defn- telemetry-inc!
   [telemetry k]
@@ -494,6 +501,16 @@
 (defn- telemetry-inc-in!
   [telemetry ks]
   (swap! telemetry update-in ks (fnil inc 0)))
+
+(defn- telemetry-record-quality!
+  [telemetry done-eval]
+  (when (seq (:must-failed done-eval))
+    (telemetry-inc! telemetry :quality/must-failed))
+  (when (number? (:judge/score done-eval))
+    (telemetry-inc! telemetry :quality/judge-used)
+    (if (true? (:judge/pass? done-eval))
+      (telemetry-inc! telemetry :quality/judge-pass)
+      (telemetry-inc! telemetry :quality/judge-fail))))
 
 (defn execute-plan
   "Executes minimal plan AST with ops:
@@ -602,8 +619,7 @@
                                                                     :out (:emitted run*)}}
                                                           result)
                                           done-eval (evaluate-done protocol candidate-node env verify-result check-fns judge-fn)
-                                          _ (when (number? (:judge/score done-eval))
-                                              (telemetry-inc! telemetry* :quality/judge-used))
+                                          _ (telemetry-record-quality! telemetry* done-eval)
                                           failure-type (call-failure-type protocol candidate-node result done-eval)
                                           recover? (recoverable-failure? failure-type switch-on)
                                           failed? (keyword? failure-type)
@@ -670,8 +686,9 @@
                   (throw (ex-info "Tool node must declare requested effects in :effects/:allowed."
                                   {:node node
                                    :tool/id tool-id
-                                   :error :effects/not-declared
-                                   :failure/type :effects/not-declared
+                                   :error :effects/invalid-input
+                                   :failure/type :effects/invalid-input
+                                   :reason :effects/not-declared
                                    :retryable? false})))
                 (when-not (fn? invoke-tool)
                   (throw (ex-info "Workflow runtime is missing :invoke-tool handler."
@@ -703,8 +720,7 @@
                                                         (nil? raw-result) {}
                                                         :else {:value raw-result})}})
                               done-eval (evaluate-done protocol base-node env result check-fns judge-fn)
-                              _ (when (number? (:judge/score done-eval))
-                                  (telemetry-inc! telemetry* :quality/judge-used))
+                              _ (telemetry-record-quality! telemetry* done-eval)
                               failure-type (call-failure-type protocol base-node result done-eval)
                               failed? (keyword? failure-type)
                               slot-val (normalize-tool-result tool-id result)]

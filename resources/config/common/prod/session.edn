@@ -15,6 +15,65 @@
    :limits/max-vars         256
    :limits/max-key-chars    191
    :limits/max-value-bytes  131072
+   :class/default           :session.vars/default
+   :class/by-namespace
+   {"session" :session.vars/session-data
+    "context" :session.vars/context-data
+    "request" :session.vars/request-data
+    "user"    :session.vars/user-data
+    "agent"   :session.vars/agent-data
+    "runtime" :session.vars/runtime-data}
+   :class/policy
+   {:session.vars/default
+    {:ttl/default-ms       14400000
+     :ttl/max-ms           604800000
+     :freeze/allow-write?  false
+     :freeze/allow-delete? false}
+
+    :session.vars/session-data
+    {:ttl/default-ms       86400000
+     :ttl/max-ms           604800000
+     :freeze/allow-write?  false
+     :freeze/allow-delete? false}
+
+    :session.vars/context-data
+    {:ttl/default-ms       43200000
+     :ttl/max-ms           604800000
+     :freeze/allow-write?  false
+     :freeze/allow-delete? false}
+
+    :session.vars/request-data
+    {:ttl/default-ms       3600000
+     :ttl/max-ms           43200000
+     :freeze/allow-write?  false
+     :freeze/allow-delete? false}
+
+    :session.vars/user-data
+    {:ttl/default-ms       172800000
+     :ttl/max-ms           604800000
+     :freeze/allow-write?  false
+     :freeze/allow-delete? false}
+
+    :session.vars/agent-data
+    {:ttl/default-ms       172800000
+     :ttl/max-ms           604800000
+     :freeze/allow-write?  false
+     :freeze/allow-delete? false}
+
+    :session.vars/runtime-data
+    {:ttl/default-ms       900000
+     :ttl/max-ms           21600000
+     :freeze/allow-write?  false
+     :freeze/allow-delete? false}}
+   :request/default-bindings
+   {:session/language        {:target [:constraints :language]
+                              :coerce :keyword-or-string}
+    :session/style           {:target [:constraints :style]
+                              :coerce :keyword-or-string}
+    :session/system-prompt   {:target [:input :system]
+                              :coerce :trimmed-string}
+    :session/context-summary {:target [:context :summary]
+                              :coerce :trimmed-string}}
    :policy/default
    {:read-namespaces   #{"session" "context"}
     :write-namespaces  #{"session" "context" "user" "agent" "runtime" "request"}
