@@ -1,6 +1,6 @@
 {:name         "ferment"
  :description  "Freedom to Models"
- :license      "GNU Lesser General Public License 3.0"
+ :license      "Apache License 2.0 (Apache-2.0)"
  :package      io.randomseed/ferment
  :output-path  "docs"
  :source-uri   "https://github.com/randomseed-io/ferment/blob/{version}/{filepath}#L{line}"

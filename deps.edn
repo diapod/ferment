@@ -149,7 +149,7 @@
                        :main-opts  ["-m" "babashka.cli.exec"]}}
  :codox   {:name        "Ferment"
            :description "All-mighty AI Agent"
-           :license     "Proprietary"
+           :license     "Apache-2.0"
            :package     io.randomseed/ferment
            :version     "1.0.0"
            :output-path "docs"

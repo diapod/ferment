@@ -13,7 +13,7 @@
                             :author      "Paweł Wilk"
                             :description "The AI Orchestrator"
                             :version     "1.0.0"
-                            :license     "Copyright by Paweł Wilk"}
+                            :license     "Apache-2.0"}
 
  ;; Application shortcuts
 

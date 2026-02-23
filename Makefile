@@ -36,7 +36,7 @@ docs: readme
 	@echo "# Introduction" > doc/10_introduction.md
 	@tail -n +2 README.md >> doc/10_introduction.md
 	@perl -pi -e 's/\[([^\]]+)\]\(doc\/([^\)]+)\)/[$$1]($$2)/g' doc/10_introduction.md
-	@perl -pi -e 's/\[([^\]]+)\]\(LICENSE.txt\)/[$$1](85_License.md)/g' doc/10_introduction.md
+	@perl -pi -e 's/\[([^\]]+)\]\(LICENSE(?:\.txt)?\)/[$$1](85_license.md)/g' doc/10_introduction.md
 	@$(DOCS) :version '"$(VERSION)"' :description '"$(DESCRIPTION)"'
 
 doc: docs
