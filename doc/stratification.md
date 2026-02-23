@@ -1,6 +1,9 @@
-# Stratification of Calls (LLM and non-LLM) via capabilities + IR + quality applicator
+# Stratification of Calls
+
+Stratification of calls to LLM and non-LLM solvers is realized via capabilities, IR and quality applicator.
 
 The assumptions and conclusions below describe a stratified design architecture for a multi-agent system where:
+
 - execution units can be LLMs or non-LLM solvers,
 - calls can nest to arbitrary depth (A->B->C->...),
 - delegation is *late-bound* (lazy applicator may switch executor when address/capability is unavailable),
