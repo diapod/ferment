@@ -1,9 +1,9 @@
 {:name         "ferment"
  :description  "Freedom to Models"
  :license      "Apache License 2.0 (Apache-2.0)"
- :package      io.randomseed/ferment
+ :package      ai.orbiplex/ferment
  :output-path  "docs"
- :source-uri   "https://github.com/randomseed-io/ferment/blob/{version}/{filepath}#L{line}"
+ :source-uri   "https://github.com/diapod/ferment/blob/{version}/{filepath}#L{line}"
  :metadata     {:doc/format :markdown}
  :exclude-vars nil
  :themes       [:default :randomseed]}

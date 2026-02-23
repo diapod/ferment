@@ -8,7 +8,7 @@ VERSION     ?= 1.0.0
 GROUP       ?= ai.orbiplex
 APPNAME     ?= ferment
 DESCRIPTION ?= AI orchestration system for multi-model workflows
-URL         ?= https://randomseed.io/software/$(APPNAME)/
+URL         ?= https://diapod.github.com/$(APPNAME)/
 SCM         ?= https://github.com/diapod/$(APPNAME)
 AOTNS       ?= '[]'
 
