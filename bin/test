@@ -7,4 +7,4 @@ test -f secrets.env && . secrets.env
 export FERMENT_PROFILE
 export FERMENT_LLM_MODE
 
-clojure -M:test
+clojure -M:test "@$"

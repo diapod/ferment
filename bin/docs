@@ -1,5 +1,5 @@
 #!/bin/sh
 
-echo "[ferment] Building docs, please wait..."
+set -eu
 
-clojure -M:docs "${1}"
+exec clojure -X:docs "$@"

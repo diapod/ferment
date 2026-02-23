@@ -4,12 +4,12 @@ DEPLOY      := bin/deploy
 DOCS        := bin/docs
 UPREADME    := bin/update-readme
 
-VERSION     ?= 2.2.4
-GROUP       ?= io.randomseed
+VERSION     ?= 1.0.0
+GROUP       ?= ai.orbiplex
 APPNAME     ?= ferment
-DESCRIPTION ?= Money as data, done right.
+DESCRIPTION ?= AI orchestrator/router
 URL         ?= https://randomseed.io/software/$(APPNAME)/
-SCM         ?= github.com/randomseed-io/$(APPNAME)
+SCM         ?= https://github.com/diapod/$(APPNAME)
 AOTNS       ?= '[]'
 
 POMFILE     := pom.xml
