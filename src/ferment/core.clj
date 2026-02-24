@@ -955,7 +955,7 @@
   (fn [call-node env]
     (let [intent  (:intent call-node)
           cap-id  (or (:cap/id call-node)
-                      (workflow/resolve-capability-id resolver call-node))
+                      (workflow/resolve-capability resolver call-node))
           role    (or (:role call-node) (router/resolve-role runtime resolver cap-id intent))
           prompt  (input->prompt (:input call-node))
           model-k (router/resolve-model-key runtime resolver cap-id intent)
@@ -1095,27 +1095,34 @@
       (and (not ok?) (keyword? (:failure/type run))) (assoc :failure/type (:failure/type run))
       (and (not ok?) (some? (:error run))) (assoc :error (:error run)))))
 
-(defn execute-capability!
-  "Invokes capability and executes returned plan (if any) in runtime evaluator."
+(defn call-capability
+  "Canonical domain entrypoint.
+
+  Invokes a capability and executes returned plan (if any) in runtime evaluator.
+  Accepts either normal invoke opts or direct `:plan` in opts."
   ([runtime opts]
-   (execute-capability! runtime nil opts))
+   (call-capability runtime nil opts))
   ([runtime resolver opts]
-  (let [effects-cfg (runtime-effects runtime)
-        check-fns (runtime-check-fns runtime)
-        judge-fn  (runtime-judge-fn runtime resolver opts)
-        debug-plan? (true? (:debug/plan? opts))
-        protocol  (or (runtime-protocol runtime) {})
-        resolver' (cond-> (if (map? resolver) resolver {})
-                    (map? protocol) (assoc :protocol protocol))
-        result (invoke-capability! runtime opts)
-        rtype  (contracts/result-type-of result)
-         workflow-env (cond-> {}
-                        (map? (:workflow/env opts)) (merge (:workflow/env opts))
-                        (map? (:auth/user opts)) (assoc :auth/user (:auth/user opts))
-                        (map? (:roles opts)) (assoc :roles/config (:roles opts)))]
+   (let [effects-cfg   (runtime-effects runtime)
+         check-fns     (runtime-check-fns runtime)
+         judge-fn      (runtime-judge-fn runtime resolver opts)
+         debug-plan?   (true? (:debug/plan? opts))
+         protocol      (or (runtime-protocol runtime) {})
+         resolver'     (cond-> (if (map? resolver) resolver {})
+                         (map? protocol) (assoc :protocol protocol))
+         workflow-env  (cond-> {}
+                         (map? (:workflow/env opts)) (merge (:workflow/env opts))
+                         (map? (:auth/user opts)) (assoc :auth/user (:auth/user opts))
+                         (map? (:roles opts)) (assoc :roles/config (:roles opts)))
+         plan-result?  (map? (:plan opts))
+         base-result   (if plan-result?
+                         {:result {:type :plan
+                                   :plan (:plan opts)}}
+                         (invoke-capability! runtime opts))
+         rtype         (contracts/result-type-of base-result)]
      (if (= :plan rtype)
-       (let [plan (or (contracts/materialize-plan-result result)
-                      (contracts/result-plan-of result))
+       (let [plan (or (contracts/materialize-plan-result base-result)
+                      (contracts/result-plan-of base-result))
              run  (workflow/execute-plan
                    {:plan plan
                     :resolver resolver'
@@ -1126,12 +1133,12 @@
                     :judge-fn judge-fn
                     :env workflow-env})
              out  (emitted->out (:emitted run))]
-        (assoc result
-               :result (cond-> {:type :value
-                                :out out
-                                :plan/run (public-plan-run run)}
-                         debug-plan? (assoc :plan/debug plan))))
-       result))))
+         (assoc base-result
+                :result (cond-> {:type :value
+                                 :out out
+                                 :plan/run (public-plan-run run)}
+                          debug-plan? (assoc :plan/debug plan))))
+       base-result))))
 
 (defn- find-text
   [v]
@@ -1146,7 +1153,7 @@
   "Value-only wrapper for simple text capabilities."
   [runtime opts]
   (let [resolver (some-> runtime :resolver)
-        result (execute-capability! runtime resolver opts)
+        result (call-capability runtime resolver opts)
         rtype  (contracts/result-type-of result)]
     (if (= :value rtype)
       (let [text (find-text (contracts/result-out-of result))]
@@ -1154,7 +1161,7 @@
           text
           (throw (ex-info "Capability returned :value without :out/:text"
                           {:result result}))))
-      (throw (ex-info "Capability returned non-value result; use invoke-capability! for stratified plan/stream flow."
+      (throw (ex-info "Capability returned non-value result; use call-capability for stratified plan/stream flow."
                       {:result/type rtype
                        :result result
                        :plan/materialized (contracts/materialize-plan-result result)})))))
@@ -1162,6 +1169,56 @@
 (defn- normalize-invoke-opts
   [opts]
   (if (map? opts) opts {}))
+
+(defn classify-intent
+  "Canonical domain classifier for user input.
+
+  Returns one of:
+  - `:code/patch`
+  - `:problem/solve`"
+  ([user-text]
+   (classify-intent user-text nil))
+  ([user-text opts]
+   (let [opts'    (normalize-invoke-opts opts)
+         explicit (keywordish (or (:intent opts')
+                                  (get-in opts' [:task :intent])))]
+     (if (contains? #{:code/patch :problem/solve} explicit)
+       explicit
+       (if (looks-like-coding? (or user-text ""))
+         :code/patch
+         :problem/solve)))))
+
+(defn build-plan
+  "Canonical domain plan builder for text input.
+
+  Produces a minimal two-step plan:
+  - primary capability (`:code/patch` or `:problem/solve`)
+  - `:text/respond` finalization by voice."
+  ([user-text]
+   (build-plan user-text nil))
+  ([user-text opts]
+   (let [opts'       (normalize-invoke-opts opts)
+         intent      (classify-intent user-text opts')
+         stage-as    (if (= intent :code/patch) :coder :solver)
+         stage-cap   (if (= intent :code/patch) :llm/code :llm/solver)
+         stage-prompt (or (some-> opts' :input :prompt str)
+                          (str (or user-text "")))
+         voice-cap   (or (some-> opts' :voice :cap/id keywordish)
+                         :llm/voice)
+         voice-prompt (or (get-in opts' [:voice :input :prompt])
+                          {:slot/id [stage-as :out :text]})]
+     {:nodes [{:op :call
+               :as stage-as
+               :intent intent
+               :cap/id stage-cap
+               :input {:prompt stage-prompt}}
+              {:op :call
+               :as :voice
+               :intent :text/respond
+               :cap/id voice-cap
+               :input {:prompt voice-prompt}}
+              {:op :emit
+               :input {:slot/id [:voice :out]}}]})))
 
 (defn coder!
   "Returns a strict JSON object as string for coding tasks."
@@ -1234,19 +1291,6 @@
             :prompt (str "USER:\n" user-text "\n\nSOLVER_JSON:\n" solver-json)
             :temperature 0.0})))))
 
-(defn respond!
-  ([user-text]
-   (respond! user-text nil nil))
-  ([user-text runtime]
-   (respond! user-text runtime nil))
-  ([user-text runtime opts]
-   (let [opts' (normalize-invoke-opts opts)]
-   (if (looks-like-coding? user-text)
-     (let [sj (coder! user-text runtime opts')]
-       (voice! sj user-text runtime opts'))
-     (let [sj (solver! user-text runtime opts')]
-       (voice! sj user-text runtime opts'))))))
-
 (defn- with-session-service
   [session-service opts]
   (let [opts' (normalize-invoke-opts opts)]
@@ -1298,9 +1342,23 @@
                 (voice! solver-json user-text runtime (with-session-service session nil)))
                ([solver-json user-text opts]
                 (voice! solver-json user-text runtime (with-session-service session opts))))
-   :respond! (fn
-               ([user-text] (respond! user-text runtime (with-session-service session nil)))
-               ([user-text opts] (respond! user-text runtime (with-session-service session opts))))})
+   :classify-intent (fn
+                      ([user-text]
+                       (classify-intent user-text))
+                      ([user-text opts]
+                       (classify-intent user-text opts)))
+   :build-plan (fn
+                 ([user-text]
+                  (build-plan user-text))
+                 ([user-text opts]
+                  (build-plan user-text opts)))
+   :call-capability (fn
+                      ([opts]
+                       (call-capability runtime resolver (with-session-service session opts)))
+                      ([resolver-override opts]
+                       (call-capability runtime
+                                        (or resolver-override resolver)
+                                        (with-session-service session opts))))})
 
 (defn stop-service
   "Stops core service branch (no-op for config-oriented service)."
@@ -1322,5 +1380,8 @@
   (with-open [r (io/reader System/in)]
     (doseq [line (line-seq r)]
       (println "\n---")
-      (println (respond! line))
+      (let [plan   (build-plan line)
+            result (call-capability nil nil {:plan plan})]
+        (println (or (find-text (contracts/result-out-of result))
+                     "Brak odpowiedzi.")))
       (println "---\n"))))

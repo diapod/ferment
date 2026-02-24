@@ -464,7 +464,7 @@
   [resolver request]
   (or (:cap/id request)
       (get-in request [:task :cap/id])
-      (workflow/resolve-capability-id
+      (workflow/resolve-capability
        resolver
        {:intent  (get-in request [:task :intent])
         :requires (get-in request [:task :requires])
@@ -1210,7 +1210,7 @@
              :attempted? false
              :reason :fail-open})
           (try
-            (let [route-response (core/execute-capability!
+            (let [route-response (core/call-capability
                                   runtime
                                   resolver
                                   (route-decider-opts runtime resolver request cap-id route-intent))
@@ -1384,7 +1384,7 @@
                                         {:intent (get-in request* [:task :intent])})}
                (try
                  {:status 200
-                  :body   (core/execute-capability!
+                  :body   (core/call-capability
                            runtime
                            resolver
                            (act-request->invoke-opts runtime request* cap-id))}

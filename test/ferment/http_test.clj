@@ -22,7 +22,7 @@
                        :user/email "u@example.com"
                        :user/account-type :operator
                        :user/roles #{:role/operator :role/reviewer}}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (reset! seen opts)
                                    {:result {:type :value
@@ -69,7 +69,7 @@
                        :task {:intent :text/respond
                               :cap/id :llm/voice}
                        :input {:prompt "hej"}}
-              response (with-redefs [core/execute-capability!
+              response (with-redefs [core/call-capability
                                      (fn [_runtime _resolver opts]
                                        (reset! seen opts)
                                        {:result {:type :value
@@ -111,7 +111,7 @@
                        :task {:intent :text/respond
                               :cap/id :llm/voice}
                        :input {:prompt "hej"}}
-              response (with-redefs [core/execute-capability!
+              response (with-redefs [core/call-capability
                                      (fn [_runtime _resolver opts]
                                        (reset! seen opts)
                                        {:result {:type :value
@@ -138,7 +138,7 @@
                        :user/email "user@example.com"
                        :user/account-type :user
                        :user/roles #{:role/user}}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver _opts]
                                    (throw (ex-info "Forbidden effect"
                                                    {:error :auth/forbidden-effect
@@ -161,7 +161,7 @@
                           :cap/id :llm/code}
                    :input {:prompt "run tool"}
                    :effects {:allowed #{:fs/write}}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver _opts]
                                    (throw (ex-info "Scope denied"
                                                    {:error :effects/scope-denied
@@ -184,7 +184,7 @@
                    :task {:intent :code/patch
                           :cap/id :llm/code}
                    :input {:prompt "run tool"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver _opts]
                                    (throw (ex-info "Invalid tool input"
                                                    {:error :effects/invalid-input
@@ -208,7 +208,7 @@
                           :cap/id :llm/voice}
                    :input {:prompt "hej"}
                    :response/type "stream"}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (reset! seen opts)
                                    {:result {:type :stream
@@ -234,7 +234,7 @@
                    :trace {:id "t-5"}
                    :task {:intent :text/respond}
                    :input {:prompt "hej"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (swap! calls conj (:intent opts))
                                    (case (:intent opts)
@@ -489,7 +489,7 @@
                    :task {:intent :text/respond}
                    :routing {:strict? true}
                    :input {:prompt "hej"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (if (= :route/decide (:intent opts))
                                      (throw (ex-info "route failed" {:error :runtime/invoke-failed}))
@@ -518,7 +518,7 @@
                    :task {:intent :text/respond}
                    :routing {:strict? true}
                    :input {:prompt "hej"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (if (= :route/decide (:intent opts))
                                      (throw (ex-info "route failed" {:error :runtime/invoke-failed}))
@@ -546,7 +546,7 @@
                    :task {:intent :text/respond}
                    :routing {:strict? true}
                    :input {:prompt "hej"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (if (= :route/decide (:intent opts))
                                      (throw (ex-info
@@ -609,7 +609,7 @@
                    :trace {:id "t-6-defaults"}
                    :task {:intent :text/respond}
                    :input {:prompt "hej"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (if (= :route/decide (:intent opts))
                                      (throw (ex-info "route failed" {:error :runtime/invoke-failed}))
@@ -638,7 +638,7 @@
                    :task {:intent :text/respond}
                    :routing {:on-error :fail-open}
                    :input {:prompt "hej"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (if (= :route/decide (:intent opts))
                                      (throw (ex-info "route failed" {:error :runtime/invoke-failed}))
@@ -664,7 +664,7 @@
                    :trace {:id "t-7"}
                    :task {:intent :text/respond}
                    :input {:prompt "hej"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (if (= :route/decide (:intent opts))
                                      (throw (ex-info "route failed" {:error :runtime/invoke-failed}))
@@ -690,7 +690,7 @@
                    :trace {:id "t-8"}
                    :task {:intent :text/respond}
                    :input {:prompt "hej"}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
                                    (if (= :route/decide (:intent opts))
                                      {:result {:type :value
@@ -718,7 +718,7 @@
                    :trace {:id "t-9"}
                    :task {:intent :text/respond}
                    :input {:prompt "hej"}}]
-      (with-redefs [core/execute-capability!
+      (with-redefs [core/call-capability
                     (fn [_runtime _resolver opts]
                       (if (= :route/decide (:intent opts))
                         (case @mode
@@ -752,7 +752,7 @@
                    :task {:intent :text/respond
                           :cap/id :llm/voice}
                    :input {:prompt "hej"}}]
-      (with-redefs [core/execute-capability!
+      (with-redefs [core/call-capability
                     (fn [_runtime _resolver _opts]
                       {:result {:type :value
                                 :out {:text "ok"}
@@ -797,7 +797,7 @@
                    :task {:intent :text/respond}
                    :routing {:strict? true}
                    :input {:prompt "hej"}}]
-      (with-redefs [core/execute-capability!
+      (with-redefs [core/call-capability
                     (fn [_runtime _resolver opts]
                       (if (= :route/decide (:intent opts))
                         (throw (ex-info
@@ -845,7 +845,7 @@
                        :user/email "audit@example.com"
                        :user/account-type :operator
                        :user/roles #{:role/operator}}}
-          response (with-redefs [core/execute-capability!
+          response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver _opts]
                                    {:result {:type :value
                                              :out {:text "ok"}}})

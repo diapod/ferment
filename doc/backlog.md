@@ -77,13 +77,15 @@ Status: after delivering contracts, sessions, RBAC/effects, and `/v1/act` flow.
      - rewired `workflow` to use shared telemetry helpers from `ferment.telemetry`,
      - regression check: `bin/test-full` green after refactor.
 
-8. [ ] Normalize core domain API names (`classify-intent`, `build-plan`, `call-capability`)
+8. [x] Normalize core domain API names (`classify-intent`, `build-plan`, `call-capability`)
    - Define canonical public entrypoints and map current internals to them (`resolve-capability`, `execute-plan`, `respond!`).
    - Goal: make domain pipeline explicit and discoverable as stable API.
-   - Done when:
-     - canonical functions are present in one module (or clearly re-exported),
-     - docs/examples use canonical names only,
-     - old aliases are either deprecated or removed consistently.
+   - Delivered:
+     - added canonical public entrypoints in `ferment.core`: `classify-intent`, `build-plan`, `call-capability`,
+     - replaced internal/runtime usage of legacy names with canonical API in `ferment.http` and tests,
+     - renamed workflow capability resolver API to `resolve-capability`,
+     - updated core service map to expose `:classify-intent`, `:build-plan`, `:call-capability`,
+     - updated design docs to use canonical naming and removed legacy prompt override naming.
 
 9. [ ] Complete Stage D observability (`start/stop/error` events + optional response cache)
    - Add lifecycle telemetry events for app/runtime/http/model/session start-stop-failure transitions.

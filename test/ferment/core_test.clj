@@ -175,7 +175,7 @@
                             :mode :live}))))
         (is (= :ferment.model/meta @called))))))
 
-(deftest execute-capability-plan-call-uses-dispatch-role-and-model-from-resolver
+(deftest call-capability-plan-call-uses-dispatch-role-and-model-from-resolver
   (testing "Plan call takes role/model from capability dispatch metadata in resolver."
     (let [nested-call (atom nil)
           runtime {:resolver {:caps/by-id
@@ -203,7 +203,7 @@
 
                         {:result {:type :value
                                   :out {:text "noop"}}}))]
-        (let [result (core/execute-capability!
+        (let [result (core/call-capability
                       runtime
                       (:resolver runtime)
                       {:role :router
@@ -401,14 +401,14 @@
           (is (= :value (contracts/result-type-of result)))
           (is (= "SYS/OVERRIDE" (:system @seen))))))))
 
-(deftest execute-capability-evaluates-plan-in-runtime
-  (testing "execute-capability! evaluates returned plan and normalizes final value output."
+(deftest call-capability-evaluates-plan-in-runtime
+  (testing "call-capability! evaluates returned plan and normalizes final value output."
     (with-redefs [core/ollama-generate!
                   (fn [{:keys [model prompt]}]
                     (if (= "mock/meta" model)
                       {:response "PLAN"}
                       {:response (str "VOICE:" prompt)}))]
-        (let [result (core/execute-capability!
+        (let [result (core/call-capability
                       nil
                       {:routing {:intent->cap {:text/respond :llm/voice}}}
                     {:role :router
@@ -435,8 +435,8 @@
         (is (nil? (get-in result [:result :plan/run :env])))
         (is (vector? (get-in result [:result :plan/run :participants])))))))
 
-(deftest execute-capability-can-expose-plan-debug-when-enabled
-  (testing "execute-capability! may include pre-execution plan with slot refs when :debug/plan? is true."
+(deftest call-capability-can-expose-plan-debug-when-enabled
+  (testing "call-capability! may include pre-execution plan with slot refs when :debug/plan? is true."
     (with-redefs [core/invoke-capability!
                   (fn [_runtime _opts]
                     {:result {:type :plan
@@ -445,7 +445,7 @@
                                               :value {:out {:text "ACID"}}}
                                              {:op :emit
                                               :input {:slot/id [:solver :out :text]}}]}}})]
-      (let [result (core/execute-capability!
+      (let [result (core/call-capability
                     nil
                     {}
                     {:role :router
@@ -459,8 +459,8 @@
                (get-in result [:result :out :text])))
         (is (map? (get-in result [:result :plan/run :telemetry])))))))
 
-(deftest execute-capability-runs-tool-node-with-runtime-effects
-  (testing "execute-capability! runs :tool plan nodes through scoped runtime effect handler."
+(deftest call-capability-runs-tool-node-with-runtime-effects
+  (testing "call-capability! runs :tool plan nodes through scoped runtime effect handler."
     (let [root (str (java.nio.file.Files/createTempDirectory
                      "ferment-core-tool"
                      (make-array java.nio.file.attribute.FileAttribute 0)))
@@ -480,7 +480,7 @@
                     (fn [_runtime _opts]
                       {:result {:type :plan
                                 :plan plan}})]
-        (let [result (core/execute-capability!
+        (let [result (core/call-capability
                       runtime
                       {}
                       {:role :router
@@ -492,8 +492,8 @@
           (is (= "tool-ok"
                  (slurp (io/file root "sandbox/tool.txt")))))))))
 
-(deftest execute-capability-propagates-auth-context-into-tool-plan
-  (testing "execute-capability! passes auth user and role policy into tool node payload and workflow env."
+(deftest call-capability-propagates-auth-context-into-tool-plan
+  (testing "call-capability! passes auth user and role policy into tool node payload and workflow env."
     (let [seen (atom nil)
           runtime {}
           roles-cfg {:enabled? true
@@ -523,7 +523,7 @@
                                     :env env})
                       {:result {:type :value
                                 :out {:ok? true}}})]
-        (let [result (core/execute-capability!
+        (let [result (core/call-capability
                       runtime
                       {}
                       {:role :router
@@ -539,8 +539,8 @@
           (is (= 21 (get-in @seen [:env :auth/user :user/id])))
           (is (= roles-cfg (get-in @seen [:env :roles/config]))))))))
 
-(deftest execute-capability-uses-configured-checks-and-judge-capability
-  (testing "execute-capability! passes protocol check-fns and triggers judge capability (:eval/grade)."
+(deftest call-capability-uses-configured-checks-and-judge-capability
+  (testing "call-capability! passes protocol check-fns and triggers judge capability (:eval/grade)."
     (let [calls (atom [])
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
                                         :eval/grade {:in-schema :req/eval}}
@@ -583,7 +583,7 @@
                         {:ok? true
                          :emitted {:judge-score (:score judge-out)
                                    :tests-check tests-check}}))]
-        (let [result (core/execute-capability!
+        (let [result (core/call-capability
                       runtime
                       (:resolver runtime)
                       {:role :solver
@@ -597,7 +597,7 @@
           (is (= [:problem/solve :eval/grade]
                  (mapv :intent @calls))))))))
 
-(deftest execute-capability-judge-parses-score-from-json-text
+(deftest call-capability-judge-parses-score-from-json-text
   (testing "Judge may return score as JSON in :out/:text and the result is parsed."
     (let [runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
                                         :eval/grade {:in-schema :req/eval}}
@@ -626,7 +626,7 @@
                                                                 {}
                                                                 {:result {:type :value
                                                                           :out {:text "x"}}}))}})]
-        (let [result (core/execute-capability!
+        (let [result (core/call-capability
                       runtime
                       (:resolver runtime)
                       {:role :solver
@@ -712,7 +712,7 @@
                 :score-min 1.0}
                (:done @captured)))))))
 
-(deftest execute-capability-respects-per-intent-judge-policy
+(deftest call-capability-respects-per-intent-judge-policy
   (testing "Intent-level quality/:judge may disable judge even with global judge enabled."
     (let [calls (atom [])
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
@@ -744,7 +744,7 @@
                                                       {}
                                                       {:result {:type :value
                                                                 :out {:text "x"}}})}})]
-        (let [result (core/execute-capability!
+        (let [result (core/call-capability
                       runtime
                       (:resolver runtime)
                       {:role :solver
@@ -775,14 +775,14 @@
           (is (= :delta (get-in result [:result :stream 0 :event])))
           (is (= "chunk-1" (get-in result [:result :stream 0 :text]))))))))
 
-(deftest execute-capability-passes-stream-result-through
-  (testing "execute-capability! returns :stream result unchanged (no plan materialization)."
+(deftest call-capability-passes-stream-result-through
+  (testing "call-capability! returns :stream result unchanged (no plan materialization)."
     (with-redefs [core/invoke-capability!
                   (fn [_runtime _opts]
                     {:result {:type :stream
                               :stream [{:seq 0 :event :delta :text "s-1"}
                                        {:seq 1 :event :done}]}})]
-      (let [result (core/execute-capability! nil {} {:intent :text/respond})]
+      (let [result (core/call-capability nil {} {:intent :text/respond})]
         (is (= :stream (contracts/result-type-of result)))
         (is (= "s-1" (get-in result [:result :stream 0 :text])))))))
 

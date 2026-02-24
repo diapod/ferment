@@ -258,7 +258,7 @@
         (with-meta accepted {:routing/rejected rejected}))
       candidates)))
 
-(defn resolve-capability-id
+(defn resolve-capability
   "Resolves capability id for a call node.
 
   Priority:

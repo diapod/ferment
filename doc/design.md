@@ -97,7 +97,7 @@ Requirement: thin composition layer for all others.
 ## 6. Module Map (current and target)
 
 Current building blocks:
-- `ferment.core` - contract-driven capability calls (`invoke-with-contract`, `execute-capability!`), meta/solver/voice routing, and plan execution,
+- `ferment.core` - contract-driven capability calls (`invoke-with-contract`, `call-capability`), canonical domain entrypoints (`classify-intent`, `build-plan`), meta/solver/voice routing, and plan execution,
 - `ferment.workflow` - IR evaluator (`:let`, `:call`, `:emit`, recursive `:plan`) with retry/fallback/checks,
 - `ferment.router`, `ferment.resolver`, `ferment.contracts`, `ferment.protocol` - routing, capability registry, and request/response validation,
 - `ferment.model` - model runtime (processes, HTTP invoke, session workers, freeze/thaw/TTL),
@@ -118,13 +118,13 @@ Target buds:
   - `:prompts/:default` (global core),
   - `:prompts/:roles` (router/solver/voice/coder/judge),
   - `:prompts/:intents` (intent semantic refinements).
-  Runtime composes prompts from these layers; `:intents/*/:system` and `:system/prompt` remain compatible full overrides.
+  Runtime composes prompts from these layers; `:intents/*/:system` is the canonical full override.
 
 ### 6.1. Implementation Status (2026-02-22)
 
 Integrant config branches are already split and active:
 - `:ferment.runtime/default` - orchestrator runtime input (refs to `:router`, `:resolver`, `:protocol`, `:roles`, `:session`, `:oplog`, `:models`, plus effect scope),
-- `:ferment.core/default` - core service (`:invoke!`, `:solver!`, `:voice!`, `:respond!`) initialized from runtime,
+- `:ferment.core/default` - core service (`:call-capability`, `:classify-intent`, `:build-plan`, plus `:solver!`/`:voice!`) initialized from runtime,
 - `:ferment.model.defaults/*`, `:ferment.model.id/*`, `:ferment.model.runtime/*`, `:ferment.model/*`, `:ferment/models` - complete model selection/runtime config.
 - `:ferment.session.store/default :session-vars/contract` supports:
   - `:policy/*` (read/write/delete by intent and operation),

@@ -282,7 +282,7 @@
       (is (= :ferment.model.runtime/meta (get-in routes ["/meta/responses" :worker-id]))))))
 
 (deftest http-v1-act-dispatches-through-core-contract-flow
-  (testing "/v1/act validates request and calls core/invoke-capability! with cap-id from resolver."
+  (testing "/v1/act validates request and calls core/call-capability with cap-id from resolver."
     (let [captured (atom nil)
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}}
                               :result/types [:value]}
@@ -295,7 +295,7 @@
                    :budget {:max-roundtrips 2
                             :temperature 0.0}
                    :session/id "s-1"}]
-      (with-redefs [core/execute-capability!
+      (with-redefs [core/call-capability
                     (fn [rt resolver opts]
                       (reset! captured {:runtime rt :resolver resolver :opts opts})
                       {:proto 1
@@ -350,7 +350,7 @@
                    :task {:intent :problem/solve}
                    :input {:prompt "diag"}
                    :session/id "s-http-1"}]
-      (with-redefs [core/execute-capability!
+      (with-redefs [core/call-capability
                     (fn [_rt _resolver opts]
                       {:proto 1
                        :trace (:trace opts)
@@ -380,7 +380,7 @@
                          :models {}})
           url (str "http://127.0.0.1:" port "/v1/act")]
       (try
-        (with-redefs [core/execute-capability!
+        (with-redefs [core/call-capability
                       (fn [rt resolver opts]
                         (reset! called {:runtime rt :resolver resolver :opts opts})
                         {:proto 1
@@ -969,7 +969,7 @@
           act-url (str "http://127.0.0.1:" port "/v1/act")
           diag-url (str "http://127.0.0.1:" port "/diag/telemetry")]
       (try
-        (with-redefs [core/execute-capability!
+        (with-redefs [core/call-capability
                       (fn [_rt _resolver opts]
                         {:proto 1
                          :trace (:trace opts)
@@ -1368,7 +1368,9 @@
                                          {:runtime runtime
                                           :resolver {}
                                           :protocol {}})]
-          (is (fn? (:respond! service)))
+          (is (fn? (:classify-intent service)))
+          (is (fn? (:build-plan service)))
+          (is (fn? (:call-capability service)))
           (is (fn? (:solver! service)))
           (is (fn? (:voice! service)))
           (is (= "{\"intent\":\"ok\"}" ((:solver! service) "napisz patch")))
