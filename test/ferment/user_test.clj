@@ -229,7 +229,7 @@
       (is (= 1 (user/id ::db "Cache@test.io")))
       (is (= 1 @db-calls)))))
 
-(deftest ids-cache-aliases-props-cache
-  (testing "Configured :ferment.user/ids-cache points to cache used by props helpers."
-    (is (identical? (var-get #'ferment.user/ids-cache)
-                    (var-get #'ferment.user/props-cache)))))
+(deftest props-cache-var-is-available
+  (testing "User props cache var is available for DB cache bootstrap."
+    (is (instance? clojure.lang.Atom
+                   (var-get #'ferment.user/props-cache)))))

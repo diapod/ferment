@@ -197,7 +197,7 @@
 
 (deftest eval-grade-result-contract-is-enforced
   (testing "Intent :eval/grade requires canonical value result with :out/:score in range 0..1."
-    (let [protocol {:quality/judge {:intent :eval/grade}
+    (let [protocol {:policy/default {:judge {:intent :eval/grade}}
                     :result/types [:value :plan :error]}
           ok-result {:result {:type :value
                               :out {:score 0.75
@@ -369,7 +369,7 @@
                    :trace {:id "trace-eval"}
                    :task {:intent :eval/grade}
                    :input {:prompt "grade this"}}
-          protocol {:quality/judge {:intent :eval/grade}
+          protocol {:policy/default {:judge {:intent :eval/grade}}
                     :result/types [:value :error]}
           calls (atom 0)
           invoke (fn [_request _attempt]

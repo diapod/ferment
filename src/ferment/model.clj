@@ -1226,11 +1226,9 @@
   "Returns runtime worker state by id from model runtime aggregate."
   [runtime worker-id]
   (let [workers (:workers runtime)
-        wid    (if (keyword? worker-id) worker-id (keyword (str worker-id)))
-        alias  (keyword (name wid))]
+        wid    (if (keyword? worker-id) worker-id (keyword (str worker-id)))]
     (or (get workers worker-id)
-        (get workers wid)
-        (get workers alias))))
+        (get workers wid))))
 
 (defn runtime-worker
   "Returns worker handle by id from model runtime aggregate."
@@ -1287,9 +1285,7 @@
                     (get-in system [:ferment/models model-k :runtime])
                     (get-in system [:ferment/models short-k :runtime])
                     (get-in system [:ferment.runtime/default :models model-k :runtime])
-                    (get-in system [:ferment.runtime/default :models short-k :runtime])
-                    (get-in system [:ferment.model/runtime :workers short-k])
-                    (get-in system [:ferment.runtime/default :workers short-k])]]
+                    (get-in system [:ferment.runtime/default :models short-k :runtime])]]
     (some #(when (and (map? %) (contains? % :worker)) %) candidates)))
 
 (defn diagnostic-invoke!
@@ -1362,11 +1358,9 @@
   (let [cfg    (runtime-config runtime)
         models (:models cfg)
         shortk (keyword (name model-k))]
-    (or (when (map? models)
-          (or (get models model-k)
-              (get models shortk)))
-        (let [legacy (get cfg model-k)]
-          (when (map? legacy) legacy)))))
+    (when (map? models)
+      (or (get models model-k)
+          (get models shortk)))))
 
 (defn- runtime-session-registry
   [runtime]

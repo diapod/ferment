@@ -376,15 +376,15 @@
           (is (= "SYS/DEFAULT\n\nSYS/ROLE/VOICE\n\nSYS/INTENT/TEXT"
                  (:system @seen))))))))
 
-(deftest invoke-capability-intent-system-prompt-still-overrides-packages
-  (testing "Explicit :system/prompt in intent config still works as full override."
+(deftest invoke-capability-intent-system-prompt-overrides-packages
+  (testing "Explicit :system in intent config works as full override."
     (let [seen (atom nil)
           runtime {:protocol {:prompts {:default "SYS/DEFAULT"
                                         :roles {:voice "SYS/ROLE/VOICE"}
                                         :intents {:text/respond "SYS/INTENT/TEXT"}}
                               :intents {:text/respond {:in-schema :req/text
                                                        :out-schema :res/text
-                                                       :system/prompt "SYS/LEGACY-OVERRIDE"}}
+                                                       :system "SYS/OVERRIDE"}}
                               :result/types [:value]}}]
       (with-redefs [core/ollama-generate!
                     (fn [params]
@@ -399,7 +399,7 @@
                        :prompt "hej"
                        :max-attempts 1})]
           (is (= :value (contracts/result-type-of result)))
-          (is (= "SYS/LEGACY-OVERRIDE" (:system @seen))))))))
+          (is (= "SYS/OVERRIDE" (:system @seen))))))))
 
 (deftest execute-capability-evaluates-plan-in-runtime
   (testing "execute-capability! evaluates returned plan and normalizes final value output."
@@ -545,13 +545,13 @@
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
                                         :eval/grade {:in-schema :req/eval}}
                               :result/types [:value :plan :error]
-                              :quality/checks {:tests-pass :builtin/tests-pass}
-                              :quality/judge {:enabled? true
-                                              :intent :eval/grade
-                                              :cap/id :llm/judge
-                                              :role :router
-                                              :max-attempts 1
-                                              :score-path [:score]}}
+                              :policy/checks {:tests-pass :builtin/tests-pass}
+                              :policy/default {:judge {:enabled? true
+                                                       :intent :eval/grade
+                                                       :cap/id :llm/judge
+                                                       :role :router
+                                                       :max-attempts 1
+                                                       :score-path [:score]}}}
                    :resolver {:routing {:intent->cap {:eval/grade :llm/judge}}}}]
       (with-redefs [core/invoke-capability!
                     (fn [_runtime opts]
@@ -602,11 +602,11 @@
     (let [runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
                                         :eval/grade {:in-schema :req/eval}}
                               :result/types [:value :plan :error]
-                              :quality/judge {:enabled? true
-                                              :intent :eval/grade
-                                              :cap/id :llm/judge
-                                              :score-path [:score]
-                                              :max-attempts 1}}
+                              :policy/default {:judge {:enabled? true
+                                                       :intent :eval/grade
+                                                       :cap/id :llm/judge
+                                                       :score-path [:score]
+                                                       :max-attempts 1}}}
                    :resolver {:routing {:intent->cap {:eval/grade :llm/judge}}}}]
       (with-redefs [core/invoke-capability!
                     (fn [_runtime opts]
@@ -642,9 +642,9 @@
           protocol {:retry/max-attempts 5
                     :intents {:text/respond {:in-schema :req/text}}
                     :constraints/default {:no-web true :language :pl}
-                    :done/default {:must #{:schema-valid}
-                                   :should #{:tests-pass}
-                                   :score-min 0.8}
+                    :policy/default {:done {:must #{:schema-valid}
+                                             :should #{:tests-pass}
+                                             :score-min 0.8}}
                     :budget/default {:max-tokens 1200}
                     :effects/default {:allowed #{:none}}
                     :result/types [:value]}
@@ -687,12 +687,12 @@
   (testing "Intent-level quality/:done is used when explicit request :done is not provided."
     (let [captured (atom nil)
           protocol {:retry/max-attempts 3
-                    :intents {:text/respond {:in-schema :req/text
-                                             :quality {:done {:must #{:schema-valid}
-                                                              :score-min 1.0}}}}
-                    :done/default {:must #{:schema-valid}
-                                   :should #{:tests-pass}
-                                   :score-min 0.8}
+                    :intents {:text/respond {:in-schema :req/text}}
+                    :policy/default {:done {:must #{:schema-valid}
+                                             :should #{:tests-pass}
+                                             :score-min 0.8}}
+                    :policy/intents {:text/respond {:done {:must #{:schema-valid}
+                                                           :score-min 1.0}}}
                     :result/types [:value]}
           runtime {:protocol protocol}]
       (with-redefs [contracts/invoke-with-contract
@@ -716,15 +716,15 @@
   (testing "Intent-level quality/:judge may disable judge even with global judge enabled."
     (let [calls (atom [])
           runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}
-                                        :text/respond {:in-schema :req/text
-                                                       :quality {:judge {:enabled? false}}}
+                                        :text/respond {:in-schema :req/text}
                                         :eval/grade {:in-schema :req/eval}}
+                              :policy/intents {:text/respond {:judge {:enabled? false}}}
                               :result/types [:value :plan :error]
-                              :quality/judge {:enabled? true
-                                              :intent :eval/grade
-                                              :cap/id :llm/judge
-                                              :role :router
-                                              :max-attempts 1}}
+                              :policy/default {:judge {:enabled? true
+                                                       :intent :eval/grade
+                                                       :cap/id :llm/judge
+                                                       :role :router
+                                                       :max-attempts 1}}}
                    :resolver {:routing {:intent->cap {:eval/grade :llm/judge}}}}]
       (with-redefs [core/invoke-capability!
                     (fn [_runtime opts]
@@ -793,7 +793,7 @@
           protocol {:retry/max-attempts 3
                     :intents {:text/respond {:in-schema :req/text}}
                     :constraints/default {:no-web true}
-                    :done/default {:must #{:schema-valid}}
+                    :policy/default {:done {:must #{:schema-valid}}}
                     :effects/default {:allowed #{:none}}
                     :result/types [:value]}
           runtime {:protocol protocol}]

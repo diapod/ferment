@@ -4,11 +4,12 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [ferment.adapters.model :as model-adapter]
+            [ferment.adapters.tool :as tool-adapter]
             [ferment.contracts :as contracts]
-            [ferment.effects :as effects]
+            [ferment.memory :as memory]
             [ferment.model :as model]
             [ferment.router :as router]
-            [ferment.session :as session]
             [ferment.workflow :as workflow]
             [ferment.system :as system])
 
@@ -72,10 +73,7 @@
   [protocol intent role]
   (let [intent-cfg (intent-config protocol intent)]
     (or
-     ;; Backward-compatible full override.
      (some-> (:system intent-cfg) str str/trim not-empty)
-     ;; Backward-compatible legacy full prompt key.
-     (some-> (:system/prompt intent-cfg) str str/trim not-empty)
      ;; Prompt package composition (default + role + intent + addendum).
      (join-system-prompt [(get-in protocol [:prompts :default])
                           (get-in protocol [:prompts :roles role])
@@ -261,9 +259,6 @@
   [runtime]
   (let [protocol    (or (runtime-protocol runtime) {})
         descriptors (merge default-check-descriptors
-                           (if (map? (:quality/checks protocol))
-                             (:quality/checks protocol)
-                             {})
                            (if (map? (:policy/checks protocol))
                              (:policy/checks protocol)
                              {}))]
@@ -324,7 +319,7 @@
                        meta-from-opts)]
     (when (and (map? service) sid)
       {:service service
-       :state   (session/open! service sid {:session/meta meta'})
+       :state   (memory/open! service sid {:session/meta meta'})
        :id      sid})))
 
 (defn- append-session-turn-safe!
@@ -333,7 +328,7 @@
              sid
              (map? turn))
     (try
-      (session/append-turn! session-service sid turn)
+      (memory/append-turn! session-service sid turn)
       (catch Throwable _ nil))))
 
 (def ^:private session-response-keys
@@ -350,7 +345,7 @@
   [session-service sid]
   (when (and (map? session-service) sid)
     (try
-      (session/get! session-service sid)
+      (memory/get! session-service sid)
       (catch Throwable _ nil))))
 
 (defn- attach-session-response
@@ -521,9 +516,7 @@
      :raw (assoc res :command cmd)}))
 
 (defn ollama-generate!
-  "Model generator (HF/MLX command backend, mock-aware).
-
-  Name kept for backward compatibility in tests."
+  "Model generator (HF/MLX command backend, mock-aware)."
   [{:keys [runtime resolver cap-id intent model prompt system mode session-id]}]
   (if (= :mock mode)
     {:response (mock-llm-response {:prompt (compose-prompt system prompt)})
@@ -625,8 +618,7 @@
                                          constraints-local)]
                        (when (seq merged) merged))
         done'        (or done
-                         (intent-default-done protocol' intent)
-                         (protocol-default protocol' :done/default nil))
+                         (intent-default-done protocol' intent))
         budget'      (or budget (protocol-default protocol' :budget/default nil))
         effects'     (or effects (protocol-default protocol' :effects/default nil))
         requires'    (contracts/normalize-requires requires)
@@ -1129,7 +1121,7 @@
                     :resolver resolver'
                     :invoke-call (invoke-plan-call! runtime resolver')
                     :invoke-tool (fn [tool-node env]
-                                   (effects/invoke-tool! effects-cfg tool-node env))
+                                   (tool-adapter/invoke! effects-cfg tool-node env))
                     :check-fns check-fns
                     :judge-fn judge-fn
                     :env workflow-env})
@@ -1279,22 +1271,22 @@
    :protocol protocol
    :session  session
    :session-open! (fn
-                    ([sid] (when (map? session) (session/open! session sid)))
-                    ([sid opts] (when (map? session) (session/open! session sid opts))))
+                    ([sid] (when (memory/service? session) (memory/open! session sid)))
+                    ([sid opts] (when (memory/service? session) (memory/open! session sid opts))))
    :session-get! (fn [sid]
-                   (when (map? session) (session/get! session sid)))
+                   (when (memory/service? session) (memory/get! session sid)))
    :session-freeze! (fn
-                      ([sid] (when (map? session) (session/freeze! session sid)))
-                      ([sid opts] (when (map? session) (session/freeze! session sid opts))))
+                      ([sid] (when (memory/service? session) (memory/freeze! session sid)))
+                      ([sid opts] (when (memory/service? session) (memory/freeze! session sid opts))))
    :session-thaw! (fn
-                    ([sid] (when (map? session) (session/thaw! session sid)))
-                    ([sid opts] (when (map? session) (session/thaw! session sid opts))))
+                    ([sid] (when (memory/service? session) (memory/thaw! session sid)))
+                    ([sid opts] (when (memory/service? session) (memory/thaw! session sid opts))))
    :session-workers (fn []
-                      (model/session-workers-state runtime))
+                      (model-adapter/session-workers-state runtime))
    :session-worker-freeze! (fn [model-id sid]
-                             (model/freeze-session-worker! runtime model-id sid))
+                             (model-adapter/freeze-session-worker! runtime model-id sid))
    :session-worker-thaw! (fn [model-id sid]
-                           (model/thaw-session-worker! runtime model-id sid))
+                           (model-adapter/thaw-session-worker! runtime model-id sid))
    :coder!   (fn
                ([user-text] (coder! user-text runtime (with-session-service session nil)))
                ([user-text opts] (coder! user-text runtime (with-session-service session opts))))

@@ -2,8 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [ferment.oplog :as oplog]))
 
-(deftest reads-oplog-config-from-new-and-legacy-branches
-  (testing "Auth and subsystem config are resolved from both new and legacy keys."
+(deftest reads-oplog-config-from-canonical-branches
+  (testing "Auth and subsystem config are resolved from canonical logging branches."
     (let [new-cfg    {:ferment.logging/oplog
                       {:auth {:fn/reporter :auth-r}
                        :act  {:fn/reporter :act-r}
@@ -11,10 +11,7 @@
           runtime-cfg {:oplog
                        {:auth {:fn/reporter :runtime-auth-r}
                         :act  {:fn/reporter :runtime-act-r}
-                        :ops  {:fn/reporter :runtime-ops-r}}}
-          legacy-cfg {:ferment.oplog.auth/log {:fn/reporter :legacy-auth-r}
-                      :ferment.oplog.act/log  {:fn/reporter :legacy-act-r}
-                      :ferment.oplog.ops/log  {:fn/reporter :legacy-ops-r}}]
+                        :ops  {:fn/reporter :runtime-ops-r}}}]
       (is (= {:fn/reporter :auth-r}
              (oplog/auth-config new-cfg)))
       (is (= {:fn/reporter :act-r}
@@ -23,16 +20,10 @@
              (oplog/auth-config runtime-cfg)))
       (is (= {:fn/reporter :runtime-act-r}
              (oplog/act-config runtime-cfg)))
-      (is (= {:fn/reporter :legacy-auth-r}
-             (oplog/auth-config legacy-cfg)))
-      (is (= {:fn/reporter :legacy-act-r}
-             (oplog/act-config legacy-cfg)))
       (is (= {:fn/reporter :ops-r}
              (oplog/config :ops new-cfg)))
       (is (= {:fn/reporter :runtime-ops-r}
-             (oplog/config :ops runtime-cfg)))
-      (is (= {:fn/reporter :legacy-ops-r}
-             (oplog/config :ops legacy-cfg))))))
+             (oplog/config :ops runtime-cfg))))))
 
 (deftest logger-wrappers-use-reporter-functions
   (testing "logger/auth-logger/get-logger forward keyword arguments to reporter."

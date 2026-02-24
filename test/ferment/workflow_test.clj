@@ -151,7 +151,7 @@
       (is (= {:text "voice-b"} (:emitted run))))))
 
 (deftest execute-plan-applies-per-intent-quality-checks
-  (testing "Per-intent :quality/:checks are enforced as hard gates even when node does not provide :done."
+  (testing "Per-intent :policy/intents :checks are enforced as hard gates even when node does not provide :done."
     (let [err (try
                 (workflow/execute-plan
                  {:plan {:nodes [{:op :call
@@ -159,9 +159,9 @@
                                   :dispatch {:candidates [:llm/voice]}
                                   :as :answer}
                                  {:op :emit :input {:slot/id [:answer :out]}}]}
-                  :resolver {:protocol {:intents {:text/respond
-                                                  {:quality {:checks [:tests-pass]
-                                                             :done {:score-min 1.0}}}}
+                  :resolver {:protocol {:policy/intents {:text/respond
+                                                         {:checks [:tests-pass]
+                                                          :done {:score-min 1.0}}}
                                        :result/types [:value]}}
                   :check-fns {:tests-pass (fn [_ _ _] false)}
                   :invoke-call (fn [_ _]

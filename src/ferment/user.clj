@@ -19,9 +19,6 @@
 (defonce ^:redef props-cache    (atom nil))
 (defonce ^:redef settings-cache (atom nil))
 (defonce ^:redef identity-cache (atom nil))
-;; Cache config currently uses :ferment.user/ids-cache. Keep alias to props-cache
-;; so DB cache bootstrap wires into the same cache atom used by user props helpers.
-(defonce ^:redef ids-cache      props-cache)
 
 (def ^:private select-user-by-id-sql
   (str "SELECT id, email, account_type, password_suite_id, password,"

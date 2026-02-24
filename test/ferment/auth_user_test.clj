@@ -2,11 +2,14 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [ferment.auth :as auth]
+            [ferment.auth.algo.pbkdf2]
             [ferment.auth.user :as auth-user]
             [ferment.session :as session]
             [ferment.session.store :as session-store]
+            [ferment.system :as system]
             [ferment.test-support.fake-auth-db :as fake-db]
             [ferment.user :as user]
+            [jsonista.core :as json]
             [next.jdbc :as jdbc]
             [tick.core :as t]))
 
@@ -183,12 +186,12 @@
                   auth-user/get-login-data (fn [_ _ _]
                                              {:user/id 1
                                               :user/email "a@b.c"
-                                              :auth/locked? true
+                                              :auth/locked-at (t/now)
                                               :auth/password-shared "{}"
                                               :auth/password-intrinsic "{}"})]
       (is (= {:ok? false
               :error :auth/account-locked
-              :auth/lock-kind :unknown}
+              :auth/lock-kind :hard}
              (auth-user/authenticate-password :auth "a@b.c" "secret")))))
   (testing "returns error when password does not match"
     (with-redefs [auth/config (fn
@@ -249,6 +252,57 @@
           (is (= :operator (get-in login [:user :user/account-type])))
           (is (= "auth-e2e-s1" (:session/id (session/get! service "auth-e2e-s1"))))
           (is (contains? #{:hot :warm} (:session/state (session/get! service "auth-e2e-s1")))))))))
+
+(deftest password-roundtrip-uses-stored-user-and-suite-json
+  (testing "Password created by user/create-user! is verifiable using stored suite/intrinsic JSON from DB."
+    (let [fake-db (fake-db/make-db)
+          pwd-settings (system/init-key
+                        :ferment.auth.pwd/settings.simple
+                        {:wait        0
+                         :wait-random [0 0.001]
+                         :wait-nouser 0
+                         :suite       [{:name         :pbkdf2
+                                        :handler      'ferment.auth.algo.pbkdf2/handler
+                                        :iterations   2000
+                                        :salt-length  8
+                                        :salt-charset "abcdefghijklmnopqrstuvwzyx0123456789"}]})
+          auth-cfg (auth/make-auth :ferment.auth/simple
+                                   {:db ::db
+                                    :passwords pwd-settings
+                                    :account-types [:user]})]
+      (with-redefs [jdbc/transact (fn [connectable f _opts] (f connectable))
+                    jdbc/execute! (partial fake-db/execute! fake-db)
+                    jdbc/execute-one! (partial fake-db/execute-one! fake-db)]
+        (let [created (user/create-user! auth-cfg "Verifier@Test.io" "Pass.123!" :user)
+              user-id (get-in created [:user :user/id])
+              row (get @(:users* fake-db) user-id)
+              shared-json (get @(:suites-id* fake-db) (:password_suite_id row))
+              intrinsic-json (:password row)
+              shared-suite (json/read-value shared-json json/keyword-keys-object-mapper)
+              intrinsic-suite (json/read-value intrinsic-json json/keyword-keys-object-mapper)
+              encoded-fields (->> (concat shared-suite intrinsic-suite)
+                                  (filter map?)
+                                  (mapcat (fn [entry]
+                                            [(:salt entry)
+                                             (:password entry)
+                                             (:prefix entry)
+                                             (:suffix entry)
+                                             (:infix entry)]))
+                                  (filter string?))
+              login-data (auth-user/get-login-data auth-cfg "verifier@test.io" :user)
+              ok-login (auth-user/authenticate-password auth-cfg "verifier@test.io" "Pass.123!" :user)
+              bad-login (auth-user/authenticate-password auth-cfg "verifier@test.io" "wrong-pass" :user)]
+          (is (:ok? created))
+          (is (string? shared-json))
+          (is (string? intrinsic-json))
+          (is (seq encoded-fields))
+          (is (every? #(nil? (re-find #"[+/]" %)) encoded-fields))
+          (is (= shared-json (:auth/password-shared login-data)))
+          (is (= intrinsic-json (:auth/password-intrinsic login-data)))
+          (is (true? (auth/check-password-json "Pass.123!" shared-json intrinsic-json auth-cfg)))
+          (is (false? (auth/check-password-json "wrong-pass" shared-json intrinsic-json auth-cfg)))
+          (is (= true (:ok? ok-login)))
+          (is (= :auth/invalid-credentials (:error bad-login))))))))
 
 (deftest repeated-login-failures-trigger-soft-lock
   (testing "Failed login increments attempts and then blocks next login with soft lock."

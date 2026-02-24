@@ -292,17 +292,56 @@
 ;; Encode/decode as JSON
 ;;
 
+(def ^:private bytes-class
+  (class (byte-array 0)))
+
+(defn- bytes->base64-url-safe
+  [v]
+  (if (instance? bytes-class v)
+    (codecs/bin->base64-url-safe v)
+    v))
+
+(def json-write-translation
+  {:prefix   bytes->base64-url-safe
+   :suffix   bytes->base64-url-safe
+   :infix    bytes->base64-url-safe
+   :salt     bytes->base64-url-safe
+   :password bytes->base64-url-safe})
+
+(defn pre-generate-json
+  "Prepares suite entry for JSON serialization using translation map `tr-map`."
+  [tr-map m]
+  (if-not (map? m) m
+          (reduce-kv (fn [acc k f]
+                       (if (contains? m k)
+                         (qassoc acc k (f (get m k)))
+                         acc))
+                     m tr-map)))
+
 (defn to-json
   "Converts the given suite to JSON format."
-  [suite]
-  (json/write-value-as-string suite json/keyword-keys-object-mapper))
+  ([suite]
+   (to-json suite json-write-translation))
+  ([suite tr-map]
+   (let [suite' (if (sequential? suite)
+                  (mapv (partial pre-generate-json tr-map) suite)
+                  suite)]
+     (json/write-value-as-string suite' json/keyword-keys-object-mapper))))
+
+(defn- base64-any->bin
+  "Decodes Base64 payload accepting URL-safe and standard alphabets."
+  [v]
+  (try
+    (codecs/base64-url-safe->bin v)
+    (catch Throwable _
+      (codecs/base64->bin v))))
 
 (def json-translation
-  {:prefix     codecs/base64-url-safe->bin
-   :suffix     codecs/base64-url-safe->bin
-   :infix      codecs/base64-url-safe->bin
-   :salt       codecs/base64-url-safe->bin
-   :password   codecs/base64-url-safe->bin
+  {:prefix     base64-any->bin
+   :suffix     base64-any->bin
+   :infix      base64-any->bin
+   :salt       base64-any->bin
+   :password   base64-any->bin
    :handler-id symbol})
 
 (defn post-parse-json
@@ -314,7 +353,7 @@
                        (if (contains? m k)
                          (qassoc acc k (f (get m k)))
                          acc))
-                     m json-translation)))
+                     m tr-map)))
 
 (defn from-json
   "Converts JSON data to suite by applying transformations to keys described by

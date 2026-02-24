@@ -62,3 +62,34 @@ Status: after delivering contracts, sessions, RBAC/effects, and `/v1/act` flow.
      - runtime prompt builder supports composition `default + role + intent` while keeping full override compatibility via `:system` and `:system/prompt`,
      - regression tests cover both package composition and legacy overrides,
      - operational tuning iteration 2: stricter prompts and output limits for `route/decide`, `context/summarize`, `text/respond`, `problem/solve`, plus hard `:no-list-expansion` for `text/respond`.
+
+7. [x] Materialize target module buds (`adapters`, `memory`, `telemetry`)
+   - Split integration concerns into explicit namespaces:
+     - `ferment.adapters.model` (provider-specific model invoke/start/stop),
+     - `ferment.adapters.tool` (tool-side effect adapters),
+     - `ferment.memory` (session/context/cache facade),
+     - `ferment.telemetry` (counters/events API and sinks).
+   - Goal: align runtime code layout with design stratification and reduce cross-layer coupling.
+   - Delivered:
+     - added namespace facades: `src/ferment/adapters/model.clj`, `src/ferment/adapters/tool.clj`, `src/ferment/memory.clj`, `src/ferment/telemetry.clj`,
+     - rewired `core` to use `tool` adapter for plan tools and `memory` facade for runtime session operations,
+     - rewired `http` to use `model` adapter and `memory` facade in session/runtime endpoints and defaults injection,
+     - rewired `workflow` to use shared telemetry helpers from `ferment.telemetry`,
+     - regression check: `bin/test-full` green after refactor.
+
+8. [ ] Normalize core domain API names (`classify-intent`, `build-plan`, `call-capability`)
+   - Define canonical public entrypoints and map current internals to them (`resolve-capability`, `execute-plan`, `respond!`).
+   - Goal: make domain pipeline explicit and discoverable as stable API.
+   - Done when:
+     - canonical functions are present in one module (or clearly re-exported),
+     - docs/examples use canonical names only,
+     - old aliases are either deprecated or removed consistently.
+
+9. [ ] Complete Stage D observability (`start/stop/error` events + optional response cache)
+   - Add lifecycle telemetry events for app/runtime/http/model/session start-stop-failure transitions.
+   - Add local response cache behind config switch (intent-aware key, TTL, bounded size, safe invalidation).
+   - Goal: operational visibility and predictable latency/cost reduction on repeat requests.
+   - Done when:
+     - lifecycle event schema is emitted and visible via diagnostics/oplog,
+     - response cache is disabled by default, can be enabled per profile, and has regression tests,
+     - cache hit/miss is included in telemetry snapshot.

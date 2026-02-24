@@ -601,6 +601,26 @@
         (finally
           (fhttp/stop-http :ferment.http/default server-state))))))
 
+(deftest http-v1-admin-rejects-legacy-action-alias
+  (testing "/v1/admin accepts only canonical :admin/* actions."
+    (let [port (free-port)
+          runtime {:models {}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (let [resp (http-post-json url {:action :create-user
+                                        :email "new@example.com"
+                                        :password "secret"})
+              body (json/parse-string (:body resp) true)]
+          (is (= 400 (:status resp)))
+          (is (= "input/invalid" (:error body)))
+          (is (= "create-user" (get-in body [:details :action]))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
 (deftest http-v1-admin-allows-manager-to-create-user
   (testing "/v1/admin calls create-user when authenticated role policy allows operation."
     (let [port (free-port)

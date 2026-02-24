@@ -8,7 +8,8 @@
 
   (:require [clojure.walk :as walk]
             [ferment.contracts :as contracts]
-            [ferment.roles :as roles]))
+            [ferment.roles :as roles]
+            [ferment.telemetry :as telemetry]))
 
 (def ^:private default-retry-policy
   {:same-cap-max 0
@@ -479,28 +480,15 @@
 
 (defn- telemetry-atom
   [telemetry]
-  (if (instance? clojure.lang.IAtom telemetry)
-    telemetry
-    (atom {:nodes/total 0
-           :nodes/by-op {}
-           :calls/total 0
-           :calls/succeeded 0
-           :calls/failed 0
-           :calls/retries 0
-           :calls/fallback-hops 0
-           :calls/failure-types {}
-           :quality/judge-used 0
-           :quality/judge-pass 0
-           :quality/judge-fail 0
-           :quality/must-failed 0})))
+  (telemetry/ensure-atom telemetry telemetry/default-workflow-counters))
 
 (defn- telemetry-inc!
   [telemetry k]
-  (swap! telemetry update k (fnil inc 0)))
+  (telemetry/inc! telemetry k))
 
 (defn- telemetry-inc-in!
   [telemetry ks]
-  (swap! telemetry update-in ks (fnil inc 0)))
+  (telemetry/inc-in! telemetry ks))
 
 (defn- telemetry-record-quality!
   [telemetry done-eval]

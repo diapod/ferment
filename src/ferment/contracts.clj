@@ -414,47 +414,17 @@
       (assoc :should (set/union (keyword-set (:should base'))
                                 (keyword-set (:should over')))))))
 
-(defn- legacy-default-policy
-  [protocol]
-  (cond-> {}
-    (map? (:done/default protocol))
-    (assoc :done (:done/default protocol))
-
-    (map? (:quality/judge protocol))
-    (assoc :judge (:quality/judge protocol))
-
-    (or (integer? (:retry/max-attempts protocol))
-        (contains? protocol :retry/max-attempts))
-    (assoc :retry {:max-attempts (:retry/max-attempts protocol)})))
-
-(defn- legacy-intent-policy
-  [protocol intent]
-  (let [quality (if (map? (get-in protocol [:intents intent :quality]))
-                  (get-in protocol [:intents intent :quality])
-                  {})]
-    (cond-> {}
-      (map? (:done quality))
-      (assoc :done (:done quality))
-
-      (seq (keyword-set (:checks quality)))
-      (assoc :checks (keyword-set (:checks quality)))
-
-      (map? (:judge quality))
-      (assoc :judge (:judge quality)))))
-
 (defn intent-policy
   "Returns normalized policy map for `intent`, with defaults inherited from protocol."
   [protocol intent]
   (let [default-policy
-        (merge (legacy-default-policy protocol)
-               (if (map? (:policy/default protocol))
-                 (:policy/default protocol)
-                 {}))
+        (if (map? (:policy/default protocol))
+          (:policy/default protocol)
+          {})
         intent-policy*
-        (merge (legacy-intent-policy protocol intent)
-               (if (map? (get-in protocol [:policy/intents intent]))
-                 (get-in protocol [:policy/intents intent])
-                 {}))
+        (if (map? (get-in protocol [:policy/intents intent]))
+          (get-in protocol [:policy/intents intent])
+          {})
         done* (merge-done (:done default-policy) (:done intent-policy*))
         checks* (set/union (keyword-set (:checks default-policy))
                            (keyword-set (:checks intent-policy*)))
@@ -840,7 +810,6 @@
 (defn- validate-intent-result-shape
   [protocol intent result]
   (let [judge-intent (or (get-in (intent-policy protocol intent) [:judge :intent])
-                         (get-in protocol [:quality/judge :intent])
                          :eval/grade)
          contract     (or (get-in protocol [:intents intent :result/contract])
                           {:type :value

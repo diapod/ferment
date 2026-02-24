@@ -87,8 +87,7 @@
    (auth-config app/state))
   ([config]
    (or (some-> config (get :oplog) (get :auth))
-       (some-> config (get :ferment.logging/oplog) (get :auth))
-       (get config :ferment.oplog.auth/log))))
+       (some-> config (get :ferment.logging/oplog) (get :auth)))))
 
 (defn act-config
   "Returns default `/v1/act` operations logger configuration obtained from a system config."
@@ -96,8 +95,7 @@
    (act-config app/state))
   ([config]
    (or (some-> config (get :oplog) (get :act))
-       (some-> config (get :ferment.logging/oplog) (get :act))
-       (get config :ferment.oplog.act/log))))
+       (some-> config (get :ferment.logging/oplog) (get :act)))))
 
 (defn config
   "Returns default operations logger configuration obtained from a system config. Takes
@@ -107,9 +105,7 @@
   ([sub-name cfg]
    (let [sub-k (some-keyword-simple sub-name)]
      (or (some-> cfg (get :oplog) (get sub-k))
-         (some-> cfg (get :ferment.logging/oplog) (get sub-k))
-         (when sub-k
-           (get cfg (keyword (str "ferment.oplog." (name sub-k)) "log")))))))
+         (some-> cfg (get :ferment.logging/oplog) (get sub-k))))))
 
 (defn get-config
   "Returns default operations logger configuration obtained from a system config. Takes

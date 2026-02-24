@@ -91,8 +91,7 @@
   [login-data auth-config now]
   (let [hard?      (locking/hard-locked? login-data)
         soft?      (locking/soft-locked? login-data auth-config now)
-        legacy?    (true? (:auth/locked? login-data))
-        locked?    (or hard? soft? legacy?)
+        locked?    (or hard? soft?)
         soft-left  (when soft?
                      (locking/soft-lock-remains login-data auth-config now))]
     {:locked? locked?

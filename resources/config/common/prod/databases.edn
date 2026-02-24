@@ -15,6 +15,6 @@
                    :suspender   ferment.db/suspend-pool
                    :resumer     ferment.db/resume-pool}
 
- :ferment.db/caches {:ferment.user/ids-cache      {:size 2048}
+ :ferment.db/caches {:ferment.user/props-cache    {:size 2048}
                      :ferment.user/identity-cache {:ttl [1  minute] :size 2048}}
  }

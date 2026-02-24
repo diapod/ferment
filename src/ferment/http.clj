@@ -9,18 +9,18 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [cheshire.core :as json]
+            [ferment.adapters.model :as model-adapter]
+            [ferment.admin :as admin]
             [ferment.auth.user :as auth-user]
             [ferment.contracts :as contracts]
             [ferment.core :as core]
+            [ferment.memory :as memory]
             [ferment.middleware.remote-ip :as remote-ip]
-            [ferment.model :as model]
             [ferment.oplog :as oplog]
             [ferment.roles :as roles]
             [ferment.router :as router]
-            [ferment.session :as session]
-            [ferment.session.store :as session-store]
             [ferment.system :as system]
-            [ferment.admin :as admin]
+            [ferment.telemetry :as telemetry]
             [ferment.workflow :as workflow]
             [io.randomseed.utils.ip :as ip])
 
@@ -269,17 +269,6 @@
   [start-nanos]
   (/ (double (- (System/nanoTime) start-nanos)) 1000000.0))
 
-(defn- merge-telemetry-counters
-  [a b]
-  (merge-with
-   (fn [x y]
-     (cond
-       (and (map? x) (map? y)) (merge-telemetry-counters x y)
-       (and (number? x) (number? y)) (+ x y)
-       :else y))
-   (or a {})
-   (or b {})))
-
 (defn- default-telemetry
   []
   {:act {:requests 0
@@ -443,7 +432,7 @@
            wf-error-telemetry (workflow-telemetry-from-error body)]
        (swap! telemetry
               (fn [state]
-                (-> (merge-telemetry-counters (default-telemetry) state)
+                (-> (telemetry/merge-counters (default-telemetry) state)
                     (update-in [:act :requests] (fnil inc 0))
                     (update-in [:act :status status] (fnil inc 0))
                     (update-in [:act :latency-ms :count] (fnil inc 0))
@@ -453,18 +442,18 @@
                     (cond-> (keyword? err-k)
                       (update-in [:act :error-types err-k] (fnil inc 0)))
                     (cond-> (map? wf-telemetry)
-                      (update :workflow merge-telemetry-counters wf-telemetry))
+                      (update :workflow telemetry/merge-counters wf-telemetry))
                     (cond-> (map? wf-error-telemetry)
-                      (update :workflow merge-telemetry-counters wf-error-telemetry))
+                      (update :workflow telemetry/merge-counters wf-error-telemetry))
                     (cond-> (map? routing-telemetry)
-                      (update-in [:act :routing] merge-telemetry-counters routing-telemetry)))))))))
+                      (update-in [:act :routing] telemetry/merge-counters routing-telemetry)))))))))
 
 (defn- telemetry-snapshot
   [telemetry]
   (let [state0 (if (instance? clojure.lang.IAtom telemetry)
                  @telemetry
                  (default-telemetry))
-        state  (merge-telemetry-counters (default-telemetry) state0)
+        state  (telemetry/merge-counters (default-telemetry) state0)
         count  (counter-value (get-in state [:act :latency-ms :count]))
         sum    (double (or (get-in state [:act :latency-ms :sum]) 0.0))
         avg    (if (pos? count) (/ sum count) 0.0)
@@ -571,7 +560,7 @@
   (let [service (when (map? runtime) (:session runtime))
         store (when (map? service) (:store service))
         bindings (when (map? store)
-                   (session-store/request-default-bindings store))]
+                   (memory/request-default-bindings store))]
     (if (seq bindings)
       bindings
       fallback-request-default-bindings)))
@@ -623,9 +612,9 @@
              sid
              (seq binding-keys))
       (let [vars (try
-                   (session/get-vars! service sid binding-keys opts)
+                   (memory/get-vars! service sid binding-keys opts)
                    (catch clojure.lang.ArityException _
-                     (session/get-vars! service sid binding-keys))
+                     (memory/get-vars! service sid binding-keys))
                    (catch Throwable _
                      nil))]
         (if (map? vars)
@@ -1493,7 +1482,7 @@
            (let [service (when (map? runtime) (:session runtime))]
              (when (map? service)
                (try
-                 (session/get! service sid)
+                 (memory/get! service sid)
                  (catch Throwable _ nil)))))
          session-view
          (when (map? session-state)
@@ -1702,19 +1691,19 @@
       :state
       {:status 200
        :body {:ok? true
-              :workers (model/session-workers-state runtime)}}
+              :workers (model-adapter/session-workers-state runtime)}}
 
       :expire
       (do
-        (model/expire-session-workers! runtime)
+        (model-adapter/expire-session-workers! runtime)
         {:status 200
          :body {:ok? true
-                :workers (model/session-workers-state runtime)}})
+                :workers (model-adapter/session-workers-state runtime)}})
 
       :worker/thaw
       (if (and session-id model-id)
         {:status 200
-         :body (model/thaw-session-worker! runtime model-id session-id)}
+         :body (model-adapter/thaw-session-worker! runtime model-id session-id)}
         {:status 400
          :body {:ok? false
                 :error :input/invalid
@@ -1723,7 +1712,7 @@
       :worker/freeze
       (if (and session-id model-id)
         {:status 200
-         :body (model/freeze-session-worker! runtime model-id session-id)}
+         :body (model-adapter/freeze-session-worker! runtime model-id session-id)}
         {:status 400
          :body {:ok? false
                 :error :input/invalid
@@ -1733,7 +1722,7 @@
       (if (and service session-id)
         {:status 200
          :body {:ok? true
-                :session (session-public (session/open! service session-id opts))}}
+                :session (session-public (memory/open! service session-id opts))}}
         {:status 400
          :body {:ok? false
                 :error :input/invalid
@@ -1743,7 +1732,7 @@
       (if (and service session-id)
         {:status 200
          :body {:ok? true
-                :session (session-public (session/get! service session-id))}}
+                :session (session-public (memory/get! service session-id))}}
         {:status 400
          :body {:ok? false
                 :error :input/invalid
@@ -1753,7 +1742,7 @@
       (if (and service session-id)
         {:status 200
          :body {:ok? true
-                :session (session-public (session/thaw! service session-id opts))}}
+                :session (session-public (memory/thaw! service session-id opts))}}
         {:status 400
          :body {:ok? false
                 :error :input/invalid
@@ -1763,7 +1752,7 @@
       (if (and service session-id)
         {:status 200
          :body {:ok? true
-                :session (session-public (session/freeze! service session-id opts))}}
+                :session (session-public (memory/freeze! service session-id opts))}}
         {:status 400
          :body {:ok? false
                 :error :input/invalid
@@ -1773,7 +1762,7 @@
       (if service
         {:status 200
          :body {:ok? true
-                :sessions (mapv session-public (session/list! service))}}
+                :sessions (mapv session-public (memory/list! service))}}
         {:status 400
          :body {:ok? false
                 :error :input/invalid
@@ -1788,7 +1777,7 @@
                :body {:ok? true
                       :session/id session-id
                       :key k
-                      :value (session/get-var! service session-id k var-opts)}}))
+                      :value (memory/get-var! service session-id k var-opts)}}))
           {:status 400
            :body {:ok? false
                   :error :input/invalid
@@ -1803,7 +1792,7 @@
                :body {:ok? true
                       :session/id session-id
                       :keys ks
-                      :vars (session/get-vars! service session-id ks var-opts)}}))
+                      :vars (memory/get-vars! service session-id ks var-opts)}}))
           {:status 400
            :body {:ok? false
                   :error :input/invalid
@@ -1820,7 +1809,7 @@
                :body {:ok? true
                       :session/id session-id
                       :key k
-                      :written? (session/put-var! service session-id k value' var-opts)}}))
+                      :written? (memory/put-var! service session-id k value' var-opts)}}))
           {:status 400
            :body {:ok? false
                   :error :input/invalid
@@ -1834,7 +1823,7 @@
               {:status 200
                :body {:ok? true
                       :session/id session-id
-                      :written? (session/put-vars! service session-id vars' var-opts)}}))
+                      :written? (memory/put-vars! service session-id vars' var-opts)}}))
           {:status 400
            :body {:ok? false
                   :error :input/invalid
@@ -1849,7 +1838,7 @@
                :body {:ok? true
                       :session/id session-id
                       :key k
-                      :deleted? (session/del-var! service session-id k var-opts)}}))
+                      :deleted? (memory/del-var! service session-id k var-opts)}}))
           {:status 400
            :body {:ok? false
                   :error :input/invalid
@@ -1864,7 +1853,7 @@
                :body {:ok? true
                       :session/id session-id
                       :keys ks
-                      :deleted? (session/del-vars! service session-id ks var-opts)}}))
+                      :deleted? (memory/del-vars! service session-id ks var-opts)}}))
           {:status 400
            :body {:ok? false
                   :error :input/invalid
@@ -1877,7 +1866,7 @@
             {:status 200
              :body {:ok? true
                     :session/id session-id
-                    :deleted? (session/del-all-vars! service session-id var-opts)}}))
+                    :deleted? (memory/del-all-vars! service session-id var-opts)}}))
         {:status 400
          :body {:ok? false
                 :error :input/invalid
@@ -1898,23 +1887,6 @@
                                      :session/del-var :session/del-vars
                                      :session/del-all-vars}}}})))
 
-(def ^:private admin-action-aliases
-  {:create-user            :admin/create-user
-   :create-role            :admin/create-role
-   :delete-user            :admin/delete-user
-   :delete-role            :admin/delete-role
-   :set-password           :admin/set-password
-   :lock-user              :admin/lock-user
-   :unlock-user            :admin/unlock-user
-   :grant-role             :admin/grant-role
-   :revoke-role            :admin/revoke-role
-   :list-roles             :admin/list-roles
-   :list-known-roles       :admin/list-known-roles
-   :migrate-db             :admin/migrate-db
-   :rollback-db            :admin/rollback-db
-   :reset-login-attempts   :admin/reset-login-attempts
-   :reset-login            :admin/reset-login-attempts})
-
 (def ^:private admin-supported-actions
   #{:admin/create-user
     :admin/create-role
@@ -1934,10 +1906,8 @@
 (defn- normalize-admin-action
   [v]
   (when-some [action (keywordish v)]
-    (let [canonical (or (get admin-action-aliases action)
-                        action)]
-      (when (contains? admin-supported-actions canonical)
-        canonical))))
+    (when (contains? admin-supported-actions action)
+      action)))
 
 (defn- payload-params
   [payload]
@@ -2382,7 +2352,7 @@
              (map? service)
              (fn? (:open! service)))
       (or (try
-            (session/open! service sid {:session/meta (merge existing-meta
+            (memory/open! service sid {:session/meta (merge existing-meta
                                                              (session-principal-meta-update user now))})
             (catch Throwable _ nil))
           session-state)
@@ -2468,7 +2438,7 @@
 
       :else
       (if-some [session-state (try
-                                (session/get! service sid)
+                                (memory/get! service sid)
                                 (catch Throwable _ nil))]
         (let [user            (session-principal-user session-state)
               now-ms          (System/currentTimeMillis)
@@ -2600,7 +2570,7 @@
         {:ok? false
          :error :runtime-worker-missing
          :model (:model route)}
-        (or (model/command-bot-worker! worker :invoke payload)
+        (or (model-adapter/invoke-worker! worker payload)
             {:ok? false
              :error :empty-response
              :model (:model route)})))
