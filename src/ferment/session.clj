@@ -7,7 +7,8 @@
     ferment.session
 
   (:require [ferment.system :as system]
-            [ferment.session.store :as store])
+            [ferment.session.store :as store]
+            [ferment.telemetry :as telemetry])
 
   (:import (java.time Instant)
            (java.util UUID)))
@@ -198,47 +199,55 @@
 
 (defn init-service
   [_k {:keys [store context manager] :as config}]
-  (let [cfg (preconfigure-service _k config)]
-    (assoc cfg
-           :store         store
-           :context       context
-           :manager       manager
-           :open!         (fn
-                            ([sid]       (open-session!        manager sid nil))
-                            ([sid opts]  (open-session!        manager sid opts)))
-           :get!          (fn [sid]      (get-session          manager sid))
-           :list!         (fn []         (list-sessions        manager))
-           :append-turn!  (fn [sid turn] (append-session-turn! manager sid turn))
-           :get-var!      (fn
-                            ([sid k]       (store/get-var       store sid k))
-                            ([sid k opts]  (store/get-var       store sid k opts)))
-           :get-vars!     (fn
-                            ([sid ks]       (store/get-vars      store sid ks))
-                            ([sid ks opts]  (store/get-vars      store sid ks opts)))
-           :put-var!      (fn
-                            ([sid k v]       (store/put-var!      store sid k v))
-                            ([sid k v opts]  (store/put-var!      store sid k v opts)))
-           :put-vars!     (fn
-                            ([sid kvs]       (store/put-vars!     store sid kvs))
-                            ([sid kvs opts]  (store/put-vars!     store sid kvs opts)))
-           :del-var!      (fn
-                            ([sid k]       (store/del-var!      store sid k))
-                            ([sid k opts]  (store/del-var!      store sid k opts)))
-           :del-vars!     (fn
-                            ([sid ks]       (store/del-vars!     store sid ks))
-                            ([sid ks opts]  (store/del-vars!     store sid ks opts)))
-           :del-all-vars! (fn
-                            ([sid]       (store/del-all-vars! store sid))
-                            ([sid opts]  (store/del-all-vars! store sid opts)))
-           :freeze!       (fn
-                            ([sid]       (freeze-session! manager sid nil))
-                            ([sid opts]  (freeze-session! manager sid opts)))
-           :thaw!         (fn
-                            ([sid]       (thaw-session!   manager sid nil))
-                            ([sid opts]  (thaw-session!   manager sid opts))))))
+  (try
+    (let [cfg (preconfigure-service _k config)
+          service (assoc cfg
+                         :store         store
+                         :context       context
+                         :manager       manager
+                         :open!         (fn
+                                          ([sid]       (open-session!        manager sid nil))
+                                          ([sid opts]  (open-session!        manager sid opts)))
+                         :get!          (fn [sid]      (get-session          manager sid))
+                         :list!         (fn []         (list-sessions        manager))
+                         :append-turn!  (fn [sid turn] (append-session-turn! manager sid turn))
+                         :get-var!      (fn
+                                          ([sid k]       (store/get-var       store sid k))
+                                          ([sid k opts]  (store/get-var       store sid k opts)))
+                         :get-vars!     (fn
+                                          ([sid ks]       (store/get-vars      store sid ks))
+                                          ([sid ks opts]  (store/get-vars      store sid ks opts)))
+                         :put-var!      (fn
+                                          ([sid k v]       (store/put-var!      store sid k v))
+                                          ([sid k v opts]  (store/put-var!      store sid k v opts)))
+                         :put-vars!     (fn
+                                          ([sid kvs]       (store/put-vars!     store sid kvs))
+                                          ([sid kvs opts]  (store/put-vars!     store sid kvs opts)))
+                         :del-var!      (fn
+                                          ([sid k]       (store/del-var!      store sid k))
+                                          ([sid k opts]  (store/del-var!      store sid k opts)))
+                         :del-vars!     (fn
+                                          ([sid ks]       (store/del-vars!     store sid ks))
+                                          ([sid ks opts]  (store/del-vars!     store sid ks opts)))
+                         :del-all-vars! (fn
+                                          ([sid]       (store/del-all-vars! store sid))
+                                          ([sid opts]  (store/del-all-vars! store sid opts)))
+                         :freeze!       (fn
+                                          ([sid]       (freeze-session! manager sid nil))
+                                          ([sid opts]  (freeze-session! manager sid opts)))
+                         :thaw!         (fn
+                                          ([sid]       (thaw-session!   manager sid nil))
+                                          ([sid opts]  (thaw-session!   manager sid opts))))]
+      (telemetry/record-lifecycle! :session :start {:key _k})
+      service)
+    (catch Throwable t
+      (telemetry/record-lifecycle! :session :error {:key _k
+                                                    :error (.getMessage t)})
+      (throw t))))
 
 (defn stop-service
   [_k _state]
+  (telemetry/record-lifecycle! :session :stop {:key _k})
   nil)
 
 (defn open!

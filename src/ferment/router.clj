@@ -15,9 +15,10 @@
 (def ^:private routing-keys
   #{:intent->cap
     :cap->model-key
-    :intent->model-key
+    :intent->default-model-key
     :cap->role
     :intent->role
+    :intent->default-role
     :switch-on
     :retry
     :fallback
@@ -138,15 +139,18 @@
         (when (contains? routing :cap->model-key)
           (validate-keyword->keyword-map! (:cap->model-key routing)
                                           [:routing :cap->model-key]))
-        (when (contains? routing :intent->model-key)
-          (validate-keyword->keyword-map! (:intent->model-key routing)
-                                          [:routing :intent->model-key]))
+        (when (contains? routing :intent->default-model-key)
+          (validate-keyword->keyword-map! (:intent->default-model-key routing)
+                                          [:routing :intent->default-model-key]))
         (when (contains? routing :cap->role)
           (validate-keyword->keyword-map! (:cap->role routing)
                                           [:routing :cap->role]))
         (when (contains? routing :intent->role)
           (validate-keyword->keyword-map! (:intent->role routing)
                                           [:routing :intent->role]))
+        (when (contains? routing :intent->default-role)
+          (validate-keyword->keyword-map! (:intent->default-role routing)
+                                          [:routing :intent->default-role]))
         (when (contains? routing :switch-on)
           (validate-keyword-coll! (:switch-on routing) [:routing :switch-on]))
         (when (contains? routing :fallback)
@@ -237,6 +241,7 @@
   "Returns routing map from dedicated router branch."
   [runtime resolver]
   (or (some-> (router-config runtime) :routing)
+      (some-> (resolver-config runtime resolver) :routing)
       {}))
 
 (defn resolver-capability
@@ -249,38 +254,48 @@
                   cap))
               (:caps resolver')))))
 
+(def ^:private fallback-intent->default-model-key
+  {:text/respond :ferment.model/voice
+   :code/generate :ferment.model/coding
+   :code/patch :ferment.model/coding
+   :code/explain :ferment.model/coding
+   :code/review :ferment.model/coding
+   :route/decide :ferment.model/meta
+   :context/summarize :ferment.model/meta
+   :eval/grade :ferment.model/meta
+   :problem/solve :ferment.model/solver})
+
+(def ^:private fallback-intent->default-role
+  {:problem/solve :solver
+   :code/generate :coder
+   :code/patch :coder
+   :code/explain :coder
+   :code/review :coder
+   :route/decide :router
+   :context/summarize :router
+   :eval/grade :router
+   :text/respond :voice})
+
 (defn default-model-key-by-intent
-  "Returns default model selector key for capability intent."
-  [intent]
-  (cond
-    (= :text/respond intent)
-    :ferment.model/voice
-
-    (#{:code/generate :code/patch :code/explain :code/review} intent)
-    :ferment.model/coding
-
-    (#{:route/decide :context/summarize :eval/grade} intent)
-    :ferment.model/meta
-
-    :else
-    :ferment.model/solver))
+  "Returns default model selector key for capability intent from routing config."
+  [runtime resolver intent]
+  (or (some-> (resolver-routing runtime resolver) :intent->default-model-key (get intent))
+      (some-> fallback-intent->default-model-key (get intent))
+      :ferment.model/solver))
 
 (defn resolve-model-key
   "Resolves model selector key from capability metadata, resolver routing, or default intent mapping."
   [runtime resolver cap-id intent]
   (or (some-> (resolver-capability runtime resolver cap-id) :dispatch/model-key)
       (some-> (resolver-routing runtime resolver) :cap->model-key (get cap-id))
-      (some-> (resolver-routing runtime resolver) :intent->model-key (get intent))
-      (default-model-key-by-intent intent)))
+      (default-model-key-by-intent runtime resolver intent)))
 
 (defn default-role-by-intent
-  "Returns default execution role for capability intent."
-  [intent]
-  (case intent
-    :problem/solve :solver
-    (:code/generate :code/patch :code/explain :code/review) :coder
-    (:route/decide :context/summarize :eval/grade) :router
-    :voice))
+  "Returns default execution role for capability intent from routing config."
+  [runtime resolver intent]
+  (or (some-> (resolver-routing runtime resolver) :intent->default-role (get intent))
+      (some-> fallback-intent->default-role (get intent))
+      :voice))
 
 (defn resolve-role
   "Resolves execution role from capability metadata, resolver routing, or default intent mapping."
@@ -288,7 +303,7 @@
   (or (some-> (resolver-capability runtime resolver cap-id) :dispatch/role)
       (some-> (resolver-routing runtime resolver) :cap->role (get cap-id))
       (some-> (resolver-routing runtime resolver) :intent->role (get intent))
-      (default-role-by-intent intent)))
+      (default-role-by-intent runtime resolver intent)))
 
 (derive ::service :ferment.system/value)
 (derive :ferment.router/default ::service)

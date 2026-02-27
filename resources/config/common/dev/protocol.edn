@@ -2,6 +2,9 @@
 
  :ferment.protocol/default
  {:policy/default {:judge {:enabled? true
-                           :cap/id :llm/judge}}}
+                           :cap/id :llm/judge}}
+  :policy/intents {:route/decide {:retry {:max-attempts 4
+                                          :same-cap-max 3
+                                          :fallback-max 0}}}}
 
 }

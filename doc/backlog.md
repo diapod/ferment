@@ -1,97 +1,112 @@
-# Domain Backlog
+# Production Backlog (Tuning Phase)
 
-Status: after delivering contracts, sessions, RBAC/effects, and `/v1/act` flow.
+Status: post-foundation phase complete (`doc/backlogs-done.md`).
+Current focus: orchestration quality, natural multi-model behavior, robust contextual memory.
 
 ## Priorities
 
-1. [x] Per-intent quality tuning (operational)
-   - Tune `:done`, `:checks`, `judge`, and per-intent prompts in `resources/config/common/prod/protocol.edn`.
-   - Goal: fewer retries/fallbacks and more stable `meta -> solver -> voice` behavior.
-   - Delivered:
-     - system prompts for `:route/decide`, `:context/summarize`, `:problem/solve`, `:code/*`, `:eval/grade`,
-     - refined per-intent `:constraints/:max-chars` limits,
-     - quality policy updates for coding intents (`:checks` and `:done`) and default `:done/:should`.
-
-2. [x] Routing policy as a product decision
-   - Define default `routing.meta?`, `routing.strict?`, `routing.force?` for `dev/test-live/prod`.
-   - Define when to fail-open vs fail-closed.
-   - Goal: predictable `/v1/act` behavior.
-   - Delivered:
-     - `resources/config/common/prod/router.edn`: `:defaults {:meta? true :strict? false :force? false :on-error :fail-open}`,
-     - `resources/config/common/dev/router.edn`: `:defaults {:meta? true :strict? true :force? false :on-error :fail-closed}`,
-     - `resources/config/common/test-live/router.edn`: `:defaults {:meta? true :strict? false :force? false :on-error :fail-open}`,
-     - HTTP runtime uses effective config (`router/defaults` + request `:routing`),
-     - routing error semantics: `:on-error :fail-closed` => 502, `:on-error :fail-open` => fallback to static routing,
-     - request-level `:on-error` can override profile defaults.
-
-3. [x] Working-memory session contract
-   - Standardize session-vars namespaces (what can be written, what is auto-injected into context).
-   - Clarify TTL and freeze/thaw rules by data class.
-   - Goal: coherent contextual memory without semantic leakage.
-   - Delivered:
-     - `session-vars` contract extended with `:class/default`, `:class/by-namespace`, `:class/policy` (TTL and freeze policy by data class),
-     - frozen-session `put/del` now checks permissions by key/class (with fallback to global `:freeze/*`),
-     - variable TTL is computed per data class (`:ttl/default-ms` / `:ttl/max-ms`) with optional per-write `:ttl-ms` override,
-     - contract supports `:request/default-bindings` for declarative auto-injection of `session-vars` into request paths (`:constraints`, `:input`, `:context`),
-     - `/v1/act` reads bindings from store contract instead of a hardcoded key list.
-
-4. [x] Role/effect policy for tool plans
-   - Refine the `role -> operation/effect` matrix (especially `:process/run`, `:net/http`, `:fs/write`).
-   - Close edge-case scenarios and enforce unambiguous error codes.
-   - Goal: one authorization model end-to-end for the full execution plan.
-   - Delivered:
-     - production role policy switched to `:authorize-default? false` (default-deny for unknown operations/effects),
-     - unified error code for missing effect declaration in `:tool` (`:effects/invalid-input` + `:reason :effects/not-declared`),
-     - edge-case tests added for `workflow`, `effects`, `http`, and `roles` around effect authorization and error mapping.
-
-5. [x] Quality telemetry consolidation
-   - Define canonical KPIs: parse-rate, retry-rate, fallback-rate, judge pass-rate, failure taxonomy for `/v1/act`.
-   - Goal: drive tuning from metrics.
-   - Delivered:
-     - `/diag/telemetry` now returns `:kpi` branch with `:parse-rate`, `:retry-rate`, `:fallback-rate`, `:judge-pass-rate`,
-     - `:kpi/:failure-taxonomy` aggregates errors by type (`:by-type`) and by domain (`:by-domain`),
-     - workflow telemetry extended with `:quality/judge-pass` and `:quality/judge-fail`,
-     - KPI/taxonomy regression tests added for `http`, `workflow`, and diagnostics endpoint.
-
-6. [x] Role prompt packages
-   - Refine system prompts for `meta`, `solver`, `voice` against contracts (no `<think>`, less format drift).
-   - Goal: lower hallucination rate and better protocol conformance in live mode.
-   - Delivered:
-     - `resources/config/common/prod/protocol.edn` includes prompt packages under `:prompts/:default`, `:prompts/:roles`, `:prompts/:intents`,
-     - intents `:route/decide`, `:context/summarize`, `:text/respond`, `:problem/solve` use prompt packages instead of long inline prompts,
-     - runtime prompt builder supports composition `default + role + intent` while keeping full override compatibility via `:system` and `:system/prompt`,
-     - regression tests cover both package composition and legacy overrides,
-     - operational tuning iteration 2: stricter prompts and output limits for `route/decide`, `context/summarize`, `text/respond`, `problem/solve`, plus hard `:no-list-expansion` for `text/respond`.
-
-7. [x] Materialize target module buds (`adapters`, `memory`, `telemetry`)
-   - Split integration concerns into explicit namespaces:
-     - `ferment.adapters.model` (provider-specific model invoke/start/stop),
-     - `ferment.adapters.tool` (tool-side effect adapters),
-     - `ferment.memory` (session/context/cache facade),
-     - `ferment.telemetry` (counters/events API and sinks).
-   - Goal: align runtime code layout with design stratification and reduce cross-layer coupling.
-   - Delivered:
-     - added namespace facades: `src/ferment/adapters/model.clj`, `src/ferment/adapters/tool.clj`, `src/ferment/memory.clj`, `src/ferment/telemetry.clj`,
-     - rewired `core` to use `tool` adapter for plan tools and `memory` facade for runtime session operations,
-     - rewired `http` to use `model` adapter and `memory` facade in session/runtime endpoints and defaults injection,
-     - rewired `workflow` to use shared telemetry helpers from `ferment.telemetry`,
-     - regression check: `bin/test-full` green after refactor.
-
-8. [x] Normalize core domain API names (`classify-intent`, `build-plan`, `call-capability`)
-   - Define canonical public entrypoints and map current internals to them (`resolve-capability`, `execute-plan`, `respond!`).
-   - Goal: make domain pipeline explicit and discoverable as stable API.
-   - Delivered:
-     - added canonical public entrypoints in `ferment.core`: `classify-intent`, `build-plan`, `call-capability`,
-     - replaced internal/runtime usage of legacy names with canonical API in `ferment.http` and tests,
-     - renamed workflow capability resolver API to `resolve-capability`,
-     - updated core service map to expose `:classify-intent`, `:build-plan`, `:call-capability`,
-     - updated design docs to use canonical naming and removed legacy prompt override naming.
-
-9. [ ] Complete Stage D observability (`start/stop/error` events + optional response cache)
-   - Add lifecycle telemetry events for app/runtime/http/model/session start-stop-failure transitions.
-   - Add local response cache behind config switch (intent-aware key, TTL, bounded size, safe invalidation).
-   - Goal: operational visibility and predictable latency/cost reduction on repeat requests.
+1. [ ] Routing intelligence hardening (`meta -> solver -> voice`)
+   - Calibrate routing prompts and constraints for clearer `route/decide` outputs under strict mode.
+   - Add deterministic fallback ladder when `route/decide` quality fails.
+   - Goal: stable multi-model participation without accidental single-model collapse.
+   - Execution package (config):
+     - [x] `resources/config/common/prod/protocol.edn`
+       - tighten `:prompts/:intents/:route/decide` to enforce one canonical outcome shape (decision or `solver->voice->emit` plan),
+       - tighten `:intents/:route/decide/:constraints` (reduce max output size to reduce drift),
+       - define explicit retry/switch/fallback policy under `:policy/intents/:route/decide` (no implicit defaults).
+     - [x] `resources/config/common/prod/router.edn` and `resources/config/common/prod/capabilities.edn`
+       - keep router branch canonical (`#ref`), and add explicit routing-level retry/switch defaults in routing source branch,
+       - keep profile-independent fail mode semantics explicit (`:on-error` remains product default, request may override).
+     - [x] `resources/config/common/dev/protocol.edn` and `resources/config/common/test-live/protocol.edn`
+       - add overlay knobs for strict tuning runs (judge/retry profile) without mutating prod defaults.
+   - Execution package (tests):
+     - [x] `test/ferment/http_test.clj`
+       - add test for deterministic decider retry ladder (`same-cap` retries, then fail mode),
+       - add test that fail-open fallback path is explicit in error/details and routing telemetry counters,
+       - add test for strict fail-closed with rich, stable diagnostics payload (`failure/type`, `switch-on`, `retry-policy`, rejected candidates).
+     - [x] `test/ferment/workflow_test.clj`
+       - add candidate-order determinism test (base + policy fallback + routing fallback => stable deduplicated order),
+       - add test that route failure classes map deterministically to recoverable/non-recoverable decisions.
+     - [x] `test/ferment/contracts_test.clj`
+       - extend `:route/decide` contract tests for malformed/empty decision payload variants that currently trigger ambiguous retries.
+     - [x] `test/ferment/router_test.clj`
+       - validate new router-level tuning keys and invalid combinations fail fast with actionable `ex-data`.
+   - Validation run:
+     - [x] `bin/test` green,
+     - [ ] strict smoke (`/v1/act` with `routing.meta?=true`, `routing.strict?=true`, `routing.force?=true`) shows either canonical multi-model path or explicit fail-closed diagnostics (no silent fallback).
    - Done when:
-     - lifecycle event schema is emitted and visible via diagnostics/oplog,
-     - response cache is disabled by default, can be enabled per profile, and has regression tests,
-     - cache hit/miss is included in telemetry snapshot.
+     - strict mode keeps `route/fail-closed` intentional and explainable,
+     - `models/used` shows expected participants for representative prompts,
+     - routing failure reasons are explicit in telemetry and response details.
+
+2. [ ] Capability recognition precision (`intent -> cap/id`)
+   - Improve capability selection rules for ambiguous natural-language requests.
+   - Add negative tests for near-miss intents (avoid wrong cap selection).
+   - Goal: high precision in capability dispatch without overfitting.
+   - Done when:
+     - resolver chooses expected `cap/id` across golden intent/cap matrix,
+     - misroutes are observable in telemetry taxonomy,
+     - no legacy alias paths are required for canonical resolution.
+
+3. [ ] Reasoning quality control loop (operational)
+   - Tighten per-intent `:done/:checks/judge` profiles for `:route/decide`, `:problem/solve`, `:text/respond`.
+   - Separate quality thresholds for structure conformance vs semantic adequacy.
+   - Goal: fewer empty/degenerate outputs and fewer low-value retries.
+   - Done when:
+     - retry-rate and fallback-rate drop on smoke scenarios,
+     - `eval/must-failed` is actionable (clear must-rule failures),
+     - no `<think>`/tool-leak artifacts in user-facing text.
+
+4. [ ] Tool-call protocol discipline (no leakage to user output)
+   - Keep internal tool-calling markers as orchestration internals only.
+   - Ensure model outputs are normalized before final emission.
+   - Goal: natural conversational responses with strict protocol boundaries.
+   - Done when:
+     - tool markers never leak in `/v1/act` final output,
+     - telemetry still captures tool-plan internals for diagnostics,
+     - regression probes for leakage are green.
+
+5. [ ] Context memory shaping (session vars as working memory)
+   - Define default memory write/read patterns per intent class.
+   - Add summarization/compaction policy for long sessions (`freeze/thaw` friendly).
+   - Goal: consistent contextual continuity with bounded memory growth.
+   - Done when:
+     - context recall works across multi-turn calls without semantic drift,
+     - memory budget limits are enforced with deterministic eviction/compaction,
+     - session-vars behavior is covered by integration tests.
+
+6. [ ] Cross-model context handoff contract
+   - Standardize payload handoff from `solver` to `voice` (and future roles) with explicit shape.
+   - Preserve key reasoning artifacts without leaking chain-of-thought.
+   - Goal: voice layer naturally verbalizes solver outcome instead of echoing raw draft artifacts.
+   - Done when:
+     - solver output consumed by voice is structured and schema-validated,
+     - voice response quality improves on “explain + example” tasks,
+     - no prompt-format bleed between roles.
+
+7. [ ] Adaptive retry/fallback policy tuning per intent
+   - Tune `same-cap-max`, `fallback-max`, and `switch-on` sets per intent/cap profile.
+   - Differentiate policy for low-latency chat vs high-quality solve paths.
+   - Goal: better latency/quality tradeoff by intent.
+   - Done when:
+     - retry/fallback policy is declarative and intent-specific in config,
+     - telemetry KPIs show improved success-per-attempt ratio,
+     - no uncontrolled retry bursts in live profile.
+
+8. [ ] Production telemetry views for orchestration tuning
+   - Add focused views/queries for routing path quality and memory effectiveness.
+   - Expose interpretable KPIs: participant diversity, route confidence trend, context hit utility.
+   - Goal: tuning decisions driven by metrics, not ad-hoc inspection.
+   - Done when:
+     - `/diag/telemetry` includes actionable orchestration KPIs,
+     - baseline vs tuned runs can be compared consistently,
+     - documentation includes tuning playbook linked to KPI thresholds.
+
+9. [ ] Live profile benchmark pack (repeatable)
+   - Maintain a stable smoke/benchmark request set for `text/respond`, strict meta route, solver handoff, context reuse.
+   - Track response quality + latency + retries over time.
+   - Goal: regression-safe tuning cycle for production-like conditions.
+   - Done when:
+     - benchmark script produces comparable artifacts per run,
+     - pass/fail gates are explicit for routing, schema, and output quality,
+     - release checklist references this benchmark pack.

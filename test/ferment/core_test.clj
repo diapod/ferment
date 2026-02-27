@@ -144,10 +144,35 @@
                             :model "ignored"
                             :prompt "hej"
                             :system "sys"
+                            :max-tokens 420
+                            :top-p 0.77
                             :session-id "s-42"
                             :mode :live}))))
         (is (= :ferment.model/solver (:model-k @called)))
+        (is (= 420 (get-in @called [:payload :max-tokens])))
+        (is (= 0.77 (get-in @called [:payload :top-p])))
         (is (= "s-42" (get-in @called [:opts :session/id])))))))
+
+(deftest invoke-capability-forwards-budget-generation-overrides
+  (testing "invoke-capability! forwards budget :max-tokens and :top-p into runtime invoke payload."
+    (let [seen (atom nil)]
+      (with-redefs [core/ollama-generate!
+                    (fn [opts]
+                      (reset! seen opts)
+                      {:response "OK"})]
+        (let [result (core/invoke-capability!
+                      nil
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice
+                       :input {:prompt "hej"}
+                       :budget {:max-tokens 321
+                                :top-p 0.91}
+                       :max-attempts 1})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= "OK" (get-in result [:result :out :text])))
+          (is (= 321 (:max-tokens @seen)))
+          (is (= 0.91 (:top-p @seen))))))))
 
 (deftest model-generate-uses-capability-dispatch-model-key-from-resolver
   (testing "Generator resolves model runtime key from resolver capability metadata."
@@ -376,6 +401,32 @@
           (is (= "SYS/DEFAULT\n\nSYS/ROLE/VOICE\n\nSYS/INTENT/TEXT"
                  (:system @seen))))))))
 
+(deftest invoke-capability-composes-system-prompt-from-sequential-fragments
+  (testing "Prompt composition accepts vectors/lists for default/role/intent/addendum fragments."
+    (let [seen (atom nil)
+          runtime {:protocol {:prompts {:default ["SYS/DEFAULT" "A"]
+                                        :roles {:voice '("SYS/ROLE" "VOICE")}
+                                        :intents {:text/respond ["SYS/INTENT" "TEXT"]}}
+                              :intents {:text/respond {:in-schema :req/text
+                                                       :out-schema :res/text
+                                                       :system/addendum '("SYS/ADD" "END")}}
+                              :result/types [:value]}}]
+      (with-redefs [core/ollama-generate!
+                    (fn [params]
+                      (reset! seen params)
+                      {:response "ok"})]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice
+                       :model "voice-model"
+                       :prompt "hej"
+                       :max-attempts 1})]
+          (is (= :value (contracts/result-type-of result)))
+          (is (= "SYS/DEFAULT A\n\nSYS/ROLE VOICE\n\nSYS/INTENT TEXT\n\nSYS/ADD END"
+                 (:system @seen))))))))
+
 (deftest invoke-capability-intent-system-prompt-overrides-packages
   (testing "Explicit :system in intent config works as full override."
     (let [seen (atom nil)
@@ -433,6 +484,7 @@
         (is (= true (get-in result [:result :plan/run :ok?])))
         (is (map? (get-in result [:result :plan/run :telemetry])))
         (is (nil? (get-in result [:result :plan/run :env])))
+        (is (nil? (get-in result [:result :plan/run :transcript])))
         (is (vector? (get-in result [:result :plan/run :participants])))))))
 
 (deftest call-capability-can-expose-plan-debug-when-enabled
@@ -458,6 +510,64 @@
         (is (= "ACID"
                (get-in result [:result :out :text])))
         (is (map? (get-in result [:result :plan/run :telemetry])))))))
+
+(deftest call-capability-can-expose-call-transcript-when-enabled
+  (testing "call-capability! may include per-call transcript with materialized inputs/outputs when :debug/transcript? is true."
+    (with-redefs [core/invoke-capability!
+                  (fn [_runtime {:keys [cap-id input]}]
+                    (case cap-id
+                      :llm/meta
+                      {:result {:type :plan
+                                :plan {:nodes [{:op :call
+                                                :intent :problem/solve
+                                                :input {:prompt "Wyjasnij ACID."}
+                                                :as :solver}
+                                               {:op :call
+                                                :intent :text/respond
+                                                :input {:prompt {:slot/id [:solver :out :text]}}
+                                                :as :voice}
+                                               {:op :emit
+                                                :input {:slot/id [:voice :out]}}]}}}
+
+                      :llm/solver
+                      {:result {:type :value
+                                :out {:text "ACID to atomowosc, spojnosc, izolacja i trwalosc."}}}
+
+                      :llm/voice
+                      {:result {:type :value
+                                :out {:text (str "VOICE:" (:prompt input))}}}
+
+                      {:result {:type :error
+                                :error {:type :unsupported/capability}}}))]
+      (let [result (core/call-capability
+                    {}
+                    {:routing {:intent->cap {:problem/solve :llm/solver
+                                             :text/respond :llm/voice}}}
+                    {:role :router
+                     :intent :route/decide
+                     :cap-id :llm/meta
+                     :debug/transcript? true})
+            transcript (get-in result [:result :plan/run :transcript])]
+        (is (= :value (contracts/result-type-of result)))
+        (is (= "VOICE:ACID to atomowosc, spojnosc, izolacja i trwalosc."
+               (get-in result [:result :out :text])))
+        (is (= 2 (count transcript)))
+        (is (number? (get-in transcript [0 :latency-ms])))
+        (is (number? (get-in transcript [1 :latency-ms])))
+        (is (= :problem/solve (get-in transcript [0 :intent])))
+        (is (= "Wyjasnij ACID." (get-in transcript [0 :input :prompt])))
+        (is (= "ACID to atomowosc, spojnosc, izolacja i trwalosc."
+               (get-in transcript [0 :out :text])))
+        (is (= :text/respond (get-in transcript [1 :intent])))
+        (is (= "ACID to atomowosc, spojnosc, izolacja i trwalosc."
+               (get-in transcript [1 :input :prompt])))
+        (is (= "VOICE:ACID to atomowosc, spojnosc, izolacja i trwalosc."
+               (get-in transcript [1 :out :text])))
+        (is (= 2 (count (get-in result [:result :plan/run :timings]))))
+        (is (= :problem/solve
+               (get-in result [:result :plan/run :timings 0 :intent])))
+        (is (= :text/respond
+               (get-in result [:result :plan/run :timings 1 :intent])))))))
 
 (deftest call-capability-runs-tool-node-with-runtime-effects
   (testing "call-capability! runs :tool plan nodes through scoped runtime effect handler."
@@ -636,6 +746,85 @@
           (is (= :value (contracts/result-type-of result)))
           (is (= 0.73 (get-in result [:result :out :judge-score]))))))))
 
+(deftest call-capability-retries-problem-solve-on-truncated-ending
+  (testing "Problem solve fails quality gate and retries when output ends mid-sentence."
+    (let [calls (atom 0)
+          runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}}
+                              :result/types [:value :plan :error]
+                              :policy/checks {:no-truncated-ending :builtin/no-truncated-ending}
+                              :policy/intents {:problem/solve {:checks [:no-truncated-ending]}}
+                              :policy/default {:retry {:same-cap-max 1
+                                                       :fallback-max 0}
+                                               :switch-on #{:eval/must-failed}}}
+                   :resolver {:routing {:intent->cap {:problem/solve :llm/solver}}}}
+          plan {:nodes [{:op :call
+                         :intent :problem/solve
+                         :cap/id :llm/solver
+                         :input {:prompt "Explain ACID briefly."}
+                         :as :answer}
+                        {:op :emit
+                         :input {:slot/id [:answer :out]}}]}]
+      (with-redefs [core/invoke-capability!
+                    (fn [_runtime opts]
+                      (when (= :problem/solve (:intent opts))
+                        (if (= 1 (swap! calls inc))
+                          {:result {:type :value
+                                    :out {:text "ACID is a set of database transaction guarantees and"}}}
+                          {:result {:type :value
+                                    :out {:text "ACID is a set of database transaction guarantees."}}})))]
+        (let [result (core/call-capability
+                      runtime
+                      (:resolver runtime)
+                      {:role :router
+                       :intent :route/decide
+                       :cap-id :llm/meta
+                       :plan plan})]
+          (is (= 2 @calls))
+          (is (= :value (contracts/result-type-of result)))
+          (is (= "ACID is a set of database transaction guarantees."
+                 (get-in result [:result :out :text]))))))))
+
+(deftest call-capability-retries-text-respond-on-truncated-ending
+  (testing "Text respond can enforce no-truncated-ending as hard check and retry same capability."
+    (let [calls (atom 0)
+          runtime {:protocol {:intents {:text/respond {:in-schema :req/text}}
+                              :result/types [:value :plan :error]
+                              :policy/checks {:no-truncated-ending :builtin/no-truncated-ending}
+                              :policy/default {:retry {:same-cap-max 1
+                                                       :fallback-max 0}
+                                               :switch-on #{:eval/must-failed}}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice}}}}
+          plan {:nodes [{:op :call
+                         :intent :text/respond
+                         :cap/id :llm/voice
+                         :dispatch {:checks/hard [:no-truncated-ending]
+                                    :retry {:same-cap-max 1
+                                            :fallback-max 0}
+                                    :switch-on #{:eval/must-failed}}
+                         :input {:prompt "Explain briefly."}
+                         :as :answer}
+                        {:op :emit
+                         :input {:slot/id [:answer :out]}}]}]
+      (with-redefs [core/invoke-capability!
+                    (fn [_runtime opts]
+                      (when (= :text/respond (:intent opts))
+                        (if (= 1 (swap! calls inc))
+                          {:result {:type :value
+                                    :out {:text "ACID means Atomicity, Consistency, Isolation and Durability"}}}
+                          {:result {:type :value
+                                    :out {:text "ACID means Atomicity, Consistency, Isolation, and Durability."}}})))]
+        (let [result (core/call-capability
+                      runtime
+                      (:resolver runtime)
+                      {:role :router
+                       :intent :route/decide
+                       :cap-id :llm/meta
+                       :plan plan})]
+          (is (= 2 @calls))
+          (is (= :value (contracts/result-type-of result)))
+          (is (= "ACID means Atomicity, Consistency, Isolation, and Durability."
+                 (get-in result [:result :out :text]))))))))
+
 (deftest invoke-capability-applies-protocol-defaults
   (testing "invoke-capability! builds request from protocol default branches and retry from :retry/max-attempts."
     (let [captured (atom nil)
@@ -682,6 +871,66 @@
         (is (= {:allowed #{:none}}
                (get-in @captured [:request :effects])))
         (is (= 5 (get-in @captured [:opts :max-attempts]))))))
+
+(deftest invoke-capability-merges-intent-budget-over-default-and-request
+  (testing "Budget defaults are merged as: protocol default -> intent default -> request-local."
+    (let [captured (atom nil)
+          protocol {:retry/max-attempts 3
+                    :intents {:text/respond {:in-schema :req/text
+                                             :budget {:max-tokens 640
+                                                      :temperature 0.0}}}
+                    :budget/default {:max-tokens 1200
+                                     :max-roundtrips 3
+                                     :top-p 0.9}
+                    :result/types [:value]}
+          runtime {:protocol protocol}]
+      (with-redefs [contracts/invoke-with-contract
+                    (fn [_invoke-fn request _opts]
+                      (reset! captured request)
+                      {:ok? true
+                       :result {:result {:type :value
+                                         :out {:text "ok"}}}})]
+        (core/invoke-capability!
+         runtime
+         {:role :voice
+          :intent :text/respond
+          :cap-id :llm/voice
+          :model "voice-model"
+          :prompt "hej"
+          :budget {:top-p 0.75}})
+        (is (= {:max-tokens 640
+                :max-roundtrips 3
+                :top-p 0.75
+                :temperature 0.0}
+               (get-in @captured [:budget])))))))
+
+(deftest invoke-capability-uses-merged-request-budget-for-generation-params
+  (testing "Generation max-tokens/top-p are derived from merged request budget (default -> intent -> request)."
+    (let [seen-call (atom nil)
+          protocol {:intents {:text/respond {:in-schema :req/text
+                                             :budget {:max-tokens 640
+                                                      :top-p 0.85}}}
+                    :budget/default {:max-tokens 1200
+                                     :top-p 0.9}
+                    :result/types [:value]}
+          runtime {:protocol protocol}]
+      (with-redefs [core/ollama-generate!
+                    (fn [opts]
+                      (reset! seen-call opts)
+                      {:response "ok"})
+                    contracts/invoke-with-contract
+                    (fn [invoke-fn request _opts]
+                      {:ok? true
+                       :result (invoke-fn request 1)})]
+        (core/invoke-capability!
+         runtime
+         {:role :voice
+          :intent :text/respond
+          :cap-id :llm/voice
+          :input {:prompt "hej"}
+          :budget {:top-p 0.75}})
+        (is (= 640 (:max-tokens @seen-call)))
+        (is (= 0.75 (:top-p @seen-call)))))))
 
 (deftest invoke-capability-prefers-intent-done-policy-over-global-default
   (testing "Intent-level quality/:done is used when explicit request :done is not provided."

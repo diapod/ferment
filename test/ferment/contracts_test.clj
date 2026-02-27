@@ -39,15 +39,19 @@
              (get-in protocol [:intents :route/decide :result/contract :type])))
       (is (= #{:schema-valid}
              (get-in protocol [:policy/intents :route/decide :done :must])))
-      (is (= #{:schema-valid :no-list-expansion}
+      (is (= #{:schema-valid}
              (get-in protocol [:policy/intents :text/respond :done :must])))
+      (is (= #{:no-hallucinated-apis :no-list-expansion}
+             (get-in protocol [:policy/intents :text/respond :done :should])))
       (is (= [:schema-valid :no-hallucinated-apis :no-list-expansion]
              (get-in protocol [:policy/intents :text/respond :checks])))
+      (is (= [:llm/voice :llm/solver-text]
+             (get-in protocol [:policy/intents :text/respond :fallback])))
       (is (= 900
              (get-in protocol [:intents :text/respond :constraints :max-chars])))
-      (is (string? (get-in protocol [:prompts :default])))
-      (is (string? (get-in protocol [:prompts :roles :voice])))
-      (is (string? (get-in protocol [:prompts :intents :text/respond])))
+      (is (vector? (get-in protocol [:prompts :default])))
+      (is (vector? (get-in protocol [:prompts :roles :voice])))
+      (is (vector? (get-in protocol [:prompts :intents :text/respond])))
       (is (contains? (:error/catalog protocol) :schema/invalid))
       (is (contains? (:error/catalog protocol) :eval/must-failed))
       (is (= :builtin/schema-valid
@@ -275,7 +279,9 @@
           ok-nested {:result {:type :value
                               :out {:cap/id :llm/voice
                                     :dispatch {:candidates [:llm/voice :llm/solver]
-                                               :switch-on #{:schema/invalid}}}}}
+                                               :switch-on #{:schema/invalid}
+                                               :checks/hard [:schema-valid]
+                                               :checks/soft [:no-list-expansion]}}}}
           missing-target {:result {:type :value
                                    :out {:dispatch {:checks [:schema-valid]}}}}
           bad-cap-type {:result {:type :value
@@ -283,9 +289,24 @@
           bad-candidates {:result {:type :value
                                    :out {:cap/id :llm/solver
                                          :dispatch {:candidates ["llm/voice"]}}}}
+          bad-checks-hard {:result {:type :value
+                                    :out {:cap/id :llm/solver
+                                          :dispatch {:checks/hard ["schema-valid"]}}}}
+          bad-checks-soft {:result {:type :value
+                                    :out {:cap/id :llm/solver
+                                          :dispatch {:checks/soft ["no-list-expansion"]}}}}
+          bad-switch-on {:result {:type :value
+                                  :out {:cap/id :llm/solver
+                                        :dispatch {:switch-on ["schema/invalid"]}}}}
+          bad-dispatch-key {:result {:type :value
+                                     :out {:cap/id :llm/solver
+                                           :dispatch {:caps [:llm/solver]}}}}
           bad-retry {:result {:type :value
                               :out {:cap/id :llm/solver
                                     :dispatch {:retry {:same-cap-max -1}}}}}
+          bad-retry-fallback {:result {:type :value
+                                       :out {:cap/id :llm/solver
+                                             :dispatch {:retry {:fallback-max -1}}}}}
           bad-alias {:result {:type :value
                               :out {:cap-id :llm/solver}}}
           error-result {:error {:type :runtime/invoke-failed}}]
@@ -297,8 +318,18 @@
              (:reason (contracts/validate-result protocol :route/decide bad-cap-type))))
       (is (= :route/decide-candidates-not-keywords
              (:reason (contracts/validate-result protocol :route/decide bad-candidates))))
+      (is (= :route/decide-checks-hard-not-keywords
+             (:reason (contracts/validate-result protocol :route/decide bad-checks-hard))))
+      (is (= :route/decide-checks-soft-not-keywords
+             (:reason (contracts/validate-result protocol :route/decide bad-checks-soft))))
+      (is (= :route/decide-switch-on-not-keywords
+             (:reason (contracts/validate-result protocol :route/decide bad-switch-on))))
+      (is (= :route/decide-dispatch-unknown-keys
+             (:reason (contracts/validate-result protocol :route/decide bad-dispatch-key))))
       (is (= :route/decide-retry-same-cap-max-not-nonneg-int
              (:reason (contracts/validate-result protocol :route/decide bad-retry))))
+      (is (= :route/decide-retry-fallback-max-not-nonneg-int
+             (:reason (contracts/validate-result protocol :route/decide bad-retry-fallback))))
       (is (= :route/decide-unknown-keys
              (:reason (contracts/validate-result protocol :route/decide bad-alias))))
       (is (= :route/decide-error-not-allowed
@@ -311,30 +342,50 @@
                     :result/types [:value :plan :error]}
           ok-plan {:result {:type :plan
                             :plan {:nodes [{:op :call
+                                            :intent :text/respond
+                                            :as :voice-primary
+                                            :input {:prompt "Q"}
+                                            :dispatch {:allow-failure? true}}
+                                           {:op :call
                                             :intent :problem/solve
                                             :as :solver
+                                            :when {:failed? :voice-primary}
                                             :input {:prompt "Q"}}
                                            {:op :call
                                             :intent :text/respond
-                                            :as :voice
+                                            :as :voice-final
+                                            :when {:failed? :voice-primary}
                                             :input {:prompt {:slot/id [:solver :out :text]}}}
                                            {:op :emit
-                                            :input {:slot/id [:voice :out]}}]}}}
+                                            :input {:slot/id [:voice-primary :out]}}
+                                           {:op :emit
+                                            :when {:failed? :voice-primary}
+                                            :input {:slot/id [:voice-final :out]}}]}}}
           bad-plan {:result {:type :plan
                              :plan {:nodes [{:op :call
-                                             :intent :problem/solve
-                                             :as :solver
+                                             :intent :text/respond
+                                             :as :voice-primary
+                                             :dispatch {:allow-failure? true}
                                              :input {:prompt "Q"}}
                                             {:op :call
-                                             :intent :problem/solve
-                                             :as :voice
+                                             :intent :text/respond
+                                             :as :solver
+                                             :when {:failed? :voice-primary}
+                                             :input {:prompt "Q"}}
+                                            {:op :call
+                                             :intent :text/respond
+                                             :as :voice-final
+                                             :when {:failed? :voice-primary}
                                              :input {:prompt {:slot/id [:solver :out :text]}}}
                                             {:op :emit
-                                             :input {:slot/id [:voice :out]}}]}}}
+                                             :input {:slot/id [:voice-primary :out]}}
+                                            {:op :emit
+                                             :when {:failed? :voice-primary}
+                                             :input {:slot/id [:voice-final :out]}}]}}}
           bad-type {:result {:type :value
                              :out {:cap/id :llm/solver}}}]
       (is (:ok? (contracts/validate-result protocol :route/decide ok-plan)))
-      (is (= :route/plan-second-intent-not-text-respond
+      (is (= :route/plan-second-intent-not-problem-solve
              (:reason (contracts/validate-result protocol :route/decide bad-plan))))
       (is (= :route/plan-result-type-not-plan
              (:reason (contracts/validate-result protocol :route/decide bad-type)))))))

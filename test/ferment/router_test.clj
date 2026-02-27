@@ -64,6 +64,41 @@
           {:routing {:intent->cap {:problem/solve :llm/solver}
                      :switch-on :eval/low-score}})))))
 
+(deftest router-config-validation-validates-routing-retry-policy
+  (testing "Router :routing/:retry accepts non-negative ints and rejects invalid values with actionable path."
+    (let [ok (router/init-router
+              :ferment.router/default
+              {:routing {:intent->cap {:problem/solve :llm/solver}
+                         :retry {:same-cap-max 2
+                                 :fallback-max 0}
+                         :switch-on #{:schema/invalid}
+                         :fallback [:llm/solver]}})]
+      (is (= {:same-cap-max 2
+              :fallback-max 0}
+             (get-in ok [:routing :retry]))))
+    (let [err (try
+                (router/init-router
+                 :ferment.router/default
+                 {:routing {:intent->cap {:problem/solve :llm/solver}
+                            :retry {:same-cap-max -1}}})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :router/invalid-config (:error err)))
+      (is (= [:routing :retry :same-cap-max] (:path err)))
+      (is (= :non-negative-int (:expected err))))
+    (let [err (try
+                (router/init-router
+                 :ferment.router/default
+                 {:routing {:intent->cap {:problem/solve :llm/solver}
+                            :retry {:fallback-max :one}}})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :router/invalid-config (:error err)))
+      (is (= [:routing :retry :fallback-max] (:path err)))
+      (is (= :non-negative-int (:expected err))))))
+
 (deftest router-config-validation-validates-defaults
   (testing "Router branch validates :defaults for meta/strict/force/on-error."
     (let [cfg (router/init-router
@@ -123,17 +158,18 @@
     (let [resolver {:caps/by-id {:llm/solver {:cap/id :llm/solver
                                               :dispatch/model-key :ferment.model/meta}}
                     :routing {:cap->model-key {:llm/voice :ferment.model/voice}
-                              :intent->model-key {:problem/solve :ferment.model/coding}}}]
+                              :intent->default-model-key {:problem/solve :ferment.model/coding
+                                                          :text/respond :ferment.model/voice}}}]
       (is (= :ferment.model/meta
              (router/resolve-model-key nil resolver :llm/solver :problem/solve)))
-      (is (= :ferment.model/solver
+      (is (= :ferment.model/voice
              (router/resolve-model-key nil resolver :llm/voice :problem/solve)))
-      (is (= :ferment.model/solver
+      (is (= :ferment.model/coding
              (router/resolve-model-key nil resolver :llm/unknown :problem/solve)))
       (is (= :ferment.model/solver
              (router/resolve-model-key nil {} :llm/unknown :problem/solve)))
       (is (= :ferment.model/voice
-             (router/resolve-model-key nil {} :llm/unknown :text/respond)))
+             (router/resolve-model-key nil resolver :llm/unknown :text/respond)))
       (is (= :ferment.model/voice
              (router/resolve-model-key
               {:router {:routing {:cap->model-key {:llm/voice :ferment.model/voice}}}}
@@ -142,29 +178,36 @@
               :problem/solve)))
       (is (= :ferment.model/coding
              (router/resolve-model-key
-              {:router {:routing {:intent->model-key {:problem/solve :ferment.model/coding}}}}
+              {:router {:routing {:intent->default-model-key {:problem/solve :ferment.model/coding}}}}
               resolver
               :llm/unknown
               :problem/solve)))
       (is (= :ferment.model/meta
              (router/resolve-model-key
-              {:router {:routing {:intent->model-key {:problem/solve :ferment.model/meta}}}}
+              {:router {:routing {:intent->default-model-key {:problem/solve :ferment.model/meta}}}}
               resolver
               :llm/unknown
-              :problem/solve))))))
+              :problem/solve)))))
+  (testing "When no routing mapping exists for intent, function falls back to :ferment.model/solver."
+    (is (= :ferment.model/solver
+           (router/resolve-model-key nil {} :llm/unknown :unknown/intent)))))
 
 (deftest resolve-role-precedence
   (testing "role resolution uses capability dispatch, then router branch routing, then defaults."
     (let [resolver {:caps/by-id {:llm/solver {:cap/id :llm/solver
                                               :dispatch/role :router}}
                     :routing {:cap->role {:llm/voice :voice}
-                              :intent->role {:problem/solve :coder}}}]
+                              :intent->role {:problem/solve :coder}
+                              :intent->default-role {:problem/solve :router
+                                                     :text/respond :voice}}}]
       (is (= :router
              (router/resolve-role nil resolver :llm/solver :problem/solve)))
-      (is (= :solver
+      (is (= :voice
              (router/resolve-role nil resolver :llm/voice :problem/solve)))
-      (is (= :solver
+      (is (= :coder
              (router/resolve-role nil resolver :llm/unknown :problem/solve)))
+      (is (= :voice
+             (router/resolve-role nil resolver :llm/unknown :text/respond)))
       (is (= :solver
              (router/resolve-role nil {} :llm/unknown :problem/solve)))
       (is (= :voice
@@ -186,4 +229,22 @@
               {:router {:routing {:intent->role {:problem/solve :router}}}}
               resolver
               :llm/unknown
+              :problem/solve)))
+      (is (= :router
+             (router/resolve-role
+              {:router {:routing {:intent->default-role {:problem/solve :router}}}}
+              nil
+              :llm/unknown
               :problem/solve))))))
+
+(deftest resolve-role-fallback-chain-without-caps-index
+  (testing "When :caps/by-id is unavailable, role resolution uses :cap->role then :intent->role then :intent->default-role and built-in defaults."
+    (let [runtime {:router {:routing {:cap->role {:llm/voice :voice}
+                                      :intent->role {:text/respond :router}
+                                      :intent->default-role {:problem/solve :router}}}}]
+      (is (= :voice
+             (router/resolve-role runtime nil :llm/voice :problem/solve)))
+      (is (= :router
+             (router/resolve-role runtime nil :llm/unknown :text/respond)))
+      (is (= :router
+             (router/resolve-role runtime nil :llm/unknown :problem/solve))))))

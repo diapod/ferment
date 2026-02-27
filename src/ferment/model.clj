@@ -13,6 +13,7 @@
             [hato.client :as hato]
             [ferment.session :as fsession]
             [ferment.system :as system]
+            [ferment.telemetry :as telemetry]
             [io.randomseed.utils.bot :as bot]
             [io.randomseed.utils.bus :as bus])
 
@@ -26,6 +27,7 @@
 
 (def ^:private default-session-idle-ttl-ms 900000)
 (def ^:private default-session-max-per-model 4)
+(def ^:private default-runtime-session-sid "ferment-model-runtime")
 
 (defn- now-ms
   []
@@ -85,6 +87,55 @@
           default'
           fallback))))
 
+(defn- normalize-model-id-value
+  [v]
+  (cond
+    (string? v) (some-> v str/trim not-empty)
+    (map? v) (some-> (init-model-key nil v) str str/trim not-empty)
+    (keyword? v) (some-> v name str/trim not-empty)
+    :else (some-> v str str/trim not-empty)))
+
+(defn- command-arg-value
+  [command flag]
+  (when (sequential? command)
+    (let [parts (vec command)
+          flags (mapv #(some-> % str str/trim) parts)
+          idx (.indexOf ^java.util.List flags flag)]
+      (when (and (>= idx 0)
+                 (< idx (dec (count parts))))
+        (nth parts (inc idx))))))
+
+(defn- runtime-model-label
+  [cfg]
+  (when-some [model-id
+              (or (normalize-model-id-value (:model cfg))
+                  (normalize-model-id-value (get-in cfg [:invoke/http :model]))
+                  (some-> (command-arg-value (:command cfg) "--model")
+                          normalize-model-id-value)
+                  (some-> (command-arg-value (:command cfg) "-m")
+                          normalize-model-id-value))]
+    (or (some->> (str/split model-id #"/")
+                 (remove str/blank?)
+                 last
+                 str/trim
+                 not-empty)
+        model-id)))
+
+(defn- normalize-runtime-worker-session
+  [cfg]
+  (let [raw-session (:session cfg)
+        session' (cond
+                   (map? raw-session) raw-session
+                   (some? raw-session) {:sid (str raw-session)}
+                   :else {:sid default-runtime-session-sid})
+        sid (some-> (:sid session') str str/trim not-empty)
+        model-label (runtime-model-label cfg)]
+    (cond-> session'
+      (and (some? model-label)
+           (or (nil? sid)
+               (= sid default-runtime-session-sid)))
+      (assoc :sid model-label))))
+
 (defn stop-model
   "Stop hook for model selector keys."
   [_k _state]
@@ -96,14 +147,14 @@
   (cond
     (map? config) config
     (some? config) {:sid (str config)}
-    :else {:sid "ferment-model-runtime"}))
+    :else {:sid default-runtime-session-sid}))
 
 (defn init-bot-session
   "Initializes bot session map used by model runtime workers."
   [_k config]
   (let [cfg (preconfigure-bot-session _k config)
         sid (or (some-> (:sid cfg) str str/trim not-empty)
-                "ferment-model-runtime")]
+                default-runtime-session-sid)]
     (assoc cfg :sid sid)))
 
 (defn stop-bot-session
@@ -321,12 +372,12 @@
 
 (defn- port-bindable?
   [host port]
-  (let [bind-host (some-> host str str/trim not-empty)]
+  (let [^String bind-host (or (some-> host str str/trim not-empty)
+                              "127.0.0.1")]
     (try
       (with-open [^ServerSocket socket (ServerSocket.)]
         (.setReuseAddress socket false)
-        (.bind socket (InetSocketAddress. ^String (or bind-host "127.0.0.1")
-                                          (int port)))
+        (.bind socket (InetSocketAddress. bind-host (int port)))
         true)
       (catch BindException _ false)
       ;; Unknown host or invalid bind target should not be reported as "port in use".
@@ -397,12 +448,32 @@
         system  (invoke-system-prompt payload)
         model-id (or (some-> (:model cfg) str str/trim not-empty)
                      (some-> (:model worker-config) str str/trim not-empty))
+        payload-max-toks (or (when (number? (:max-tokens payload))
+                               (long (:max-tokens payload)))
+                             (when (number? (:max_tokens payload))
+                               (long (:max_tokens payload)))
+                             (when (number? (get-in payload [:budget :max-tokens]))
+                               (long (get-in payload [:budget :max-tokens])))
+                             (when (number? (get-in payload [:budget :max_tokens]))
+                               (long (get-in payload [:budget :max_tokens]))))
+        payload-top-p (or (when (number? (:top-p payload))
+                            (double (:top-p payload)))
+                          (when (number? (:top_p payload))
+                            (double (:top_p payload)))
+                          (when (number? (get-in payload [:budget :top-p]))
+                            (double (get-in payload [:budget :top-p])))
+                          (when (number? (get-in payload [:budget :top_p]))
+                            (double (get-in payload [:budget :top_p]))))
         temp    (when (number? (:temperature cfg))
                   (double (:temperature cfg)))
-        max-toks (when (number? (:max-tokens cfg))
-                   (long (:max-tokens cfg)))
-        top-p   (when (number? (:top-p cfg))
-                  (double (:top-p cfg)))]
+        max-toks (or (when (and (integer? payload-max-toks)
+                                (pos? payload-max-toks))
+                       payload-max-toks)
+                     (when (number? (:max-tokens cfg))
+                       (long (:max-tokens cfg))))
+        top-p   (or payload-top-p
+                    (when (number? (:top-p cfg))
+                      (double (:top-p cfg))))]
     (case format'
       :prompt-json
       (cond-> {:prompt prompt}
@@ -552,7 +623,7 @@
                   (try
                     (send-http-json! ready-url {} (assoc worker-config :invoke/http (assoc cfg :method :get)))
                     (catch Throwable _ nil)))
-                (Thread/sleep retry-ms)
+                (Thread/sleep (long retry-ms))
                 (recur (inc attempt)))
               (throw (ex-info "Failed to invoke runtime model over HTTP."
                               {:error :invoke-http-failed
@@ -621,7 +692,7 @@
                      merge-runtime-defaults)
         wid      (or (:id cfg) k)
         name'    (or (:name cfg) (str (name wid) " runtime"))
-        session' (or (:session cfg) {:sid "ferment-model-runtime"})
+        session' (normalize-runtime-worker-session cfg)
         invoke-http? (map? (:invoke/http cfg))
         invoke-mode (or (:invoke/mode cfg)
                         (when invoke-http? :runtime-http)
@@ -1113,6 +1184,14 @@
                             (and (some? runtime-state)
                                  (not (contains? runtime-state :error)))
                             (assoc :runtime/state runtime-state))]
+        (telemetry/record-lifecycle! :model :start {:worker/id (:id worker-config)
+                                                    :worker/name (:name worker-config)})
+        (when (and (map? runtime-state) (contains? runtime-state :error))
+          (telemetry/record-lifecycle! :model :error {:worker/id (:id worker-config)
+                                                      :worker/name (:name worker-config)
+                                                      :error (:message runtime-state)
+                                                      :details (when (map? (:details runtime-state))
+                                                                 (:details runtime-state))}))
         (vreset! base-state initial-state)
         (loop [session initial-state]
           (vreset! base-state session)
@@ -1144,18 +1223,26 @@
   [k config]
   (let [cfg (normalize-runtime-worker-config k config)]
     (if-not (:enabled? cfg)
-      {:id (:id cfg)
-       :name (:name cfg)
-       :enabled? false
-       :worker nil
-       :session (init-bot-session ::bot-session (:session cfg))
-       :config cfg}
+      (let [state {:id (:id cfg)
+                   :name (:name cfg)
+                   :enabled? false
+                   :worker nil
+                   :session (init-bot-session ::bot-session (:session cfg))
+                   :config cfg}]
+        (telemetry/record-lifecycle! :model :start {:key k
+                                                    :worker/id (:id cfg)
+                                                    :enabled? false
+                                                    :reason :disabled})
+        state)
       (let [session (init-bot-session ::bot-session (:session cfg))
             runner  (or (:fn cfg)
                         (fn [wrk bot-session]
                           (runtime-worker-run! wrk bot-session cfg)))
             bot-cfg (assoc cfg :fn runner)
             worker  (start-bot-worker! session bot-cfg)]
+        (telemetry/record-lifecycle! :model :start {:key k
+                                                    :worker/id (:id cfg)
+                                                    :worker/name (:name cfg)})
         {:id (:id cfg)
          :name (:name cfg)
          :enabled? true
@@ -1182,7 +1269,10 @@
                            {:worker (:id state)
                             :cmd/quit (:cmd/quit cfg)
                             :error (.getMessage t)}))))
-    (stop-bot-worker! worker))
+    (stop-bot-worker! worker)
+    (telemetry/record-lifecycle! :model :stop {:key _k
+                                               :worker/id (:id state)
+                                               :worker/name (:name state)}))
   nil)
 
 (defn preconfigure-model-runtime

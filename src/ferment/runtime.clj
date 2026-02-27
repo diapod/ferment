@@ -6,7 +6,8 @@
 
     ferment.runtime
 
-  (:require [ferment.system :as system]))
+  (:require [ferment.system :as system]
+            [ferment.telemetry :as telemetry]))
 
 (defn- resolver-cap-ids
   [resolver]
@@ -93,17 +94,25 @@
 
   Runtime branch is configuration-oriented and passed through unchanged."
   [_k config]
-  (let [cfg (-> (preconfigure-runtime _k config)
-                validate-router-capabilities!
-                attach-router-to-resolver)]
-    (assoc cfg
-           :ferment.model.session/workers (atom {})
-           :ferment.model.session/last-id-by-model (atom {})
-           :ferment.model.session/lock (Object.))))
+  (try
+    (let [cfg (-> (preconfigure-runtime _k config)
+                  validate-router-capabilities!
+                  attach-router-to-resolver)
+          runtime' (assoc cfg
+                          :ferment.model.session/workers (atom {})
+                          :ferment.model.session/last-id-by-model (atom {})
+                          :ferment.model.session/lock (Object.))]
+      (telemetry/record-lifecycle! :runtime :start {:key _k})
+      runtime')
+    (catch Throwable t
+      (telemetry/record-lifecycle! :runtime :error {:key _k
+                                                    :error (.getMessage t)})
+      (throw t))))
 
 (defn stop-runtime
   "Stop hook for runtime config branch."
   [_k _state]
+  (telemetry/record-lifecycle! :runtime :stop {:key _k})
   nil)
 
 (derive ::default :ferment.system/value)

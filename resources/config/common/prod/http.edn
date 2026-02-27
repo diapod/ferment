@@ -1,5 +1,8 @@
-{:ferment.http/default {:host   "127.0.0.1"
+{:ferment.http/default {:host   "0.0.0.0"
                         :port   12002
+                        :response-cache {:enabled? false
+                                         :ttl-ms   120000
+                                         :max-size 256}
                         :models #ref :ferment/models
                         :auth   {:enabled? false
                                  :realm    "ferment"

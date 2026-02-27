@@ -28,7 +28,9 @@
     (java.io OutputStream)
     (java.net InetSocketAddress)
     (java.nio.charset StandardCharsets)
-    (java.util Base64 Base64$Decoder)))
+    (java.util Base64 Base64$Decoder)
+    (java.util.concurrent ExecutorService Executors ThreadFactory TimeUnit)
+    (java.util.concurrent.atomic AtomicLong)))
 
 (defn- trim-s
   [v]
@@ -57,6 +59,40 @@
             :else nil)]
     (when (and (some? n) (not (neg? n)))
       n)))
+
+(defn- parse-positive-int
+  [v default]
+  (let [n (cond
+            (integer? v) (int v)
+            (number? v) (int (Math/floor (double v)))
+            (string? v) (try
+                          (Integer/parseInt (str/trim v))
+                          (catch Throwable _ nil))
+            :else nil)]
+    (if (and (integer? n) (pos? n))
+      n
+      default)))
+
+(defn- http-worker-threads
+  [cfg]
+  (let [default-threads (max 4 (* 2 (.availableProcessors (Runtime/getRuntime))))
+        configured      (or (:executor/threads cfg)
+                            (get-in cfg [:executor :threads]))]
+    (parse-positive-int configured default-threads)))
+
+(defn- http-thread-factory
+  []
+  (let [counter (AtomicLong. 0)]
+    (reify ThreadFactory
+      (^Thread newThread [_ ^Runnable runnable]
+        (let [^Thread t (Thread. runnable (str "ferment-http-" (.incrementAndGet counter)))]
+          (.setDaemon t true)
+          t)))))
+
+(defn- create-http-executor
+  [cfg]
+  (Executors/newFixedThreadPool (int (http-worker-threads cfg))
+                                ^ThreadFactory (http-thread-factory)))
 
 (defn- normalize-endpoint
   [v]
@@ -139,19 +175,19 @@
   (letfn [(->keyword-coll
             [v]
             (cond
-              (nil? v) nil
-              (set? v) (into #{} (keep keywordish) v)
+              (nil? v)        nil
+              (set? v)        (into #{} (keep keywordish) v)
               (sequential? v) (into [] (keep keywordish) v)
-              :else v))
+              :else           v))
           (->bool
             [v]
             (cond
               (boolean? v) v
-              (number? v) (not (zero? (long v)))
-              (string? v) (contains? #{"1" "true" "yes" "on"}
-                                     (-> v str/trim str/lower-case))
-              (nil? v) nil
-              :else (boolean v)))
+              (number? v)  (not (zero? (long v)))
+              (string? v)  (contains? #{"1" "true" "yes" "on"}
+                                      (-> v str/trim str/lower-case))
+              (nil? v)     nil
+              :else        (boolean v)))
           (->int
             [v default]
             (cond
@@ -160,48 +196,54 @@
               (string? v)  (try
                              (Integer/parseInt (str/trim v))
                              (catch Throwable _ default))
-              :else default))
+              :else        default))
           (normalize-routing
             [routing]
-            (let [routing' (if (map? routing) routing {})
-                  intent   (keywordish (:intent routing'))
-                  cap-id   (keywordish (:cap/id routing'))
-                  meta?    (->bool (:meta? routing'))
-                  strict?  (->bool (:strict? routing'))
-                  force?   (->bool (:force? routing'))
-                  on-error (keywordish (:on-error routing'))
+            (let [routing'    (if (map? routing) routing {})
+                  intent      (keywordish (:intent routing'))
+                  cap-id      (keywordish (:cap/id routing'))
+                  profile     (keywordish (:profile routing'))
+                  meta?       (->bool (:meta? routing'))
+                  strict?     (->bool (:strict? routing'))
+                  force?      (->bool (:force? routing'))
+                  on-error    (keywordish (:on-error routing'))
                   debug-plan? (->bool (or (:debug/plan? routing')
                                           (:debug-plan? routing')
-                                          (get-in routing' [:debug :plan?])))]
+                                          (get-in routing' [:debug :plan?])))
+                  debug-transcript? (->bool (or (:debug/transcript? routing')
+                                                (:debug-transcript? routing')
+                                                (get-in routing' [:debug :transcript?])))]
               (cond-> routing'
-                (keyword? intent) (assoc :intent intent)
-                (keyword? cap-id) (assoc :cap/id cap-id)
-                (some? meta?) (assoc :meta? meta?)
-                (some? strict?) (assoc :strict? strict?)
-                (some? force?) (assoc :force? force?)
+                (keyword? intent)                               (assoc :intent intent)
+                (keyword? cap-id)                               (assoc :cap/id cap-id)
+                (keyword? profile)                              (assoc :profile profile)
+                (some? meta?)                                   (assoc :meta? meta?)
+                (some? strict?)                                 (assoc :strict? strict?)
+                (some? force?)                                  (assoc :force? force?)
                 (contains? #{:fail-open :fail-closed} on-error) (assoc :on-error on-error)
-                (some? debug-plan?) (assoc :debug/plan? debug-plan?))))
+                (some? debug-plan?)                             (assoc :debug/plan? debug-plan?)
+                (some? debug-transcript?)                       (assoc :debug/transcript? debug-transcript?))))
           (normalize-top
             [request]
-            (let [intent (or (some-> request :task :intent keywordish)
-                             (some-> request :intent keywordish))
-                  cap-id (or (some-> request :task :cap/id keywordish)
-                             (some-> request :cap/id keywordish))
-                  requires (contracts/normalize-requires
-                            (or (get-in request [:task :requires])
-                                (:requires request)))
-                  role   (keywordish (:role request))
+            (let [intent        (or (some-> request :task :intent keywordish)
+                                     (some-> request :intent keywordish))
+                  cap-id        (or (some-> request :task :cap/id keywordish)
+                                    (some-> request :cap/id keywordish))
+                  requires      (contracts/normalize-requires
+                                 (or (get-in request [:task :requires])
+                                     (:requires request)))
+                  role          (keywordish (:role request))
                   response-type (or (some-> request :response/type keywordish)
                                     (some-> request :response :type keywordish))
-                  stream? (or (->bool (:stream? request))
-                              (->bool (get-in request [:response :stream?])))]
+                  stream?       (or (->bool (:stream? request))
+                                    (->bool (get-in request [:response :stream?])))]
               (cond-> request
-                (keyword? intent) (assoc-in [:task :intent] intent)
-                (keyword? cap-id) (assoc-in [:task :cap/id] cap-id)
-                (map? requires) (assoc-in [:task :requires] requires)
-                (keyword? role) (assoc :role role)
-                (keyword? response-type) (assoc :response/type response-type)
-                (some? stream?) (assoc :stream? stream?)
+                (keyword? intent)          (assoc-in [:task :intent] intent)
+                (keyword? cap-id)          (assoc-in [:task :cap/id] cap-id)
+                (map? requires)            (assoc-in [:task :requires] requires)
+                (keyword? role)            (assoc :role role)
+                (keyword? response-type)   (assoc :response/type response-type)
+                (some? stream?)            (assoc :stream? stream?)
                 (contains? request :proto) (update :proto ->int 1)
                 (contains? request :done)
                 (-> (update-in [:done :must] ->keyword-coll)
@@ -221,45 +263,27 @@
       (string? payload)
       {:proto 1
        :trace {:id (str (java.util.UUID/randomUUID))}
-       :task {:intent :text/respond}
+       :task  {:intent :text/respond}
        :input {:prompt payload}}
 
       (map? payload)
       (let [trace (or (:trace payload)
                       {:id (str (java.util.UUID/randomUUID))})
-            req (-> payload
-                    (assoc :proto (or (:proto payload) 1))
-                    (assoc :trace trace)
-                    (assoc :task (or (:task payload) {:intent :text/respond}))
-                    (assoc :input (or (:input payload)
-                                      (if (contains? payload :prompt)
-                                        {:prompt (:prompt payload)}
-                                        {}))))]
+            req   (-> payload
+                      (assoc :proto (or (:proto payload) 1))
+                      (assoc :trace trace)
+                      (assoc :task (or (:task payload) {:intent :text/respond}))
+                      (assoc :input (or (:input payload)
+                                        (if (contains? payload :prompt)
+                                          {:prompt (:prompt payload)}
+                                          {}))))]
         (normalize-top req))
 
       :else payload)))
 
 (defn- cap-id->role
-  [cap-id intent]
-  (or (case cap-id
-        :llm/code :coder
-        :llm/solver :solver
-        :llm/meta :router
-        :llm/judge :router
-        :llm/voice :voice
-        :llm/mock :router
-        nil)
-      (case intent
-        :route/decide :router
-        :context/summarize :router
-        :eval/grade :router
-        :problem/solve :solver
-        :code/generate :coder
-        :code/patch :coder
-        :code/explain :coder
-        :code/review :coder
-        :text/respond :voice
-        :solver)))
+  [runtime resolver cap-id intent]
+  (router/resolve-role runtime resolver cap-id intent))
 
 (defn- now-nanos
   []
@@ -271,29 +295,35 @@
 
 (defn- default-telemetry
   []
-  {:act {:requests 0
-         :ok 0
-         :errors 0
-         :status {}
-         :error-types {}
-         :routing {:route/decide-hit 0
-                   :route/decide-continue 0
-                   :route/decide-final 0
-                   :route/fail-open 0
-                   :route/fail-closed 0
-                   :route/strict 0}
-         :latency-ms {:count 0
-                      :sum 0.0
-                      :max 0.0}}
-   :workflow {:calls/total 0
-              :calls/succeeded 0
-              :calls/failed 0
-              :calls/retries 0
+  {:act      {:requests    0
+              :ok          0
+              :errors      0
+              :status      {}
+              :error-types {}
+              :cache       {:lookups       0
+                            :hits          0
+                            :misses        0
+                            :stores        0
+                            :evictions     0
+                            :invalidations 0}
+              :routing     {:route/decide-hit      0
+                            :route/decide-continue 0
+                            :route/decide-final    0
+                            :route/fail-open       0
+                            :route/fail-closed     0
+                            :route/strict          0}
+              :latency-ms  {:count 0
+                            :sum   0.0
+                            :max   0.0}}
+   :workflow {:calls/total         0
+              :calls/succeeded     0
+              :calls/failed        0
+              :calls/retries       0
               :calls/fallback-hops 0
               :calls/failure-types {}
-              :quality/judge-used 0
-              :quality/judge-pass 0
-              :quality/judge-fail 0
+              :quality/judge-used  0
+              :quality/judge-pass  0
+              :quality/judge-fail  0
               :quality/must-failed 0}})
 
 (defn- workflow-telemetry-from-error
@@ -353,17 +383,17 @@
 (defn- failure-domain
   [failure-type]
   (case (some-> failure-type namespace)
-    "auth" :auth
-    "effects" :effects
-    "route" :route
-    "runtime" :runtime
-    "schema" :schema
-    "eval" :eval
-    "input" :input
+    "auth"        :auth
+    "effects"     :effects
+    "route"       :route
+    "runtime"     :runtime
+    "schema"      :schema
+    "eval"        :eval
+    "input"       :input
     "unsupported" :unsupported
-    "timeout" :timeout
-    "policy" :policy
-    "session" :session
+    "timeout"     :timeout
+    "policy"      :policy
+    "session"     :session
     :other))
 
 (defn- failure-taxonomy
@@ -381,48 +411,64 @@
 
 (defn- telemetry-kpi
   [state]
-  (let [act            (if (map? (:act state)) (:act state) {})
-        workflow       (if (map? (:workflow state)) (:workflow state) {})
-        act-errors     (normalize-counter-map (:error-types act))
-        wf-errors      (normalize-counter-map (:calls/failure-types workflow))
-        act-requests   (counter-value (:requests act))
-        wf-calls-total (counter-value (:calls/total workflow))
-        retries        (counter-value (:calls/retries workflow))
-        fallback-hops  (counter-value (:calls/fallback-hops workflow))
-        must-failed    (counter-value (:quality/must-failed workflow))
-        judge-used     (counter-value (:quality/judge-used workflow))
-        judge-pass     (counter-value (:quality/judge-pass workflow))
-        judge-fail     (counter-value (:quality/judge-fail workflow))
-        parse-source   (if (pos? wf-calls-total) :workflow :act)
-        parse-total    (if (pos? wf-calls-total) wf-calls-total act-requests)
-        parse-failures (if (pos? wf-calls-total)
-                         (sum-counter wf-errors parse-failure-types)
-                         (sum-counter act-errors parse-failure-types))
-        parse-ok       (max 0 (- parse-total parse-failures))]
-    {:parse-rate {:value (safe-rate parse-ok parse-total)
-                  :ok parse-ok
-                  :failures parse-failures
-                  :total parse-total
-                  :source parse-source}
-     :retry-rate {:value (safe-rate retries wf-calls-total)
-                  :retries retries
-                  :total wf-calls-total}
-     :fallback-rate {:value (safe-rate fallback-hops wf-calls-total)
-                     :fallback-hops fallback-hops
-                     :total wf-calls-total}
-     :must-failed-rate {:value (safe-rate must-failed wf-calls-total)
+  (let [act                 (if (map? (:act state)) (:act state) {})
+        workflow            (if (map? (:workflow state)) (:workflow state) {})
+        cache               (normalize-counter-map (:cache act))
+        act-errors          (normalize-counter-map (:error-types act))
+        wf-errors           (normalize-counter-map (:calls/failure-types workflow))
+        act-requests        (counter-value (:requests act))
+        cache-lookups       (counter-value (:lookups cache))
+        cache-hits          (counter-value (:hits cache))
+        cache-misses        (counter-value (:misses cache))
+        cache-stores        (counter-value (:stores cache))
+        cache-evictions     (counter-value (:evictions cache))
+        cache-invalidations (counter-value (:invalidations cache))
+        wf-calls-total      (counter-value (:calls/total workflow))
+        retries             (counter-value (:calls/retries workflow))
+        fallback-hops       (counter-value (:calls/fallback-hops workflow))
+        must-failed         (counter-value (:quality/must-failed workflow))
+        judge-used          (counter-value (:quality/judge-used workflow))
+        judge-pass          (counter-value (:quality/judge-pass workflow))
+        judge-fail          (counter-value (:quality/judge-fail workflow))
+        parse-source        (if (pos? wf-calls-total) :workflow :act)
+        parse-total         (if (pos? wf-calls-total) wf-calls-total act-requests)
+        parse-failures      (if (pos? wf-calls-total)
+                              (sum-counter wf-errors parse-failure-types)
+                              (sum-counter act-errors parse-failure-types))
+        parse-ok            (max 0 (- parse-total parse-failures))]
+    {:parse-rate       {:value    (safe-rate parse-ok parse-total)
+                        :ok       parse-ok
+                        :failures parse-failures
+                        :total    parse-total
+                        :source   parse-source}
+     :retry-rate       {:value   (safe-rate retries wf-calls-total)
+                        :retries retries
+                        :total   wf-calls-total}
+     :fallback-rate    {:value         (safe-rate fallback-hops wf-calls-total)
+                        :fallback-hops fallback-hops
+                        :total         wf-calls-total}
+     :must-failed-rate {:value       (safe-rate must-failed wf-calls-total)
                         :must-failed must-failed
-                        :total wf-calls-total}
-     :judge-pass-rate {:value (safe-rate judge-pass judge-used)
-                       :pass judge-pass
-                       :fail judge-fail
-                       :used judge-used}
+                        :total       wf-calls-total}
+     :judge-pass-rate  {:value (safe-rate judge-pass judge-used)
+                        :pass  judge-pass
+                        :fail  judge-fail
+                        :used  judge-used}
+     :cache-hit-rate   {:value         (safe-rate cache-hits cache-lookups)
+                        :hits          cache-hits
+                        :misses        cache-misses
+                        :lookups       cache-lookups
+                        :stores        cache-stores
+                        :evictions     cache-evictions
+                        :invalidations cache-invalidations}
      :failure-taxonomy (failure-taxonomy act-errors wf-errors)}))
 
 (defn- record-act-telemetry!
   ([telemetry response latency-ms]
-   (record-act-telemetry! telemetry response latency-ms nil))
+   (record-act-telemetry! telemetry response latency-ms nil nil))
   ([telemetry response latency-ms routing-telemetry]
+   (record-act-telemetry! telemetry response latency-ms routing-telemetry nil))
+  ([telemetry response latency-ms routing-telemetry cache-telemetry]
    (when (instance? clojure.lang.IAtom telemetry)
      (let [status (or (:status response) 500)
            body   (:body response)
@@ -446,7 +492,20 @@
                     (cond-> (map? wf-error-telemetry)
                       (update :workflow telemetry/merge-counters wf-error-telemetry))
                     (cond-> (map? routing-telemetry)
-                      (update-in [:act :routing] telemetry/merge-counters routing-telemetry)))))))))
+                      (update-in [:act :routing] telemetry/merge-counters routing-telemetry))
+                    (cond-> (map? cache-telemetry)
+                      (update-in [:act :cache] telemetry/merge-counters cache-telemetry)))))))))
+
+(defn- record-cache-telemetry!
+  [telemetry cache-telemetry]
+  (when (and (instance? clojure.lang.IAtom telemetry)
+             (map? cache-telemetry)
+             (seq cache-telemetry))
+    (swap! telemetry
+           (fn [state]
+             (-> (telemetry/merge-counters (default-telemetry) state)
+                 (update-in [:act :cache] telemetry/merge-counters cache-telemetry)))))
+  nil)
 
 (defn- telemetry-snapshot
   [telemetry]
@@ -458,7 +517,9 @@
         sum    (double (or (get-in state [:act :latency-ms :sum]) 0.0))
         avg    (if (pos? count) (/ sum count) 0.0)
         state' (assoc-in state [:act :latency-ms :avg] avg)]
-    (assoc state' :kpi (telemetry-kpi state'))))
+    (assoc state'
+           :kpi (telemetry-kpi state')
+           :lifecycle (telemetry/lifecycle-snapshot))))
 
 (defn- resolve-cap-id
   [resolver request]
@@ -472,42 +533,256 @@
 
 (defn- effective-resolver
   [runtime]
-  (let [resolver (or (:resolver runtime) {})
-        routing  (router/resolver-routing runtime resolver)
+  (let [resolver   (or (:resolver runtime) {})
+        routing    (router/resolver-routing runtime resolver)
         router-cfg (if (map? (:router runtime)) (:router runtime) {})]
     (cond-> resolver
-      (map? routing) (assoc :routing routing)
+      (map? routing)                   (assoc :routing routing)
       (contains? router-cfg :profiles) (assoc :profiles (:profiles router-cfg))
-      (contains? router-cfg :policy) (assoc :policy (:policy router-cfg)))))
+      (contains? router-cfg :policy)   (assoc :policy (:policy router-cfg)))))
 
 (defn- positive-int
   [v]
   (when (and (integer? v) (pos? v))
     (int v)))
 
+(def ^:private default-act-cache-ttl-ms
+  120000)
+
+(def ^:private default-act-cache-max-size
+  256)
+
+(defn- default-act-cache-state
+  []
+  {:entries {}
+   :order []})
+
+(defn- normalize-act-response-cache
+  [cfg]
+  (let [src (if (map? (:response-cache cfg))
+              (:response-cache cfg)
+              {})
+        enabled? (true? (:enabled? src))
+        ttl-ms  (or (parse-non-negative-long (:ttl-ms src))
+                    default-act-cache-ttl-ms)
+        max-size (parse-positive-int (:max-size src) default-act-cache-max-size)
+        state' (or (when (instance? clojure.lang.IAtom (:state src))
+                     (:state src))
+                   (atom (default-act-cache-state)))]
+    {:enabled? enabled?
+     :ttl-ms ttl-ms
+     :max-size max-size
+     :state state'}))
+
+(defn- act-cache-runtime
+  [runtime]
+  (let [cache (when (map? runtime) (:response-cache runtime))]
+    (when (map? cache) cache)))
+
+(defn- act-cache-enabled?
+  [runtime]
+  (true? (get-in runtime [:response-cache :enabled?])))
+
+(defn- order-without
+  [order key']
+  (->> (or order [])
+       (remove #(= % key'))
+       vec))
+
+(defn- prune-expired-cache-state
+  [state now-ms]
+  (let [entries (or (:entries state) {})
+        order   (or (:order state) [])
+        [entries' expired]
+        (reduce-kv (fn [[acc removed] k entry]
+                     (let [expires-at (or (parse-non-negative-long (:expires-at entry)) 0)]
+                       (if (and (pos? expires-at) (>= now-ms expires-at))
+                         [acc (inc removed)]
+                         [(assoc acc k entry) removed])))
+                   [{} 0]
+                   entries)]
+    {:state (assoc state
+                   :entries entries'
+                   :order (vec (filter #(contains? entries' %) order)))
+     :evicted expired}))
+
+(defn- prune-cache-size-state
+  [state max-size]
+  (let [max-size' (max 1 (int (or max-size default-act-cache-max-size)))
+        entries (or (:entries state) {})
+        order   (vec (or (:order state) []))
+        overflow (max 0 (- (count order) max-size'))
+        evict-keys (if (pos? overflow) (subvec order 0 overflow) [])
+        entries' (if (seq evict-keys)
+                   (apply dissoc entries evict-keys)
+                   entries)
+        order' (if (pos? overflow)
+                 (subvec order overflow)
+                 order)]
+    {:state (assoc state :entries entries' :order (vec order'))
+     :evicted (count evict-keys)}))
+
+(defn- act-cache-key
+  [request cap-id]
+  (when (and (map? request) (keyword? cap-id))
+    (let [auth-user (auth-user-public (:auth/user request))
+          auth-key (when (map? auth-user)
+                     (cond-> {}
+                       (some? (:user/id auth-user)) (assoc :user/id (:user/id auth-user))
+                       (some? (:user/account-type auth-user)) (assoc :user/account-type (:user/account-type auth-user))
+                       (seq (:user/roles auth-user)) (assoc :user/roles (vec (sort (:user/roles auth-user))))))]
+      {:intent (get-in request [:task :intent])
+       :cap/id cap-id
+       :role (:role request)
+       :requires (get-in request [:task :requires])
+       :model (or (:model request) (get-in request [:task :model]))
+       :session/id (or (some-> (:session/id request) trim-s)
+                       (some-> (:session-id request) trim-s))
+       :auth auth-key
+       :input (:input request)
+       :context (:context request)
+       :constraints (:constraints request)
+       :done (:done request)
+       :effects (:effects request)
+       :response/type (:response/type request)})))
+
+(defn- cacheable-act-request?
+  [request]
+  (and (map? request)
+       (not (true? (:stream? request)))
+       (not= :stream (keywordish (:response/type request)))))
+
+(defn- cacheable-act-response?
+  [response]
+  (and (map? response)
+       (= 200 (int (or (:status response) 500)))
+       (not (some? (get-in response [:body :error])))
+       (= :value (contracts/result-type-of (:body response)))))
+
+(defn- act-cache-get!
+  [runtime cache-key]
+  (if-not (and (act-cache-enabled? runtime)
+               cache-key)
+    {:hit? false
+     :response nil
+     :telemetry {}}
+    (let [cache (act-cache-runtime runtime)
+          now-ms (System/currentTimeMillis)
+          state-atom (:state cache)
+          expired (atom 0)]
+      (swap! state-atom
+             (fn [state]
+               (let [{state' :state evicted :evicted}
+                     (prune-expired-cache-state (if (map? state) state (default-act-cache-state))
+                                               now-ms)]
+                 (reset! expired evicted)
+                 state')))
+      (let [entry (get-in @state-atom [:entries cache-key])]
+        (if (map? entry)
+          (do
+           (swap! state-atom
+                   (fn [state]
+                     (-> state
+                         (assoc-in [:entries cache-key :last-access-at] now-ms)
+                         (update :order (fn [order]
+                                          (conj (order-without order cache-key) cache-key)))))
+                   )
+            {:hit? true
+             :response (:response entry)
+             :telemetry (cond-> {:lookups 1
+                                 :hits 1}
+                          (pos? @expired) (assoc :evictions @expired))})
+          {:hit? false
+           :response nil
+           :telemetry (cond-> {:lookups 1
+                               :misses 1}
+                        (pos? @expired) (assoc :evictions @expired))})))))
+
+(defn- act-cache-put!
+  [runtime cache-key response]
+  (if-not (and (act-cache-enabled? runtime)
+               cache-key
+               (cacheable-act-response? response))
+    {}
+    (let [cache (act-cache-runtime runtime)
+          ttl-ms (or (parse-non-negative-long (:ttl-ms cache)) default-act-cache-ttl-ms)
+          max-size (or (positive-int (:max-size cache)) default-act-cache-max-size)
+          now-ms (System/currentTimeMillis)
+          expires-at (+ now-ms ttl-ms)
+          state-atom (:state cache)
+          evictions (atom 0)]
+      (swap! state-atom
+             (fn [state]
+               (let [base (if (map? state) state (default-act-cache-state))
+                     {:keys [state evicted]} (prune-expired-cache-state base now-ms)
+                     evicted-expired evicted
+                     entry {:response response
+                            :created-at now-ms
+                            :last-access-at now-ms
+                            :expires-at expires-at}
+                     state' (-> state
+                                (assoc-in [:entries cache-key] entry)
+                                (update :order (fn [order]
+                                                 (conj (order-without order cache-key) cache-key))))
+                     {:keys [state evicted]} (prune-cache-size-state state' max-size)
+                     evicted-size evicted]
+                 (reset! evictions (+ evicted-expired evicted-size))
+                 state)))
+      (cond-> {:stores 1}
+        (pos? @evictions) (assoc :evictions @evictions)))))
+
+(defn- act-cache-invalidate-session!
+  [runtime session-id]
+  (if-not (and (act-cache-enabled? runtime)
+               (some? (trim-s session-id)))
+    0
+    (let [cache (act-cache-runtime runtime)
+          sid (trim-s session-id)
+          state-atom (:state cache)
+          removed (atom 0)]
+      (swap! state-atom
+             (fn [state]
+               (let [entries (or (:entries state) {})
+                     keys-to-drop (->> entries
+                                       (keep (fn [[k _]]
+                                               (when (= sid (:session/id k)) k)))
+                                       vec)]
+                 (reset! removed (count keys-to-drop))
+                 (if (seq keys-to-drop)
+                   (-> state
+                       (update :entries #(apply dissoc (or % {}) keys-to-drop))
+                       (update :order (fn [order]
+                                        (vec (remove (set keys-to-drop) (or order []))))))
+                   state))))
+      @removed)))
+
 (defn- request-debug-plan?
   [request]
   (true? (get-in request [:routing :debug/plan?])))
 
+(defn- request-debug-transcript?
+  [request]
+  (true? (get-in request [:routing :debug/transcript?])))
+
 (defn- act-request->invoke-opts
-  [runtime request cap-id]
-  (let [intent (get-in request [:task :intent])
-        budget (:budget request)
-        auth-user (auth-user-public (:auth/user request))
+  [runtime resolver request cap-id]
+  (let [intent        (get-in request [:task :intent])
+        budget        (:budget request)
+        auth-user     (auth-user-public (:auth/user request))
         auth-source-k (or (some-> (:auth/source request) keywordish)
                           (some-> (get-in request [:auth :source]) keywordish)
                           :http/basic)
-        base-context (if (map? (:context request)) (:context request) {})
-        context' (cond-> base-context
-                   (map? auth-user) (assoc :auth/user auth-user))
-        session-meta (when (map? auth-user)
-                       (cond-> {:auth/source auth-source-k}
-                         (some? (:user/id auth-user)) (assoc :user/id (:user/id auth-user))
-                         (some? (:user/email auth-user)) (assoc :user/email (:user/email auth-user))
-                         (some? (:user/account-type auth-user)) (assoc :user/account-type (:user/account-type auth-user))
-                         (seq (:user/roles auth-user)) (assoc :user/roles (:user/roles auth-user))))]
+        base-context  (if (map? (:context request)) (:context request) {})
+        context'      (cond-> base-context
+                        (map? auth-user) (assoc :auth/user auth-user))
+        session-meta  (when (map? auth-user)
+                        (cond-> {:auth/source auth-source-k}
+                          (some? (:user/id auth-user))           (assoc :user/id (:user/id auth-user))
+                          (some? (:user/email auth-user))        (assoc :user/email (:user/email auth-user))
+                          (some? (:user/account-type auth-user)) (assoc :user/account-type (:user/account-type auth-user))
+                          (seq   (:user/roles auth-user))        (assoc :user/roles (:user/roles auth-user))))]
     (cond-> {:role            (or (:role request)
-                                  (cap-id->role cap-id intent))
+                                  (cap-id->role runtime resolver cap-id intent))
              :intent          intent
              :cap-id          cap-id
              :input           (:input request)
@@ -522,18 +797,19 @@
              :proto           (:proto request)
              :session-id      (:session/id request)
              :session-version (:session/version request)}
-      (some? (:model request)) (assoc :model (:model request))
-      (some? (get-in request [:task :model])) (assoc :model (get-in request [:task :model]))
-      (keyword? (:response/type request)) (assoc :response/type (:response/type request))
-      (contains? request :stream?) (assoc :stream? (boolean (:stream? request)))
-      (some? (positive-int (:max-roundtrips budget)))
-      (assoc :max-attempts (positive-int (:max-roundtrips budget)))
-      (some? (:temperature budget))
-      (assoc :temperature (:temperature budget))
-      (map? auth-user) (assoc :auth/user auth-user)
-      (map? (:roles runtime)) (assoc :roles (:roles runtime))
-      (map? session-meta) (assoc :session/meta session-meta)
-      (request-debug-plan? request) (assoc :debug/plan? true))))
+      (some? (:model request))                        (assoc :model (:model request))
+      (some? (get-in request [:task :model]))         (assoc :model (get-in request [:task :model]))
+      (keyword? (:response/type request))             (assoc :response/type (:response/type request))
+      (contains? request :stream?)                    (assoc :stream? (boolean (:stream? request)))
+      (some? (positive-int (:max-roundtrips budget))) (assoc :max-attempts (positive-int (:max-roundtrips budget)))
+      (some? (positive-int (:max-tokens budget)))     (assoc :max-tokens (positive-int (:max-tokens budget)))
+      (number? (:top-p budget))                       (assoc :top-p (double (:top-p budget)))
+      (some? (:temperature budget))                   (assoc :temperature (:temperature budget))
+      (map? auth-user)                                (assoc :auth/user auth-user)
+      (map? (:roles runtime))                         (assoc :roles (:roles runtime))
+      (map? session-meta)                             (assoc :session/meta session-meta)
+      (request-debug-plan? request)                   (assoc :debug/plan? true)
+      (request-debug-transcript? request)             (assoc :debug/transcript? true))))
 
 (def ^:private fallback-request-default-bindings
   {:session/language
@@ -810,37 +1086,81 @@
       (trim-s (get-in request [:input :content]))
       (trim-s (:prompt request))))
 
+(def ^:private route-voice-preserve-system
+  "Role: VOICE. Rewrite for tone/style only. Preserve all factual claims, technical details, constraints, and examples from input. Do not summarize away meaning. Keep output compact. If source text appears truncated, complete it naturally in at most two sentences, without adding new facts.")
+
 (defn- route-solver->voice-plan
   [user-prompt]
   {:nodes [{:op :call
+            :intent :text/respond
+            :cap/id :llm/voice
+            :constraints {:max-chars 420}
+            :budget {:max-tokens 220}
+            :input {:prompt user-prompt}
+            :as :voice-primary
+            :dispatch {:allow-failure? true
+                       :checks/hard [:schema-valid :no-truncated-ending]
+                       :checks/soft [:no-hallucinated-apis :sufficient-detail :no-list-expansion]
+                       :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
+                       :retry {:same-cap-max 0
+                               :fallback-max 0}}}
+           {:op :call
             :intent :problem/solve
             :cap/id :llm/solver
+            :constraints {:max-chars 700}
+            :budget {:max-tokens 240}
             :input {:prompt user-prompt}
-            :as :solver}
+            :dispatch {:checks/hard [:schema-valid]
+                       :checks/soft [:no-hallucinated-apis :no-truncated-ending]}
+            :as :solver
+            :when {:failed? :voice-primary}}
            {:op :call
             :intent :text/respond
             :cap/id :llm/voice
+            :system route-voice-preserve-system
             :input {:prompt {:slot/id [:solver :out :text]}}
-            :as :voice}
+            :constraints {:max-chars 420}
+            :budget {:max-tokens 160}
+            :done {:score-min 0.0}
+            :dispatch {:checks/hard [:schema-valid :no-truncated-ending]
+                       :checks/soft [:no-hallucinated-apis :no-list-expansion]
+                       :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
+                       :retry {:same-cap-max 1
+                               :fallback-max 0}}
+            :as :voice-final
+            :when {:failed? :voice-primary}}
            {:op :emit
-            :input {:slot/id [:voice :out]}}]})
+            :input {:slot/id [:voice-primary :out]}}
+           {:op :emit
+            :when {:failed? :voice-primary}
+            :input {:slot/id [:voice-final :out]}}]})
 
 (defn- route-solver->voice-plan?
   [plan]
   (let [nodes (when (map? plan) (:nodes plan))
-        [node0 node1 node2] (if (vector? nodes) nodes [])]
-    (and (= 3 (count nodes))
+        [node0 node1 node2 node3 node4] (if (vector? nodes) nodes [])]
+    (and (= 5 (count nodes))
          (= :call (:op node0))
-         (= :problem/solve (:intent node0))
-         (= :llm/solver (:cap/id node0))
-         (= :solver (:as node0))
+         (= :text/respond (:intent node0))
+         (= :llm/voice (:cap/id node0))
+         (= :voice-primary (:as node0))
+         (true? (get-in node0 [:dispatch :allow-failure?]))
          (= :call (:op node1))
-         (= :text/respond (:intent node1))
-         (= :llm/voice (:cap/id node1))
-         (= :voice (:as node1))
-         (= [:solver :out :text] (get-in node1 [:input :prompt :slot/id]))
-         (= :emit (:op node2))
-         (= [:voice :out] (get-in node2 [:input :slot/id])))))
+         (= :problem/solve (:intent node1))
+         (= :llm/solver (:cap/id node1))
+         (= :solver (:as node1))
+         (= :voice-primary (get-in node1 [:when :failed?]))
+         (= :call (:op node2))
+         (= :text/respond (:intent node2))
+         (= :llm/voice (:cap/id node2))
+         (= :voice-final (:as node2))
+         (= :voice-primary (get-in node2 [:when :failed?]))
+         (= [:solver :out :text] (get-in node2 [:input :prompt :slot/id]))
+         (= :emit (:op node3))
+         (= [:voice-primary :out] (get-in node3 [:input :slot/id]))
+         (= :emit (:op node4))
+         (= :voice-primary (get-in node4 [:when :failed?]))
+         (= [:voice-final :out] (get-in node4 [:input :slot/id])))))
 
 (defn- invalid-route-decide-result
   [request]
@@ -850,8 +1170,8 @@
 
 (defn- route-decide-result-parser
   [text {:keys [request mode]}]
-  (let [text'      (trim-s text)
-        parsed     (parse-structured-text text')
+  (let [text'       (trim-s text)
+        parsed      (parse-structured-text text')
         route-plan* (cond
                       (map? (:plan parsed))
                       (:plan parsed)
@@ -870,8 +1190,8 @@
       (map? route-plan)
       {:proto  (request-proto request)
        :trace  (request-trace request)
-       :result {:type :plan
-                :plan route-plan
+       :result {:type  :plan
+                :plan  route-plan
                 :usage {:mode mode}}}
 
       (and (map? tool-call) (nil? prompt'))
@@ -880,8 +1200,8 @@
       (some? prompt')
       {:proto  (request-proto request)
        :trace  (request-trace request)
-       :result {:type :plan
-                :plan (route-solver->voice-plan prompt')
+       :result {:type  :plan
+                :plan  (route-solver->voice-plan prompt')
                 :usage {:mode mode}}}
 
       :else
@@ -893,9 +1213,22 @@
     (:routing request)
     {}))
 
+(defn- routing-profiles
+  [runtime]
+  (let [profiles (get-in runtime [:router :profiles])]
+    (if (map? profiles) profiles {})))
+
+(defn- routing-profile-config
+  [runtime request]
+  (let [profile-k (some-> (request-routing-config request) :profile keywordish)
+        profile-cfg (when (keyword? profile-k)
+                      (get (routing-profiles runtime) profile-k))]
+    (if (map? profile-cfg) profile-cfg {})))
+
 (defn- effective-routing-config
   [runtime request]
   (merge (router/routing-defaults runtime)
+         (routing-profile-config runtime request)
          (request-routing-config request)))
 
 (defn- meta-routing-target-intent
@@ -981,6 +1314,8 @@
         dispatch-in  (if (map? (:dispatch decision)) (:dispatch decision) {})
         switch-on    (keyword-vec (:switch-on dispatch-in))
         checks       (keyword-vec (:checks dispatch-in))
+        checks-hard  (keyword-vec (:checks/hard dispatch-in))
+        checks-soft  (keyword-vec (:checks/soft dispatch-in))
         retry        (normalize-retry-policy
                       (if (map? (:retry dispatch-in)) (:retry dispatch-in) {}))
         route-done   (if (map? (:done decision)) (:done decision) nil)
@@ -991,6 +1326,8 @@
                        (seq candidates) (assoc :candidates candidates)
                        (seq switch-on) (assoc :switch-on (set switch-on))
                        (seq checks) (assoc :checks checks)
+                       (seq checks-hard) (assoc :checks/hard checks-hard)
+                       (seq checks-soft) (assoc :checks/soft checks-soft)
                        (seq retry) (assoc :retry retry))]
     (cond-> request
       (and (keyword? chosen-cap)
@@ -1037,6 +1374,7 @@
      :auth/user (:auth/user request)
      :roles (:roles runtime)
      :debug/plan? (request-debug-plan? request)
+     :debug/transcript? (request-debug-transcript? request)
      :result-parser route-decide-result-parser
      :resolver resolver}))
 
@@ -1327,6 +1665,20 @@
                             (#{:error :final} route-mode) {:ok? true}
                             routed? (contracts/validate-request protocol request*)
                             :else req-check)
+         cap-id* (when (and (map? request*)
+                            (:ok? req-check)
+                            (:ok? post-route-check)
+                            (not= :error route-mode)
+                            (not= :final route-mode))
+                   (resolve-cap-id resolver request*))
+         cache-key (when (and (cacheable-act-request? request*)
+                              (keyword? cap-id*))
+                     (act-cache-key request* cap-id*))
+         cache-lookup (act-cache-get! runtime cache-key)
+         cache-hit? (true? (:hit? cache-lookup))
+         cache-telemetry0 (if (map? (:telemetry cache-lookup))
+                            (:telemetry cache-lookup)
+                            {})
          route-telemetry (routing-telemetry-counters meta-step)
          response
          (cond
@@ -1375,19 +1727,20 @@
                                       (select-keys post-route-check [:reason :intent]))})
 
            :else
-           (let [cap-id (resolve-cap-id resolver request*)]
-             (if-not (keyword? cap-id)
+           (if-not (keyword? cap-id*)
                {:status 422
                 :body   (error-envelope request*
                                         :unsupported/intent
                                         "No capability can handle the requested intent."
                                         {:intent (get-in request* [:task :intent])})}
+             (if (and cache-hit? (map? (:response cache-lookup)))
+               (:response cache-lookup)
                (try
                  {:status 200
                   :body   (core/call-capability
                            runtime
                            resolver
-                           (act-request->invoke-opts runtime request* cap-id))}
+                           (act-request->invoke-opts runtime resolver request* cap-id*))}
                  (catch clojure.lang.ExceptionInfo e
                    (let [data (or (ex-data e) {})
                          reason (or (:error data)
@@ -1474,6 +1827,11 @@
                     :body   (error-envelope request*
                                             :runtime/internal
                                             (.getMessage t))})))))
+         cache-store-telemetry (if (or cache-hit?
+                                      (not (cacheable-act-request? request*)))
+                                {}
+                                (act-cache-put! runtime cache-key response))
+         cache-telemetry (ferment.telemetry/merge-counters cache-telemetry0 cache-store-telemetry)
          elapsed-ms (nanos->millis started-at)
          sid        (or (some-> (:session/id request*) trim-s)
                         (some-> (:session-id request*) trim-s))
@@ -1500,7 +1858,7 @@
                        (update response :body merge session-view)
                        response)
          response''  (attach-response-participants response')]
-     (record-act-telemetry! telemetry response'' elapsed-ms route-telemetry)
+     (record-act-telemetry! telemetry response'' elapsed-ms route-telemetry cache-telemetry)
      (report-act! runtime request* response'' auth elapsed-ms)
      response'')))
 
@@ -1653,7 +2011,7 @@
     400))
 
 (defn- session-op-error-response
-  [e]
+  [^Throwable e]
   (let [data (or (ex-data e) {})
         err-k (or (some-> (:error data) keywordish)
                   :runtime/internal)
@@ -1678,7 +2036,7 @@
               :message (.getMessage t)}})))
 
 (defn- session-action-response
-  [runtime payload]
+  [runtime payload telemetry]
   (let [action      (keywordish (:action payload))
         session-id  (session-id-from-payload payload)
         model-id    (or (:model payload)
@@ -1686,8 +2044,9 @@
                         (:model/id payload))
         opts        (if (map? (:opts payload)) (:opts payload) {})
         var-opts    (session-var-op-opts payload action opts)
-        service     (runtime-session-service runtime)]
-    (case action
+        service     (runtime-session-service runtime)
+        response
+        (case action
       :state
       {:status 200
        :body {:ok? true
@@ -1885,7 +2244,23 @@
                                      :session/get-var :session/get-vars
                                      :session/put-var :session/put-vars
                                      :session/del-var :session/del-vars
-                                     :session/del-all-vars}}}})))
+                                     :session/del-all-vars}}}})]
+    (let [mutating-action? (contains? #{:session/open
+                                        :session/thaw
+                                        :session/freeze
+                                        :session/put-var
+                                        :session/put-vars
+                                        :session/del-var
+                                        :session/del-vars
+                                        :session/del-all-vars}
+                                      action)]
+      (when (and mutating-action?
+                 (< (int (or (:status response) 500)) 400)
+                 session-id)
+        (let [invalidated (act-cache-invalidate-session! runtime session-id)]
+          (when (pos? invalidated)
+            (record-cache-telemetry! telemetry {:invalidations invalidated}))))
+      response)))
 
 (def ^:private admin-supported-actions
   #{:admin/create-user
@@ -2645,7 +3020,7 @@
                                              :allowed ["GET" "POST"]})))))))
 
 (defn- session-handler
-  [runtime]
+  [runtime telemetry]
   (reify HttpHandler
     (handle [_ exchange]
       (let [method (some-> (.getRequestMethod exchange) str/upper-case)]
@@ -2668,7 +3043,7 @@
                 (write-response! exchange status (encode-response body) headers))
               (try
                 (let [payload (decode-request-body body-str ctype)
-                      response (session-action-response runtime payload)
+                      response (session-action-response runtime payload telemetry)
                       elapsed-ms (nanos->millis started-at)]
                   (report-session! runtime payload response (:auth authn) elapsed-ms)
                   (write-response! exchange
@@ -2763,53 +3138,80 @@
 (defn init-http
   "Initializes HTTP bridge for model runtime workers."
   [_k config]
-  (let [cfg      (preconfigure-http _k config)
-        host     (or (trim-s (:host cfg)) "127.0.0.1")
-        port     (parse-port (:port cfg))
-        runtime  (let [r (if (map? (:runtime cfg)) (:runtime cfg) {})]
-                   (cond-> (if (contains? r :models)
-                             r
-                             (assoc r :models (:models cfg)))
-                     (contains? cfg :auth)
-                     (assoc :auth (:auth cfg))))
-        routes   (model-http-routes (:models runtime))
-        public-model-routes
-        (into {}
-              (map (fn [[endpoint {:keys [model worker-id]}]]
-                     [endpoint {:model model :worker-id worker-id
-                                :type :model-runtime}]))
-              routes)
-        public-routes
-        (assoc public-model-routes
-               "/v1/act" {:type :protocol-act}
-               "/v1/session" {:type :session-bridge}
-               "/v1/admin" {:type :admin}
-               "/health" {:type :health}
-               "/routes" {:type :routes}
-               "/diag/telemetry" {:type :diag-telemetry})
-        telemetry (atom (default-telemetry))
-        server   (HttpServer/create (InetSocketAddress. ^String host (int port)) 0)]
-    (doseq [[endpoint route] routes]
-      (.createContext server endpoint (invoke-handler route)))
-    (.createContext server "/v1/act" (act-handler runtime telemetry))
-    (.createContext server "/v1/session" (session-handler runtime))
-    (.createContext server "/v1/admin" (admin-handler runtime))
-    (.createContext server "/health" (health-handler (count public-routes)))
-    (.createContext server "/routes" (routes-handler public-routes))
-    (.createContext server "/diag/telemetry" (telemetry-handler telemetry))
-    (.setExecutor server nil)
-    (.start server)
-    {:host host
-     :port port
-     :server server
-     :telemetry telemetry
-     :routes public-routes}))
+  (try
+    (let [cfg      (preconfigure-http _k config)
+          host     (or (trim-s (:host cfg)) "127.0.0.1")
+          port     (parse-port (:port cfg))
+          response-cache (normalize-act-response-cache cfg)
+          runtime  (let [r (if (map? (:runtime cfg)) (:runtime cfg) {})]
+                     (cond-> (if (contains? r :models)
+                               r
+                               (assoc r :models (:models cfg)))
+                       (contains? cfg :auth)
+                       (assoc :auth (:auth cfg))
+                       (map? response-cache)
+                       (assoc :response-cache response-cache)))
+          routes   (model-http-routes (:models runtime))
+          public-model-routes
+          (into {}
+                (map (fn [[endpoint {:keys [model worker-id]}]]
+                       [endpoint {:model model :worker-id worker-id
+                                  :type :model-runtime}]))
+                routes)
+          public-routes
+          (assoc public-model-routes
+                 "/v1/act" {:type :protocol-act}
+                 "/v1/session" {:type :session-bridge}
+                 "/v1/admin" {:type :admin}
+                 "/health" {:type :health}
+                 "/routes" {:type :routes}
+                 "/diag/telemetry" {:type :diag-telemetry})
+          telemetry-state (atom (default-telemetry))
+          executor (create-http-executor cfg)
+          server   (HttpServer/create (InetSocketAddress. ^String host (int port)) 0)]
+      (doseq [[endpoint route] routes]
+        (.createContext server endpoint (invoke-handler route)))
+      (.createContext server "/v1/act" (act-handler runtime telemetry-state))
+      (.createContext server "/v1/session" (session-handler runtime telemetry-state))
+      (.createContext server "/v1/admin" (admin-handler runtime))
+      (.createContext server "/health" (health-handler (count public-routes)))
+      (.createContext server "/routes" (routes-handler public-routes))
+      (.createContext server "/diag/telemetry" (telemetry-handler telemetry-state))
+      (.setExecutor server executor)
+      (.start server)
+      (telemetry/record-lifecycle! :http :start {:key _k
+                                                 :host host
+                                                 :port port
+                                                 :routes (count public-routes)
+                                                 :cache/enabled? (true? (:enabled? response-cache))})
+      {:host host
+       :port port
+       :server server
+       :executor executor
+       :telemetry telemetry-state
+       :response-cache response-cache
+       :routes public-routes})
+    (catch Throwable t
+      (telemetry/record-lifecycle! :http :error {:key _k
+                                                 :error (.getMessage t)})
+      (throw t))))
 
 (defn stop-http
   "Stops HTTP bridge."
   [_k state]
   (when-some [^HttpServer server (:server state)]
     (.stop server 0))
+  (when-some [^ExecutorService executor (:executor state)]
+    (.shutdown executor)
+    (try
+      (when-not (.awaitTermination executor 2000 TimeUnit/MILLISECONDS)
+        (.shutdownNow executor))
+      (catch InterruptedException _
+        (.shutdownNow executor)
+        (.interrupt (Thread/currentThread)))))
+  (telemetry/record-lifecycle! :http :stop {:key _k
+                                            :host (:host state)
+                                            :port (:port state)})
   nil)
 
 (derive ::service :ferment.system/value)

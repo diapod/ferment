@@ -677,7 +677,7 @@
         unknown-top-keys (seq (remove allowed-top-keys (keys out)))
         dispatch-map (if (map? (:dispatch out)) (:dispatch out) nil)
         retry-map   (some-> dispatch-map :retry)
-        allowed-dispatch-keys #{:candidates :checks :switch-on :retry}
+        allowed-dispatch-keys #{:candidates :checks :checks/hard :checks/soft :switch-on :retry}
         unknown-dispatch-keys (when dispatch-map
                                 (seq (remove allowed-dispatch-keys (keys dispatch-map))))]
     (cond
@@ -719,6 +719,18 @@
        :reason :route/decide-checks-not-keywords}
 
       (and dispatch-map
+           (contains? dispatch-map :checks/hard)
+           (not (keyword-coll-of? (:checks/hard dispatch-map))))
+      {:ok? false
+       :reason :route/decide-checks-hard-not-keywords}
+
+      (and dispatch-map
+           (contains? dispatch-map :checks/soft)
+           (not (keyword-coll-of? (:checks/soft dispatch-map))))
+      {:ok? false
+       :reason :route/decide-checks-soft-not-keywords}
+
+      (and dispatch-map
            (contains? dispatch-map :switch-on)
            (not (keyword-coll-of? (:switch-on dispatch-map))))
       {:ok? false
@@ -746,11 +758,15 @@
 (defn- validate-route-solver->voice-plan
   [plan]
   (let [nodes (when (map? plan) (:nodes plan))
+        ncnt  (if (vector? nodes) (count nodes) 0)
         node0 (when (vector? nodes) (nth nodes 0 nil))
         node1 (when (vector? nodes) (nth nodes 1 nil))
         node2 (when (vector? nodes) (nth nodes 2 nil))
-        voice-prompt-slot (get-in node1 [:input :prompt :slot/id])
-        emit-slot (get-in node2 [:input :slot/id])]
+        node3 (when (vector? nodes) (nth nodes 3 nil))
+        node4 (when (vector? nodes) (nth nodes 4 nil))
+        voice-final-prompt-slot (get-in node2 [:input :prompt :slot/id])
+        emit-primary-slot (get-in node3 [:input :slot/id])
+        emit-final-slot (get-in node4 [:input :slot/id])]
     (cond
       (not (map? plan))
       {:ok? false
@@ -760,52 +776,97 @@
       {:ok? false
        :reason :route/plan-nodes-not-vector}
 
-      (< (count nodes) 3)
+      (< ncnt 5)
       {:ok? false
        :reason :route/plan-too-short}
 
-      (not= :call (:op node0))
-      {:ok? false
-       :reason :route/plan-first-op-not-call}
+      (= 5 ncnt)
+      (cond
+        (not= :call (:op node0))
+        {:ok? false
+         :reason :route/plan-first-op-not-call}
 
-      (not= :problem/solve (:intent node0))
-      {:ok? false
-       :reason :route/plan-first-intent-not-problem-solve}
+        (not= :text/respond (:intent node0))
+        {:ok? false
+         :reason :route/plan-first-intent-not-text-respond}
 
-      (not= :solver (:as node0))
-      {:ok? false
-       :reason :route/plan-first-as-not-solver}
+        (not= :voice-primary (:as node0))
+        {:ok? false
+         :reason :route/plan-first-as-not-voice-primary}
 
-      (not (nonblank-string? (get-in node0 [:input :prompt])))
-      {:ok? false
-       :reason :route/plan-solver-prompt-not-string}
+        (not (nonblank-string? (get-in node0 [:input :prompt])))
+        {:ok? false
+         :reason :route/plan-voice-primary-prompt-not-string}
 
-      (not= :call (:op node1))
-      {:ok? false
-       :reason :route/plan-second-op-not-call}
+        (not (true? (get-in node0 [:dispatch :allow-failure?])))
+        {:ok? false
+         :reason :route/plan-voice-primary-allow-failure-required}
 
-      (not= :text/respond (:intent node1))
-      {:ok? false
-       :reason :route/plan-second-intent-not-text-respond}
+        (not= :call (:op node1))
+        {:ok? false
+         :reason :route/plan-second-op-not-call}
 
-      (not= :voice (:as node1))
-      {:ok? false
-       :reason :route/plan-second-as-not-voice}
+        (not= :problem/solve (:intent node1))
+        {:ok? false
+         :reason :route/plan-second-intent-not-problem-solve}
 
-      (not= [:solver :out :text] voice-prompt-slot)
-      {:ok? false
-       :reason :route/plan-voice-prompt-not-solver-slot}
+        (not= :solver (:as node1))
+        {:ok? false
+         :reason :route/plan-second-as-not-solver}
 
-      (not= :emit (:op node2))
-      {:ok? false
-       :reason :route/plan-third-op-not-emit}
+        (not= :voice-primary (get-in node1 [:when :failed?]))
+        {:ok? false
+         :reason :route/plan-solver-when-not-voice-primary-failed}
 
-      (not= [:voice :out] emit-slot)
-      {:ok? false
-       :reason :route/plan-emit-not-voice-out}
+        (not= :call (:op node2))
+        {:ok? false
+         :reason :route/plan-third-op-not-call}
+
+        (not= :text/respond (:intent node2))
+        {:ok? false
+         :reason :route/plan-third-intent-not-text-respond}
+
+        (not= :voice-final (:as node2))
+        {:ok? false
+         :reason :route/plan-third-as-not-voice-final}
+
+        (not= :voice-primary (get-in node2 [:when :failed?]))
+        {:ok? false
+         :reason :route/plan-voice-final-when-not-voice-primary-failed}
+
+        (not= [:solver :out :text] voice-final-prompt-slot)
+        {:ok? false
+         :reason :route/plan-voice-final-prompt-not-solver-slot}
+
+        (not= :emit (:op node3))
+        {:ok? false
+         :reason :route/plan-fourth-op-not-emit}
+
+        (not= [:voice-primary :out] emit-primary-slot)
+        {:ok? false
+         :reason :route/plan-first-emit-not-voice-primary-out}
+
+        (not= :emit (:op node4))
+        {:ok? false
+         :reason :route/plan-fifth-op-not-emit}
+
+        (not= :voice-primary (get-in node4 [:when :failed?]))
+        {:ok? false
+         :reason :route/plan-final-emit-when-not-voice-primary-failed}
+
+        (not= [:voice-final :out] emit-final-slot)
+        {:ok? false
+         :reason :route/plan-final-emit-not-voice-final-out}
+
+        :else
+        {:ok? true})
 
       :else
-      {:ok? true})))
+      {:ok? false
+       :reason :route/plan-unsupported-shape
+       :nodes ncnt}
+
+      )))
 
 (defn- validate-intent-result-shape
   [protocol intent result]

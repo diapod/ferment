@@ -27,7 +27,9 @@
                                           :out {:text (str "ECHO:" (get-in call-node [:input :prompt]))}}})})]
       (is (:ok? run))
       (is (= {:text "ECHO:hej"} (:emitted run)))
-      (is (= :llm/voice (get-in run [:env :answer :cap/id]))))))
+      (is (= :llm/voice (get-in run [:env :answer :cap/id])))
+      (is (= 1 (count (:timings run))))
+      (is (number? (get-in run [:timings 0 :latency-ms]))))))
 
 (deftest execute-plan-recurses-when-call-returns-plan
   (testing "Evaluator executes nested plan returned by a call and propagates emitted output."
@@ -59,7 +61,10 @@
                                 :out {:text (str "VOICE:" (get-in call-node [:input :prompt]))}}}))})]
       (is (:ok? run))
       (is (= {:text "VOICE:z planu"} (:emitted run)))
-      (is (= [:route/decide :text/respond] @calls)))))
+      (is (= [:route/decide :text/respond] @calls))
+      (is (= 2 (count (:timings run))))
+      (is (= #{:route/decide :text/respond}
+             (->> (:timings run) (map :intent) set))))))
 
 (deftest execute-plan-respects-failure-conditions
   (testing "Node guarded by `:when {:failed? ...}` runs only after failed call."
@@ -173,6 +178,31 @@
       (is (= :eval/must-failed (get-in err [:outcome :failure/type])))
       (is (= [:tests-pass] (get-in err [:outcome :done/eval :must-failed])))
       (is (false? (get-in err [:outcome :failure/recover?]))))))
+
+(deftest execute-plan-supports-per-node-hard-soft-checks
+  (testing "Node dispatch may override hard checks and move selected checks to soft scoring."
+    (let [run (workflow/execute-plan
+               {:plan {:nodes [{:op :call
+                                :intent :text/respond
+                                :dispatch {:candidates [:llm/voice]
+                                           :checks/hard [:schema-valid]
+                                           :checks/soft [:no-list-expansion]}
+                                :done {:score-min 0.0}
+                                :as :answer}
+                               {:op :emit :input {:slot/id [:answer :out]}}]}
+                :resolver {:protocol {:policy/intents {:text/respond
+                                                       {:checks [:no-list-expansion]
+                                                        :done {:must #{:schema-valid}
+                                                               :score-min 0.85}}}
+                                     :result/types [:value]}}
+                :check-fns {:schema-valid (fn [_ _ _] true)
+                            :no-list-expansion (fn [_ _ _] false)}
+                :invoke-call (fn [_ _]
+                               {:result {:type :value
+                                         :out {:text "- item"}}})})]
+      (is (:ok? run))
+      (is (= {:text "- item"} (:emitted run)))
+      (is (= 0 (get-in run [:telemetry :quality/must-failed]))))))
 
 (deftest execute-plan-fails-on-invalid-result-without-switch-policy
   (testing "Invalid result fails fast when failure type is not declared in :switch-on."
@@ -442,6 +472,59 @@
       (is (= [:llm/voice-a :llm/voice-b] @calls))
       (is (= {:text "voice-b"} (:emitted run)))
       (is (= 1 (get-in run [:telemetry :quality/must-failed]))))))
+
+(deftest execute-plan-keeps-deterministic-candidate-order-across-base-policy-and-routing-fallback
+  (testing "Candidate order is deterministic and deduplicated: base -> policy fallback -> routing fallback."
+    (let [calls (atom [])
+          run   (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :as :answer}
+                                 {:op :emit
+                                  :input {:slot/id [:answer :out]}}]}
+                  :resolver {:routing {:intent->cap {:text/respond :llm/voice-a}
+                                       :fallback [:llm/voice-b :llm/voice-a :llm/voice-c]}
+                             :protocol {:policy/default {:retry {:same-cap-max 0
+                                                                 :fallback-max 3}
+                                                         :switch-on #{:eval/low-score}
+                                                         :fallback [:llm/voice-d]}
+                                        :policy/intents {:text/respond {:done {:should #{:tests-pass}
+                                                                               :score-min 1.0}
+                                                                        :fallback [:llm/voice-b :llm/voice-c]}}
+                                        :result/types [:value]}}
+                  :check-fns {:tests-pass (fn [call-node _env _result]
+                                            (= :llm/voice-c (:cap/id call-node)))}
+                  :invoke-call (fn [call-node _env]
+                                 (swap! calls conj (:cap/id call-node))
+                                 {:result {:type :value
+                                           :out {:text (name (:cap/id call-node))}}})})]
+      (is (:ok? run))
+      (is (= [:llm/voice-a :llm/voice-d :llm/voice-b :llm/voice-c] @calls))
+      (is (= {:text "voice-c"} (:emitted run))))))
+
+(deftest execute-plan-recovers-on-must-failed-only-when-switch-on-allows-it
+  (testing "Failure class :eval/must-failed is recoverable only when explicitly listed in :switch-on."
+    (let [calls (atom [])
+          run   (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :dispatch {:candidates [:llm/voice-a :llm/voice-b]
+                                             :retry {:fallback-max 1}
+                                             :switch-on #{:eval/must-failed}}
+                                  :done {:must #{:tests-pass}}
+                                  :as :answer}
+                                 {:op :emit
+                                  :input {:slot/id [:answer :out]}}]}
+                  :resolver {}
+                  :check-fns {:tests-pass (fn [call-node _env _result]
+                                            (= :llm/voice-b (:cap/id call-node)))}
+                  :invoke-call (fn [call-node _env]
+                                 (swap! calls conj (:cap/id call-node))
+                                 {:result {:type :value
+                                           :out {:text (name (:cap/id call-node))}}})})]
+      (is (:ok? run))
+      (is (= [:llm/voice-a :llm/voice-b] @calls))
+      (is (= {:text "voice-b"} (:emitted run))))))
 
 (deftest execute-plan-fails-tool-node-with-missing-effects-declaration
   (testing "Tool node without :effects/:allowed fails with canonical invalid-input error."

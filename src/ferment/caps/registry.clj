@@ -11,6 +11,7 @@
 (derive ::llm-voice :ferment.caps/entry)
 (derive ::llm-code  :ferment.caps/entry)
 (derive ::llm-solver :ferment.caps/entry)
+(derive ::llm-solver-text :ferment.caps/entry)
 (derive ::llm-meta  :ferment.caps/entry)
 (derive ::llm-judge :ferment.caps/entry)
 (derive ::llm-mock  :ferment.caps/entry)

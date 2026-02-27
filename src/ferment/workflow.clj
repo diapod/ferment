@@ -15,6 +15,14 @@
   {:same-cap-max 0
    :fallback-max 0})
 
+(defn- now-nanos
+  []
+  (System/nanoTime))
+
+(defn- nanos->millis
+  [start-nanos]
+  (/ (double (- (System/nanoTime) start-nanos)) 1000000.0))
+
 (defn- keyword-set
   [v]
   (cond
@@ -272,6 +280,7 @@
   "Best-effort failure check for values stored in plan environment."
   [v]
   (or (and (map? v) (some? (:error v)))
+      (and (map? v) (keyword? (:failure/type v)))
       (and (map? v) (= :error (contracts/result-type-of (:result v))))
       (and (map? v) (= :error (contracts/result-type-of v)))))
 
@@ -298,6 +307,45 @@
              :out (contracts/result-out-of result)
              :error (:error result)}
       (map? invocation) (assoc :invoke/meta invocation))))
+
+(defn- call-transcript-entry
+  [call-node result attempt candidate-idx failure-type run* latency-ms]
+  (let [invocation (when (map? result) (:invoke/meta result))
+        run-ok?    (when (map? run*) (boolean (:ok? run*)))
+        run-telemetry (when (map? run*) (:telemetry run*))
+        out        (if (map? run*)
+                     (:emitted run*)
+                     (contracts/result-out-of result))
+        result-type (contracts/result-type-of result)]
+    (cond-> {:op :call
+             :intent (:intent call-node)
+             :cap/id (:cap/id call-node)
+             :as (:as call-node)
+             :attempt attempt
+             :candidate-index candidate-idx
+             :input (:input call-node)
+             :result/type result-type
+             :out out}
+      (number? latency-ms) (assoc :latency-ms latency-ms)
+      (map? invocation) (assoc :invoke/meta invocation)
+      (and (map? result) (some? (:error result))) (assoc :error (:error result))
+      (keyword? failure-type) (assoc :failure/type failure-type)
+      (map? run*) (assoc :plan/run (cond-> {:ok? run-ok?}
+                                      (map? run-telemetry)
+                                      (assoc :telemetry run-telemetry))))))
+
+(defn- call-timing-entry
+  [call-node result attempt candidate-idx failure-type latency-ms]
+  (let [invocation (when (map? result) (:invoke/meta result))]
+    (cond-> {:op :call
+             :intent (:intent call-node)
+             :cap/id (:cap/id call-node)
+             :as (:as call-node)
+             :attempt attempt
+             :candidate-index candidate-idx
+             :latency-ms latency-ms}
+      (map? invocation) (assoc :invoke/meta invocation)
+      (keyword? failure-type) (assoc :failure/type failure-type))))
 
 (defn- normalize-tool-result
   [tool-id result]
@@ -404,14 +452,22 @@
   [protocol call-node]
   (let [intent         (:intent call-node)
         policy         (contracts/intent-policy protocol intent)
+        dispatch-map   (if (map? (:dispatch call-node)) (:dispatch call-node) {})
         policy-done    (if (map? (:done policy)) (:done policy) {})
         node-done      (if (map? (:done call-node)) (:done call-node) {})
         merged-done    (merge-done-overrides policy-done node-done)
         policy-checks  (keyword-set (:checks policy))
-        dispatch-checks (keyword-set (get-in call-node [:dispatch :checks]))
+        legacy-hard-checks (keyword-set (:checks dispatch-map))
+        explicit-hard? (contains? dispatch-map :checks/hard)
+        dispatch-hard-checks (keyword-set (:checks/hard dispatch-map))
+        dispatch-soft-checks (keyword-set (:checks/soft dispatch-map))
+        hard-checks (if explicit-hard?
+                      dispatch-hard-checks
+                      (into policy-checks legacy-hard-checks))
         must-keys      (into (keyword-set (:must merged-done))
-                             (concat policy-checks dispatch-checks))
-        should-keys    (keyword-set (:should merged-done))]
+                             hard-checks)
+        should-keys    (into (keyword-set (:should merged-done))
+                             dispatch-soft-checks)]
     (cond-> merged-done
       true (assoc :must must-keys
                   :should should-keys))))
@@ -512,23 +568,37 @@
   - `:resolver`   routing map
   - `:invoke-call` fn of `[call-node env] -> canonical result envelope`
   - `:invoke-tool` fn of `[tool-node env] -> canonical result envelope`
+  - `:debug/transcript?` include per-call transcript in run output
   - `:env`        optional initial environment map
 
   Returns:
   - `{:ok? true, :env ..., :emitted ...}`"
-  [{:keys [plan resolver invoke-call invoke-tool check-fns judge-fn env telemetry]
-    :or   {env {}}}]
+  [{:keys [plan resolver invoke-call invoke-tool check-fns judge-fn env telemetry transcript]
+    :or   {env {}}
+    :as opts}]
   (let [nodes      (vec (:nodes plan))
         telemetry* (telemetry-atom telemetry)
-        protocol   (or (:protocol resolver) {})]
+        protocol   (or (:protocol resolver) {})
+        debug-transcript? (true? (:debug/transcript? opts))
+        timings*   (if (instance? clojure.lang.Atom (:timings opts))
+                     (:timings opts)
+                     (atom []))
+        transcript* (when debug-transcript?
+                      (if (instance? clojure.lang.Atom transcript)
+                        transcript
+                        (atom [])))]
     (loop [idx 0
            env env
            emitted nil]
       (if (>= idx (count nodes))
-        {:ok? true
-         :env env
-         :emitted emitted
-         :telemetry @telemetry*}
+        (cond-> {:ok? true
+                 :env env
+                 :emitted emitted
+                 :telemetry @telemetry*}
+          (seq @timings*)
+          (assoc :timings @timings*)
+          (instance? clojure.lang.Atom transcript*)
+          (assoc :transcript @transcript*))
         (let [node (nth nodes idx)]
           (telemetry-inc! telemetry* :nodes/total)
           (when (keyword? (:op node))
@@ -582,7 +652,9 @@
                                          :failure/type :schema/invalid
                                          :failure/recover? false
                                          :cap/id cap-id})
-                                    (let [result (invoke-call candidate-node env)
+                                    (let [call-start (now-nanos)
+                                          result (invoke-call candidate-node env)
+                                          latency-ms (nanos->millis call-start)
                                           _ (when (> attempt 1)
                                               (telemetry-inc! telemetry* :calls/retries))
                                           rtype (contracts/result-type-of result)
@@ -596,7 +668,10 @@
                                                                   :check-fns check-fns
                                                                   :judge-fn judge-fn
                                                                   :env env
-                                                                  :telemetry telemetry*})))
+                                                                  :telemetry telemetry*
+                                                                  :timings timings*
+                                                                  :debug/transcript? debug-transcript?
+                                                                  :transcript transcript*})))
                                           slot-val (if run*
                                                      (assoc (normalize-call-result cap-id result)
                                                             :out (:emitted run*)
@@ -611,17 +686,38 @@
                                           failure-type (call-failure-type protocol candidate-node result done-eval)
                                           recover? (recoverable-failure? failure-type switch-on)
                                           failed? (keyword? failure-type)
+                                          slot-val' (cond-> slot-val
+                                                      failed? (assoc :failure/type failure-type
+                                                                     :failure/recover? recover?))
                                           accepted? (not failed?)
                                           outcome {:ok? accepted?
                                                    :cap/id cap-id
                                                    :result result
-                                                   :slot-val slot-val
+                                                   :slot-val slot-val'
                                                    :emitted (when run* (:emitted run*))
                                                    :plan/run run*
                                                    :attempt attempt
+                                                   :latency-ms latency-ms
                                                    :done/eval done-eval
                                                    :failure/type failure-type
                                                    :failure/recover? recover?}]
+                                      (when (instance? clojure.lang.Atom timings*)
+                                        (swap! timings* conj
+                                               (call-timing-entry candidate-node
+                                                                  result
+                                                                  attempt
+                                                                  candidate-idx
+                                                                  failure-type
+                                                                  latency-ms)))
+                                      (when (instance? clojure.lang.Atom transcript*)
+                                        (swap! transcript* conj
+                                               (call-transcript-entry candidate-node
+                                                                      result
+                                                                      attempt
+                                                                      candidate-idx
+                                                                      failure-type
+                                                                      run*
+                                                                      latency-ms)))
                                       (if accepted?
                                         outcome
                                         (if (and recover?

@@ -11,6 +11,7 @@
   (:require [puget.printer            :refer [cprint pprint]]
             [ns-tracker.core          :as         ns-tracker]
             [ferment.system           :as               system]
+            [ferment.telemetry        :as            telemetry]
             [ferment.logging          :as                  log]
             [ferment.env              :as                  env]
             [ferment.router]
@@ -298,19 +299,29 @@ operation ended with an exception stored in `ferment.app/exception`).")
        (try
          (when-not (configured?) (apply configure-app local-config-file rc-dirs keys))
          (var/reset start-args [local-config-file rc-dirs keys])
-         (if-some [keys (seq keys)]
-           (do
-             (var/reset phase    :starting)
-             ;;(apply configure-app local-config-file rc-dirs keys)
-             (var/reset state    (system/init post-config keys))
-             (var/reset phase    :running)
-             (var/reset exception nil))
-           (when (stopped?)
-             (var/reset phase     :starting)
-             (var/reset state     (system/init post-config))
-             (var/reset phase     :running)
-             (var/reset exception nil)))
-         (catch Throwable e (state-from-exception e))))
+         (let [started?
+               (if-some [keys (seq keys)]
+                 (do
+                   (var/reset phase    :starting)
+                   ;;(apply configure-app local-config-file rc-dirs keys)
+                   (var/reset state    (system/init post-config keys))
+                   (var/reset phase    :running)
+                   (var/reset exception nil)
+                   true)
+                 (when (stopped?)
+                   (var/reset phase     :starting)
+                   (var/reset state     (system/init post-config))
+                   (var/reset phase     :running)
+                   (var/reset exception nil)
+                   true))]
+           (when started?
+             (telemetry/record-lifecycle! :app :start {:keys (vec (or (seq keys) []))
+                                                       :phase phase})))
+         (catch Throwable e
+           (telemetry/record-lifecycle! :app :error {:operation :start
+                                                     :keys (vec (or (seq keys) []))
+                                                     :error (.getMessage e)})
+           (state-from-exception e))))
      phase)))
 
 (defn stop-app
@@ -332,14 +343,21 @@ operation ended with an exception stored in `ferment.app/exception`).")
         (if-some [keys (seq keys)]
           (do (when-some [s state] (system/halt! s keys))
               (var/reset state         (map/nil-existing-keys state keys))
-              (var/reset exception     nil))
+              (var/reset exception     nil)
+              (telemetry/record-lifecycle! :app :stop {:keys (vec keys)
+                                                       :phase phase}))
           (do (when-some [s state] (system/halt! s))
               (var/reset state         nil)
               (var/reset post-config   nil)
               (var/reset config        nil)
               (var/reset phase    :stopped)
-              (var/reset exception     nil)))
-        (catch Throwable e (state-from-exception e))))
+              (var/reset exception     nil)
+              (telemetry/record-lifecycle! :app :stop {:phase phase})))
+        (catch Throwable e
+          (telemetry/record-lifecycle! :app :error {:operation :stop
+                                                    :keys (vec (or (seq keys) []))
+                                                    :error (.getMessage e)})
+          (state-from-exception e))))
     phase))
 
 (defn restart-app

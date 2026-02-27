@@ -8,21 +8,21 @@
                                   :http {:enabled? false}}
 
  :ferment.model.id/solver {:profile "mini"
-                           :id/default "mlx-community/SmolLM3-3B-8bit"
-                           :id/mini "mlx-community/SmolLM3-3B-8bit"
-                           :id/fallback "mlx-community/SmolLM3-3B-8bit"}
+                           :id/default "mlx-community/Phi-4-mini-instruct-4bit"
+                           :id/mini "mlx-community/Phi-4-mini-instruct-4bit"
+                           :id/fallback "mlx-community/Phi-4-mini-instruct-4bit"}
  :ferment.model.id/voice {:profile "mini"
                           :id/default "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
                           :id/mini "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
                           :id/fallback "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"}
  :ferment.model.id/coding {:profile "mini"
-                           :id/default "mlx-community/SmolLM3-3B-8bit"
-                           :id/mini "mlx-community/SmolLM3-3B-8bit"
-                           :id/fallback "mlx-community/SmolLM3-3B-8bit"}
+                           :id/default "mlx-community/Phi-4-mini-instruct-4bit"
+                           :id/mini "mlx-community/Phi-4-mini-instruct-4bit"
+                           :id/fallback "mlx-community/Phi-4-mini-instruct-4bit"}
  :ferment.model.id/meta {:profile "mini"
-                         :id/default "mlx-community/SmolLM3-3B-8bit"
-                         :id/mini "mlx-community/SmolLM3-3B-8bit"
-                         :id/fallback "mlx-community/SmolLM3-3B-8bit"}
+                         :id/default "mlx-community/Phi-4-mini-instruct-4bit"
+                         :id/mini "mlx-community/Phi-4-mini-instruct-4bit"
+                         :id/fallback "mlx-community/Phi-4-mini-instruct-4bit"}
 
  ;; Keep meta shared; voice runs separately; solver/coding stay disabled.
  :ferment.model.runtime/solver {:enabled? false
@@ -36,6 +36,7 @@
                                :invoke/http {:base-url #ref :ferment.env/ferment.model.voice.base.url
                                              :endpoint #ref :ferment.env/ferment.model.voice.endpoint
                                              :temperature 0.0
+                                             :max-tokens 220
                                              :model    #ref :ferment.model.id/voice}
                                :http {:enabled? false}}
  :ferment.model.runtime/coding {:enabled? false
@@ -49,6 +50,7 @@
                               :invoke/http {:base-url #ref :ferment.env/ferment.model.meta.base.url
                                             :endpoint #ref :ferment.env/ferment.model.meta.endpoint
                                             :temperature 0.0
+                                            :max-tokens 256
                                             :model    #ref :ferment.model.id/meta}
                               :http {:enabled? false}}
 

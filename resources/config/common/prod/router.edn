@@ -2,7 +2,18 @@
 
  :ferment.router/default
  {:routing  #ref :ferment.caps/routing
-  :profiles #ref :ferment.caps/profiles
+  :profiles {:default      {:meta? true
+                            :strict? false
+                            :force? false
+                            :on-error :fail-open}
+             :low-latency  {:meta? false
+                            :strict? false
+                            :force? false
+                            :on-error :fail-open}
+             :strict-meta  {:meta? true
+                            :strict? true
+                            :force? true
+                            :on-error :fail-closed}}
   :defaults {:meta? true
              :strict? false
              :force? false

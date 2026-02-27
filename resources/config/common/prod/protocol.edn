@@ -8,155 +8,280 @@
                            :optional [:constraints :done :context :budget :effects]}
   :envelope/response      {:required-one-of [:result :error]}
 
-  :prompts                {:default "You are a component of the Ferment system. Follow the intent contract. Return only result content, without meta commentary. Developer language is English."
-                           :roles {:router "Role: ROUTER (meta-decider). Make routing and quality decisions. Do not produce user-facing answers. No markdown, no commentary, no <think>, and no <tool_call>."
-                                   :solver "Role: SOLVER. Solve problems clearly and concisely in the language requested by constraints. If data is missing, state explicit assumptions instead of guessing. Do not use <think> or <tool_call>."
-                                   :voice "Role: VOICE. Formulate the final user response in the language requested by constraints: clear, concrete, concise, and without self-presentation. Do not expose reasoning and do not use <think>."
-                                   :coder "Role: CODER. Produce technical solutions aligned with the contract and concise change descriptions. Use English for developer-facing output unless constraints explicitly require another language. Do not use <think>."
-                                   :judge "Role: JUDGE. Evaluate strictly against contract criteria. No digressions and no <think>."}
-                           :intents {:route/decide "For :route/decide return only a contract-compliant routing decision/plan structure. Prefer canonical solver->voice->emit."
-                                     :context/summarize "For :context/summarize return a short factual summary (1-3 sentences) in the language requested by constraints. No lists and no questions. The term 'Ferment' means this project (AI model orchestrator), not food fermentation."
-                                     :text/respond "For :text/respond do not generate side conversation or additional questions unless explicitly requested. The term 'Ferment' means this project (not a JavaScript library). Keep the answer to at most 4 sentences unless the user asks for more."
-                                     :problem/solve "For :problem/solve return a substantive solution and the most important assumptions in the language requested by constraints. Avoid verbosity and lists unless required. Do not return tool tags or pseudo-XML (for example <tool_call>)."}}
+  :prompts {
+            :default ["You are a component of the Ferment system."
+                      "Follow the intent contract."
+                      "Return only result content,"
+                      "without meta commentary."
+                      "Developer language is English."]
+            :roles   {:router ["Role: ROUTER (meta-decider)."
+                               "Make routing and quality decisions."
+                               "Do not produce user-facing answers."
+                               "No markdown, no commentary,"
+                               "no <think>, and no <tool_call>."]
+                      :solver ["Role: SOLVER."
+                               "Solve problems clearly and concisely in the"
+                               "language requested by constraints."
+                               "If data is missing, state explicit assumptions"
+                               "instead of guessing."
+                               "Do not use <think> or <tool_call>."]
+                      :voice  ["Role: VOICE."
+                               "Formulate the final user response in the"
+                               "language requested by constraints:"
+                               "clear, concrete, concise,"
+                               "and without self-presentation."
+                               "Treat input as source material:"
+                               "preserve all factual claims,"
+                               "technical details, constraints,"
+                               "and examples unless the user asks to shorten."
+                               "Rewrite for tone/style only;"
+                               "do not summarize away meaning."
+                               "If the received source text appears truncated,"
+                               "complete it stylistically in at most two"
+                               "sentences while preserving original meaning."
+                               "Do not expose reasoning"
+                               "and do not use <think>."]
+                      :coder  ["Role: CODER."
+                               "Produce technical solutions aligned with the"
+                               "contract and concise change descriptions."
+                               "Use English for developer-facing output"
+                               "unless constraints explicitly require another"
+                               "language."
+                               "Do not use <think>."]
+                      :judge  ["Role: JUDGE."
+                               "Evaluate strictly against contract criteria."
+                               "No digressions and no <think>."]}
+            :intents {:route/decide      ["For :route/decide return only one"
+                                          "contract-compliant routing object and no prose."
+                                          "Allowed outputs:"
+                                          "a routing decision map with :cap/id"
+                                          "(and optional :dispatch),"
+                                          "or a canonical solver->voice->emit plan."
+                                          "Do not emit markdown, explanations,"
+                                          "XML-like tags, or <tool_call>."]
+                      :context/summarize ["For :context/summarize return a short factual"
+                                          "summary (1-3 sentences)"
+                                          "in the language requested by constraints."
+                                          "No lists and no questions."
+                                          "The term 'Ferment' means this project"
+                                          "(AI model orchestrator),"
+                                          "not food fermentation."]
+                      :text/respond      ["For :text/respond do not generate side"
+                                          "conversation or additional questions"
+                                          "unless explicitly requested."
+                                          "If input already contains an answer draft,"
+                                          "preserve its meaning and detail:"
+                                          "style/tone editing is allowed,"
+                                          "semantic compression is not."
+                                          "The term 'Ferment' means this project"
+                                          "(not a JavaScript library)."
+                                          "Keep the answer to at most 4 sentences"
+                                          "unless the user asks for more."]
+                      :problem/solve     ["For :problem/solve return a substantive"
+                                          "solution and the most important assumptions"
+                                          "in the language requested by constraints."
+                                          "Avoid verbosity and lists unless required."
+                                          "Do not return tool tags or pseudo-XML"
+                                          "(for example <tool_call>)."]}}
 
-  :intents                {:route/decide      {:in-schema :req/route
-                                               :out-schema :res/route
-                                               :constraints {:max-chars 1400}
-                                               :result/contract {:type :plan
-                                                                 :contract/kind :route/solver->voice}}
-                           :context/summarize {:in-schema :req/context
-                                               :out-schema :res/context-summary
-                                               :constraints {:max-chars 500}}
-                           :text/respond      {:in-schema :req/text
-                                               :out-schema :res/text
-                                               :constraints {:max-chars 900}}
-                           :problem/solve     {:in-schema :req/problem
-                                               :out-schema :res/problem
-                                               :constraints {:max-chars 1600}}
-                           :code/generate     {:in-schema :req/code
-                                               :out-schema :res/code
-                                               :constraints {:max-chars 8000}
-                                               :system "You are CODER in the Ferment project.\nGenerate idiomatic solutions (prefer Clojure unless context says otherwise).\nBe concrete and avoid filler. Use English for developer-facing output unless constraints require otherwise. Do not use <think>."}
-                           :code/patch        {:in-schema :req/code
-                                               :out-schema :res/patch+tests
-                                               :constraints {:max-chars 12000}
-                                               :system "You are CODER in the Ferment project.\nFor code changes, prefer patch/diff plus tests.\nUse English for developer-facing output unless constraints require otherwise. Do not use <think>. Return only substantive content."}
-                           :code/explain      {:in-schema :req/code
-                                               :out-schema :res/explanation
-                                               :constraints {:max-chars 3000}
-                                               :system "You are CODER explaining code.\nExplain briefly and precisely: what, why, and consequences.\nUse English for developer-facing output unless constraints require otherwise. Do not use <think>."}
-                           :code/review       {:in-schema :req/code
-                                               :out-schema :res/review
-                                               :constraints {:max-chars 5000}
-                                               :system "You are CODER reviewing code.\nList issues/risks first (highest severity first), then short recommendations.\nUse English for developer-facing output unless constraints require otherwise. Do not use <think>."}
-                           :eval/grade        {:in-schema :req/eval
-                                               :out-schema :res/eval
-                                               :constraints {:max-chars 1200}
-                                               :system "You are JUDGE in the Ferment project.\nReturn a contract-compliant quality evaluation: score 0.0-1.0 and optional violations/retry?.\nNo unrelated commentary and no <think>."
-                                               :result/contract {:type :value
-                                                                 :required [:score]
-                                                                 :score/range [0.0 1.0]}}}
+  :intents {:route/decide      {:in-schema       :req/route
+                                :out-schema      :res/route
+                                :constraints     {:max-chars 900}
+                                :budget          {:max-tokens     256
+                                                  :max-roundtrips 3
+                                                  :temperature    0.0}
+                                :result/contract {:type          :plan
+                                                  :contract/kind :route/solver->voice}}
+            :context/summarize {:in-schema   :req/context
+                                :out-schema  :res/context-summary
+                                :constraints {:max-chars 500}
+                                :budget      {:max-tokens     320
+                                              :max-roundtrips 2
+                                              :temperature    0.0}}
+            :text/respond      {:in-schema   :req/text
+                                :out-schema  :res/text
+                                :constraints {:max-chars 900}
+                                :budget      {:max-tokens     420
+                                              :max-roundtrips 3
+                                              :temperature    0.0}}
+            :problem/solve     {:in-schema   :req/problem
+                                :out-schema  :res/problem
+                                :constraints {:max-chars 1600}
+                                :budget      {:max-tokens     900
+                                              :max-roundtrips 3
+                                              :temperature    0.0}}
+            :code/generate     {:in-schema   :req/code
+                                :out-schema  :res/code
+                                :constraints {:max-chars 8000}
+                                :budget      {:max-tokens     2200
+                                              :max-roundtrips 3
+                                              :temperature    0.0}
+                                :system      ["You are CODER generating code."
+                                              "Generate idiomatic solutions"
+                                              "(prefer Clojure unless context says otherwise)."
+                                              "Be concrete and avoid filler."
+                                              "Use English for developer-facing output"
+                                              "unless constraints require otherwise."
+                                              "Do not use <think>."]}
+            :code/patch        {:in-schema   :req/code
+                                :out-schema  :res/patch+tests
+                                :constraints {:max-chars 12000}
+                                :budget      {:max-tokens     4200
+                                              :max-roundtrips 3
+                                              :temperature    0.0}
+                                :system      ["You are CODER patching code."
+                                              "For code changes, prefer patch/diff plus tests."
+                                              "Use English for developer-facing output"
+                                              "unless constraints require otherwise."
+                                              "Do not use <think>."
+                                              "Return only substantive content."]}
+            :code/explain      {:in-schema   :req/code
+                                :out-schema  :res/explanation
+                                :constraints {:max-chars 3000}
+                                :budget      {:max-tokens     1200
+                                              :max-roundtrips 2
+                                              :temperature    0.0}
+                                :system      ["You are CODER explaining code."
+                                              "Explain briefly and precisely:"
+                                              "what, why, and consequences."
+                                              "Use English for developer-facing output"
+                                              "unless constraints require otherwise."
+                                              "Do not use <think>."]}
+            :code/review       {:in-schema   :req/code
+                                :out-schema  :res/review
+                                :constraints {:max-chars 5000}
+                                :budget      {:max-tokens     1800
+                                              :max-roundtrips 2
+                                              :temperature    0.0}
+                                :system      ["You are CODER reviewing code."
+                                              "List issues/risks first"
+                                              "(highest severity first),"
+                                              "then short recommendations."
+                                              "Use English for developer-facing output"
+                                              "unless constraints require otherwise."
+                                              "Do not use <think>."]}
+            :eval/grade        {:in-schema       :req/eval
+                                :out-schema      :res/eval
+                                :constraints     {:max-chars 1200}
+                                :budget          {:max-tokens     220
+                                                  :max-roundtrips 1
+                                                  :temperature    0.0}
+                                :system          ["You are JUDGE."
+                                                  "Return a contract-compliant quality evaluation:"
+                                                  "score 0.0-1.0 and optional violations/retry?."
+                                                  "No unrelated commentary and no <think>."]
+                                :result/contract {:type        :value
+                                                  :required    [:score]
+                                                  :score/range [0.0 1.0]}}}
 
-  :policy/checks          {:schema-valid         :builtin/schema-valid
-                           :tests-pass           :builtin/tests-pass
-                           :no-hallucinated-apis :builtin/no-hallucinated-apis
-                           :no-list-expansion    :builtin/no-list-expansion}
+  :policy/checks {:schema-valid         :builtin/schema-valid
+                  :tests-pass           :builtin/tests-pass
+                  :no-hallucinated-apis :builtin/no-hallucinated-apis
+                  :no-list-expansion    :builtin/no-list-expansion
+                  :no-truncated-ending  :builtin/no-truncated-ending}
 
-  :policy/default         {:done {:must      #{:schema-valid}
-                                   :should    #{:no-hallucinated-apis}
-                                   :score-min 0.80}
-                           :checks [:schema-valid]
-                           :judge {:enabled? false
-                                   :intent :eval/grade
-                                   :cap/id :llm/judge
-                                   :role :router
-                                   :max-attempts 1
-                                   :score-path [:score]}
-                           :retry {:max-attempts 3
-                                   :same-cap-max 1
-                                   :fallback-max 1}
-                           :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
-                           :fallback  []}
+  :policy/default {:done      {:must      #{:schema-valid}
+                               :should    #{:no-hallucinated-apis}
+                               :score-min 0.80}
+                   :checks    [:schema-valid]
+                   :judge     {:enabled?     false
+                               :intent       :eval/grade
+                               :cap/id       :llm/judge
+                               :role         :router
+                               :max-attempts 1
+                               :score-path   [:score]}
+                   :retry     {:max-attempts 3
+                               :same-cap-max 1
+                               :fallback-max 1}
+                   :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
+                   :fallback  []}
 
-  :policy/intents         {:route/decide      {:done {:must #{:schema-valid}
-                                                      :score-min 1.0}
-                                               :checks [:schema-valid]
-                                               :fallback [:llm/meta]
-                                               :judge {:enabled? false}}
-                           :context/summarize {:done {:must #{:schema-valid}
-                                                      :should #{:no-hallucinated-apis :no-list-expansion}
-                                                      :score-min 0.9}
-                                               :checks [:schema-valid :no-hallucinated-apis]
-                                               :fallback [:llm/meta]
-                                               :judge {:enabled? false}}
-                           :text/respond      {:done {:must #{:schema-valid :no-list-expansion}
-                                                      :should #{:no-hallucinated-apis}
-                                                      :score-min 0.85}
-                                               :checks [:schema-valid :no-hallucinated-apis :no-list-expansion]
-                                               :fallback [:llm/voice :llm/solver]
-                                               :judge {:enabled? true
-                                                       :max-attempts 1}}
-                           :problem/solve     {:done {:must #{:schema-valid}
-                                                      :should #{:no-hallucinated-apis}
-                                                      :score-min 0.8}
-                                               :checks [:schema-valid :no-hallucinated-apis]
-                                               :fallback [:llm/solver :llm/meta]
-                                               :judge {:enabled? false}}
-                           :code/generate     {:done {:must #{:schema-valid}
-                                                      :should #{:tests-pass :no-hallucinated-apis}
-                                                      :score-min 0.8}
-                                               :checks [:schema-valid :no-hallucinated-apis]
-                                               :fallback [:llm/code]
-                                               :judge {:enabled? false}}
-                           :code/patch        {:done {:must #{:schema-valid}
-                                                      :should #{:tests-pass :no-hallucinated-apis}
-                                                      :score-min 0.8}
-                                               :checks [:schema-valid :tests-pass :no-hallucinated-apis]
-                                               :fallback [:llm/code]
-                                               :judge {:enabled? true
-                                                       :max-attempts 1}}
-                           :code/explain      {:done {:must #{:schema-valid}
-                                                      :should #{:tests-pass :no-hallucinated-apis}
-                                                      :score-min 0.8}
-                                               :checks [:schema-valid :no-hallucinated-apis]
-                                               :fallback [:llm/code]
-                                               :judge {:enabled? false}}
-                           :code/review       {:done {:must #{:schema-valid}
-                                                      :should #{:tests-pass :no-hallucinated-apis}
-                                                      :score-min 0.8}
-                                               :checks [:schema-valid :no-hallucinated-apis]
-                                               :fallback [:llm/code]
-                                               :judge {:enabled? false}}
-                           :eval/grade        {:done {:must #{:schema-valid}
-                                                      :score-min 1.0}
-                                               :checks [:schema-valid]
-                                               :fallback [:llm/judge]
-                                               :judge {:enabled? false}}}
+  :policy/intents {:route/decide      {:done      {:must      #{:schema-valid}
+                                                   :score-min 1.0}
+                                       :checks    [:schema-valid]
+                                       :switch-on #{:schema/invalid
+                                                    :format/drift
+                                                    :eval/low-score
+                                                    :eval/must-failed}
+                                       :retry     {:max-attempts 3
+                                                   :same-cap-max 2
+                                                   :fallback-max 0}
+                                       :fallback  [:llm/meta]
+                                       :judge     {:enabled? false}}
+                   :context/summarize {:done     {:must      #{:schema-valid}
+                                                  :should    #{:no-hallucinated-apis :no-list-expansion}
+                                                  :score-min 0.9}
+                                       :checks   [:schema-valid :no-hallucinated-apis]
+                                       :fallback [:llm/meta]
+                                       :judge    {:enabled? false}}
+                   :text/respond      {:done     {:must      #{:schema-valid}
+                                                  :should    #{:no-hallucinated-apis :no-list-expansion}
+                                                  :score-min 0.85}
+                                       :checks   [:schema-valid :no-hallucinated-apis :no-list-expansion]
+                                       :fallback [:llm/voice :llm/solver-text]
+                                       :judge    {:enabled?     true
+                                                  :max-attempts 1}}
+                   :problem/solve     {:done     {:must      #{:schema-valid}
+                                                  :should    #{:no-hallucinated-apis}
+                                                  :score-min 0.8}
+                                       :checks   [:schema-valid :no-hallucinated-apis :no-truncated-ending]
+                                       :fallback [:llm/solver :llm/meta]
+                                       :judge    {:enabled? false}}
+                   :code/generate     {:done     {:must      #{:schema-valid}
+                                                  :should    #{:tests-pass :no-hallucinated-apis}
+                                                  :score-min 0.8}
+                                       :checks   [:schema-valid :no-hallucinated-apis]
+                                       :fallback [:llm/code]
+                                       :judge    {:enabled? false}}
+                   :code/patch        {:done     {:must      #{:schema-valid}
+                                                  :should    #{:tests-pass :no-hallucinated-apis}
+                                                  :score-min 0.8}
+                                       :checks   [:schema-valid :tests-pass :no-hallucinated-apis]
+                                       :fallback [:llm/code]
+                                       :judge    {:enabled?     true
+                                                  :max-attempts 1}}
+                   :code/explain      {:done     {:must      #{:schema-valid}
+                                                  :should    #{:tests-pass :no-hallucinated-apis}
+                                                  :score-min 0.8}
+                                       :checks   [:schema-valid :no-hallucinated-apis]
+                                       :fallback [:llm/code]
+                                       :judge    {:enabled? false}}
+                   :code/review       {:done     {:must      #{:schema-valid}
+                                                  :should    #{:tests-pass :no-hallucinated-apis}
+                                                  :score-min 0.8}
+                                       :checks   [:schema-valid :no-hallucinated-apis]
+                                       :fallback [:llm/code]
+                                       :judge    {:enabled? false}}
+                   :eval/grade        {:done     {:must      #{:schema-valid}
+                                                  :score-min 1.0}
+                                       :checks   [:schema-valid]
+                                       :fallback [:llm/judge]
+                                       :judge    {:enabled? false}}}
 
-  :roles                  {:router {:allowed [:route :checks :budget]}
-                           :solver {:allowed [:analysis :value :notes]}
-                           :coder  {:allowed [:patch :tests :notes]}
-                           :voice  {:allowed [:text :summary]}}
+  :roles {:router {:allowed [:route :checks :budget]}
+          :solver {:allowed [:analysis :value :notes]}
+          :coder  {:allowed [:patch :tests :notes]}
+          :voice  {:allowed [:text :summary]}}
 
-  :constraints/default    {:no-web true
-                           :language :pl
-                           :style :concise}
-  :budget/default         {:max-tokens 1200
-                           :temperature 0.0
-                           :max-roundtrips 3}
-  :effects/default        {:allowed #{:none}}
+  :constraints/default {:no-web   true
+                        :language :pl
+                        :style    :concise}
+  :budget/default      {:max-tokens     1200
+                        :temperature    0.0
+                        :max-roundtrips 3}
+  :effects/default     {:allowed #{:none}}
 
-  :error/catalog          {:schema/invalid      {:retryable? true}
-                           :format/drift        {:retryable? true}
-                           :timeout/soft        {:retryable? true}
-                           :eval/low-score      {:retryable? true}
-                           :eval/must-failed    {:retryable? true}
-                           :policy/blocked      {:retryable? false}
-                           :timeout/hard        {:retryable? false}
-                           :input/invalid       {:retryable? false}
-                           :unsupported/intent  {:retryable? false}}
+  :error/catalog {:schema/invalid     {:retryable? true}
+                  :format/drift       {:retryable? true}
+                  :timeout/soft       {:retryable? true}
+                  :eval/low-score     {:retryable? true}
+                  :eval/must-failed   {:retryable? true}
+                  :policy/blocked     {:retryable? false}
+                  :timeout/hard       {:retryable? false}
+                  :input/invalid      {:retryable? false}
+                  :unsupported/intent {:retryable? false}}
 
-  :result/types           [:value :plan :stream :error]
-  :retry/max-attempts     3}
+  :result/types       [:value :plan :stream :error]
+  :retry/max-attempts 3}
 
-}
+ }

@@ -49,6 +49,22 @@
   :io/out-schema :res/problem
   :dispatch/tag  :solver}
 
+ :ferment.caps.registry/llm-solver-text
+ {:cap/id        :llm/solver-text
+  :cap/kind      :llm
+  :cap/version   "2026.02"
+  :cap/cost      {:latency-ms 1500}
+  :cap/limits    {:timeout-ms 20000}
+  :cap/tags      #{:solver :fallback :text}
+  :cap/intents   #{:text/respond}
+  :cap/can-produce #{:value}
+  :cap/effects-allowed #{:none}
+  :dispatch/role :solver
+  :dispatch/model-key :ferment.model/solver
+  :io/in-schema  :req/text
+  :io/out-schema :res/text
+  :dispatch/tag  :solver-text}
+
  :ferment.caps.registry/llm-meta
  {:cap/id        :llm/meta
   :cap/kind      :llm
@@ -105,6 +121,7 @@
  [#ref :ferment.caps.registry/llm-voice
   #ref :ferment.caps.registry/llm-code
   #ref :ferment.caps.registry/llm-solver
+  #ref :ferment.caps.registry/llm-solver-text
   #ref :ferment.caps.registry/llm-meta
   #ref :ferment.caps.registry/llm-judge
   #ref :ferment.caps.registry/llm-mock]
@@ -120,6 +137,37 @@
                 :code/explain      :llm/code
                 :code/review       :llm/code
                 :eval/grade        :llm/judge}
+  :intent->default-model-key {:route/decide      :ferment.model/meta
+                              :context/summarize :ferment.model/meta
+                              :eval/grade        :ferment.model/meta
+                              :problem/solve     :ferment.model/solver
+                              :text/respond      :ferment.model/voice
+                              :code/generate     :ferment.model/coding
+                              :code/patch        :ferment.model/coding
+                              :code/explain      :ferment.model/coding
+                              :code/review       :ferment.model/coding}
+  :cap->role   {:llm/code        :coder
+                :llm/solver      :solver
+                :llm/solver-text :solver
+                :llm/meta        :router
+                :llm/judge       :router
+                :llm/voice       :voice
+                :llm/mock        :router}
+  :intent->default-role {:route/decide      :router
+                         :context/summarize :router
+                         :eval/grade        :router
+                         :problem/solve     :solver
+                         :text/respond      :voice
+                         :code/generate     :coder
+                         :code/patch        :coder
+                         :code/explain      :coder
+                         :code/review       :coder}
+  :switch-on #{:schema/invalid
+               :format/drift
+               :eval/low-score
+               :eval/must-failed}
+  :retry {:same-cap-max 1
+          :fallback-max 0}
   :policy      :quality-aware}
 
  ;; Runtime/profile policy knobs

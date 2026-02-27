@@ -49,8 +49,8 @@
   ([url payload]
    (http-post-json url payload nil))
   ([url payload headers]
-   (let [conn
-         (doto (.openConnection (java.net.URL. url))
+   (let [^java.net.HttpURLConnection conn
+         (doto ^java.net.HttpURLConnection (.openConnection (java.net.URL. url))
            (.setRequestMethod "POST")
            (.setDoOutput true)
            (.setConnectTimeout 2000)
@@ -62,11 +62,11 @@
      (with-open [w (io/writer (.getOutputStream conn) :encoding "UTF-8")]
        (.write w (json/generate-string payload)))
      (let [status (.getResponseCode conn)
-           stream (if (<= 200 status 399)
-                    (.getInputStream conn)
-                    (.getErrorStream conn))
+           ^java.io.InputStream stream (if (<= 200 status 399)
+                                         (.getInputStream conn)
+                                         (.getErrorStream conn))
            body (if stream
-                  (with-open [in stream]
+                  (with-open [^java.io.InputStream in stream]
                     (slurp in :encoding "UTF-8"))
                   "")]
        {:status status
@@ -74,8 +74,8 @@
 
 (defn- http-post-edn
   [url payload]
-  (let [conn
-        (doto (.openConnection (java.net.URL. url))
+  (let [^java.net.HttpURLConnection conn
+        (doto ^java.net.HttpURLConnection (.openConnection (java.net.URL. url))
           (.setRequestMethod "POST")
           (.setDoOutput true)
           (.setConnectTimeout 2000)
@@ -84,11 +84,11 @@
     (with-open [w (io/writer (.getOutputStream conn) :encoding "UTF-8")]
       (.write w (pr-str payload)))
     (let [status (.getResponseCode conn)
-          stream (if (<= 200 status 399)
-                   (.getInputStream conn)
-                   (.getErrorStream conn))
+          ^java.io.InputStream stream (if (<= 200 status 399)
+                                        (.getInputStream conn)
+                                        (.getErrorStream conn))
           body (if stream
-                 (with-open [in stream]
+                 (with-open [^java.io.InputStream in stream]
                    (slurp in :encoding "UTF-8"))
                  "")]
       {:status status
@@ -96,17 +96,17 @@
 
 (defn- http-get
   [url]
-  (let [conn
-        (doto (.openConnection (java.net.URL. url))
+  (let [^java.net.HttpURLConnection conn
+        (doto ^java.net.HttpURLConnection (.openConnection (java.net.URL. url))
           (.setRequestMethod "GET")
           (.setConnectTimeout 2000)
           (.setReadTimeout 5000))
         status (.getResponseCode conn)
-        stream (if (<= 200 status 399)
-                 (.getInputStream conn)
-                 (.getErrorStream conn))
+        ^java.io.InputStream stream (if (<= 200 status 399)
+                                      (.getInputStream conn)
+                                      (.getErrorStream conn))
         body (if stream
-               (with-open [in stream]
+               (with-open [^java.io.InputStream in stream]
                  (slurp in :encoding "UTF-8"))
                "")]
     {:status status
@@ -118,6 +118,7 @@
           cap-keys #{:ferment.caps.registry/llm-voice
                      :ferment.caps.registry/llm-code
                      :ferment.caps.registry/llm-solver
+                     :ferment.caps.registry/llm-solver-text
                      :ferment.caps.registry/llm-meta
                      :ferment.caps.registry/llm-judge
                      :ferment.caps.registry/llm-mock}
@@ -135,7 +136,7 @@
                            (contains? cap :io/in-schema)
                            (contains? cap :io/out-schema))))
                   cap-keys))
-      (is (= 6 (count refs)))
+      (is (= 7 (count refs)))
       (is (= cap-keys (set refs))))))
 
 (deftest resolver-config-references-flat-capabilities
@@ -150,6 +151,7 @@
       (is (= #{:ferment.caps.registry/llm-voice
                :ferment.caps.registry/llm-code
                :ferment.caps.registry/llm-solver
+               :ferment.caps.registry/llm-solver-text
                :ferment.caps.registry/llm-meta
                :ferment.caps.registry/llm-judge
                :ferment.caps.registry/llm-mock}
@@ -256,7 +258,7 @@
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/http.edn")
           http (get cfg :ferment.http/default)]
       (is (map? http))
-      (is (= "127.0.0.1" (:host http)))
+      (is (= "0.0.0.0" (:host http)))
       (is (= 12002 (:port http)))
       (is (= :ferment/models (:models http))))))
 
@@ -293,6 +295,8 @@
                    :task {:intent "problem/solve"}
                    :input {:prompt "diag"}
                    :budget {:max-roundtrips 2
+                            :max-tokens 333
+                            :top-p 0.85
                             :temperature 0.0}
                    :session/id "s-1"}]
       (with-redefs [core/call-capability
@@ -310,6 +314,8 @@
           (is (= :llm/solver (get-in @captured [:opts :cap-id])))
           (is (= :solver (get-in @captured [:opts :role])))
           (is (= 2 (get-in @captured [:opts :max-attempts])))
+          (is (= 333 (get-in @captured [:opts :max-tokens])))
+          (is (= 0.85 (get-in @captured [:opts :top-p])))
           (is (= "s-1" (get-in @captured [:opts :session-id])))
           (is (= {:type :value
                   :out {:text "OK"}}
@@ -1532,6 +1538,7 @@
                         {:body :invoke
                          :args [{:prompt "hej"}]}
                         [cfg])]
+          (is (= "meta-model" (get-in cfg [:session :sid])))
           (is (fn? (:invoke-fn cfg)))
           (is (= {:ok? true
                   :result {:text "meta-ok"}}
@@ -1570,7 +1577,7 @@
     (let [port (free-port)
           request-body (atom nil)
           server (com.sun.net.httpserver.HttpServer/create
-                  (java.net.InetSocketAddress. "127.0.0.1" port)
+                  (java.net.InetSocketAddress. "127.0.0.1" (int port))
                   0)]
       (.createContext
        server
@@ -1594,13 +1601,17 @@
       (try
         (let [result (model/invoke-runtime-http!
                       {:prompt "Explain Ferment shortly."
-                       :system "Keep it concise."}
+                       :system "Keep it concise."
+                       :max-tokens 222
+                       :top-p 0.66}
                       nil
                       {:invoke/http {:url (str "http://127.0.0.1:" port "/v1/chat/completions")}})
               messages (:messages @request-body)]
           (is (= "meta-http-live-ok" (:text result)))
           (is (= "Keep it concise." (get-in messages [0 :content])))
-          (is (= "Explain Ferment shortly." (get-in messages [1 :content]))))
+          (is (= "Explain Ferment shortly." (get-in messages [1 :content])))
+          (is (= 222 (:max_tokens @request-body)))
+          (is (= 0.66 (:top_p @request-body))))
         (finally
           (.stop server 0))))))
 

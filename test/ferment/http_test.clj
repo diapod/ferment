@@ -1,7 +1,9 @@
 (ns ferment.http-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [ferment.core :as core]
-            [ferment.http :as http]))
+            [ferment.http :as http]
+            [ferment.telemetry :as telemetry]))
 
 (deftest invoke-act-injects-auth-principal-into-core-options
   (testing "invoke-act passes authenticated user and role policy to core execution options."
@@ -40,6 +42,28 @@
       (is (= #{:role/operator :role/reviewer}
              (set (get-in @seen [:session/meta :user/roles]))))
       (is (= (:roles runtime) (:roles @seen))))))
+
+(deftest invoke-act-derives-role-from-resolver-config
+  (testing "invoke-act derives execution role from resolver capability/routing maps (not hardcoded HTTP table)."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {:caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                       :dispatch/role :router}}
+                              :routing {:cap->role {:llm/voice :coder}}}}
+          payload {:proto 1
+                   :trace {:id "t-role-map-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      ;; resolver :caps/by-id dispatch role has precedence
+      (is (= :router (:role @seen))))))
 
 (deftest invoke-act-applies-session-var-defaults-when-missing
   (testing "invoke-act fills missing context/constraints/input defaults from session vars."
@@ -261,6 +285,7 @@
 (deftest invoke-act-meta-routing-adapts-tool-call-to-solver-voice-plan
   (testing "Meta route/decide output in tool_call format is adapted into canonical solver->voice plan and executed."
     (let [calls (atom [])
+          voice-calls (atom 0)
           routing {:intent->cap {:route/decide :llm/meta
                                  :problem/solve :llm/solver
                                  :text/respond :llm/voice}}
@@ -288,11 +313,13 @@
                                      :problem/solve
                                      {:response "Clojure został stworzony przez Richa Hickeya."}
                                      :text/respond
-                                     {:response (str "VOICE:" prompt)}
+                                     (if (= 1 (swap! voice-calls inc))
+                                       {:response "Nie wiem"}
+                                       {:response (str "VOICE:" prompt)})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
       (is (= 200 (:status response)))
-      (is (= [:route/decide :problem/solve :text/respond] @calls))
+      (is (= [:route/decide :text/respond :problem/solve :text/respond] @calls))
       (is (= "VOICE:Clojure został stworzony przez Richa Hickeya."
              (get-in response [:body :result :out :text])))
       (is (= #{:ferment.model/meta
@@ -309,6 +336,7 @@
 (deftest invoke-act-meta-routing-synthesizes-plan-on-empty-route-output
   (testing "Meta route/decide may return empty text; parser still synthesizes canonical solver->voice plan from request prompt."
     (let [calls (atom [])
+          voice-calls (atom 0)
           routing {:intent->cap {:route/decide :llm/meta
                                  :problem/solve :llm/solver
                                  :text/respond :llm/voice}}
@@ -335,17 +363,20 @@
                                    (case intent
                                      :route/decide {:response ""}
                                      :problem/solve {:response "Ryby nie piją jak ssaki; regulują gospodarkę wodną osmotycznie."}
-                                     :text/respond {:response (str "VOICE:" prompt)}
+                                     :text/respond (if (= 1 (swap! voice-calls inc))
+                                                     {:response "Nie wiem"}
+                                                     {:response (str "VOICE:" prompt)})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
       (is (= 200 (:status response)))
-      (is (= [:route/decide :problem/solve :text/respond] @calls))
+      (is (= [:route/decide :text/respond :problem/solve :text/respond] @calls))
       (is (= "VOICE:Ryby nie piją jak ssaki; regulują gospodarkę wodną osmotycznie."
              (get-in response [:body :result :out :text]))))))
 
 (deftest invoke-act-meta-routing-ignores-invalid-model-plan-and-synthesizes-canonical-plan
   (testing "Meta route/decide ignores non-canonical model plan and falls back to synthesized solver->voice plan."
     (let [calls (atom [])
+          voice-calls (atom 0)
           routing {:intent->cap {:route/decide :llm/meta
                                  :problem/solve :llm/solver
                                  :text/respond :llm/voice}}
@@ -375,17 +406,20 @@
                                      :problem/solve
                                      {:response "ACID to zbiór gwarancji poprawności transakcji: atomowość, spójność, izolacja, trwałość."}
                                      :text/respond
-                                     {:response (str "VOICE:" prompt)}
+                                     (if (= 1 (swap! voice-calls inc))
+                                       {:response "Nie wiem"}
+                                       {:response (str "VOICE:" prompt)})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
       (is (= 200 (:status response)))
-      (is (= [:route/decide :problem/solve :text/respond] @calls))
+      (is (= [:route/decide :text/respond :problem/solve :text/respond] @calls))
       (is (= "VOICE:ACID to zbiór gwarancji poprawności transakcji: atomowość, spójność, izolacja, trwałość."
              (get-in response [:body :result :out :text]))))))
 
 (deftest invoke-act-meta-routing-can-expose-lazy-plan-in-debug-mode
   (testing "When routing debug is enabled, /v1/act includes pre-execution plan with lazy slot refs."
     (let [calls (atom [])
+          voice-calls (atom 0)
           routing {:intent->cap {:route/decide :llm/meta
                                  :problem/solve :llm/solver
                                  :text/respond :llm/voice}}
@@ -405,7 +439,8 @@
                    :task {:intent :text/respond}
                    :routing {:meta? true
                              :strict? true
-                             :debug/plan? true}
+                             :debug/plan? true
+                             :debug-transcript? true}
                    :input {:prompt "Wyjaśnij ACID jednym zdaniem."}}
           response (with-redefs [core/ollama-generate!
                                  (fn [{:keys [intent prompt]}]
@@ -416,19 +451,44 @@
                                      :problem/solve
                                      {:response "ACID to zestaw gwarancji poprawności transakcji."}
                                      :text/respond
-                                     {:response (str "VOICE:" prompt)}
+                                     (if (= 1 (swap! voice-calls inc))
+                                       {:response "Nie wiem"}
+                                       {:response (str "VOICE:" prompt)})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
       (is (= 200 (:status response)))
-      (is (= [:route/decide :problem/solve :text/respond] @calls))
+      (is (= [:route/decide :text/respond :problem/solve :text/respond] @calls))
       (is (= {:slot/id [:solver :out :text]}
-             (get-in response [:body :result :plan/debug :nodes 1 :input :prompt])))
-      (is (= {:slot/id [:voice :out]}
-             (get-in response [:body :result :plan/debug :nodes 2 :input]))))))
+             (get-in response [:body :result :plan/debug :nodes 2 :input :prompt])))
+      (is (string? (get-in response [:body :result :plan/debug :nodes 2 :system])))
+      (is (str/includes? (get-in response [:body :result :plan/debug :nodes 2 :system])
+                         "Rewrite for tone/style only"))
+      (is (= [:schema-valid :no-truncated-ending]
+             (get-in response [:body :result :plan/debug :nodes 2 :dispatch :checks/hard])))
+      (is (= {:same-cap-max 1 :fallback-max 0}
+             (get-in response [:body :result :plan/debug :nodes 2 :dispatch :retry])))
+      (is (= {:slot/id [:voice-primary :out]}
+             (get-in response [:body :result :plan/debug :nodes 3 :input])))
+      (is (= {:slot/id [:voice-final :out]}
+             (get-in response [:body :result :plan/debug :nodes 4 :input])))
+      (is (= 3 (count (get-in response [:body :result :plan/run :transcript]))))
+      (is (= :text/respond
+             (get-in response [:body :result :plan/run :transcript 0 :intent])))
+      (is (= "Wyjaśnij ACID jednym zdaniem."
+             (get-in response [:body :result :plan/run :transcript 0 :input :prompt])))
+      (is (= :problem/solve
+             (get-in response [:body :result :plan/run :transcript 1 :intent])))
+      (is (= "Wyjaśnij ACID jednym zdaniem."
+             (get-in response [:body :result :plan/run :transcript 1 :input :prompt])))
+      (is (= :text/respond
+             (get-in response [:body :result :plan/run :transcript 2 :intent])))
+      (is (= "ACID to zestaw gwarancji poprawności transakcji."
+             (get-in response [:body :result :plan/run :transcript 2 :input :prompt]))))))
 
-(deftest invoke-act-meta-routing-fails-when-no-list-expansion-check-fails
-  (testing "Strict meta routing fails closed when voice output violates :no-list-expansion quality policy."
+(deftest invoke-act-meta-routing-softens-voice-final-list-expansion-check
+  (testing "Strict meta routing may recover to solver->voice-final when primary voice fails hard list-expansion gate."
     (let [calls (atom [])
+          text-respond-calls (atom 0)
           routing {:intent->cap {:route/decide :llm/meta
                                  :problem/solve :llm/solver
                                  :text/respond :llm/voice}}
@@ -467,13 +527,19 @@
                                      :problem/solve
                                      {:response "ACID to zestaw gwarancji dla transakcji."}
                                      :text/respond
-                                     {:response "- atomowość\n- spójność\n- izolacja\n- trwałość"}
+                                     (case (swap! text-respond-calls inc)
+                                       ;; voice-primary -> hard fail (list expansion)
+                                       1 {:response "- atomowość\n- spójność\n- izolacja\n- trwałość"}
+                                       ;; voice-final attempt #1 -> hard fail (truncated ending)
+                                       2 {:response "ACID to zestaw gwarancji dla transakcji"}
+                                       ;; voice-final retry #2 -> pass
+                                       {:response "- atomowość.\n- spójność.\n- izolacja.\n- trwałość."})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
-      (is (= 502 (:status response)))
-      (is (= :route/decide-failed
-             (get-in response [:body :error :type])))
-      (is (= [:route/decide :problem/solve :text/respond] @calls)))))
+      (is (= 200 (:status response)))
+      (is (= "- atomowość.\n- spójność.\n- izolacja.\n- trwałość."
+             (get-in response [:body :result :out :text])))
+      (is (= [:route/decide :text/respond :problem/solve :text/respond :text/respond] @calls)))))
 
 (deftest invoke-act-meta-routing-strict-mode-fails-closed
   (testing "strict meta routing returns 502 when the decider fails and does not execute main capability."
@@ -501,6 +567,42 @@
       (is (= 502 (:status response)))
       (is (= :route/decide-failed (get-in response [:body :error :type])))
       (is (false? @main-called?)))))
+
+(deftest invoke-act-routing-profile-low-latency-disables-meta-decider
+  (testing "routing profile :low-latency disables meta decider and executes direct text/respond."
+    (let [calls (atom [])
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :text/respond :llm/voice}}
+          runtime {:protocol {}
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing
+                            :defaults {:meta? true
+                                       :strict? true
+                                       :on-error :fail-closed}
+                            :profiles {:low-latency {:meta? false
+                                                     :strict? false
+                                                     :force? false
+                                                     :on-error :fail-open}}}}
+          payload {:proto 1
+                   :trace {:id "t-low-latency"}
+                   :task {:intent :text/respond}
+                   :routing {:profile "low-latency"}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (swap! calls conj (:intent opts))
+                                   (case (:intent opts)
+                                     :text/respond {:result {:type :value
+                                                             :out {:text "SZYBKO"}}}
+                                     :route/decide (throw (ex-info "meta-decider should be disabled for low-latency profile"
+                                                                   {:error :unexpected-route-decide}))
+                                     {:result {:type :value
+                                               :out {:text "UNEXPECTED"}}}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= [:text/respond] @calls))
+      (is (= "SZYBKO" (get-in response [:body :result :out :text]))))))
 
 (deftest invoke-act-meta-routing-request-strict-overrides-default-fail-open
   (testing "request :routing/:strict? true enforces fail-closed even when router default :on-error is :fail-open."
@@ -548,10 +650,18 @@
                    :input {:prompt "hej"}}
           response (with-redefs [core/call-capability
                                  (fn [_runtime _resolver opts]
-                                   (if (= :route/decide (:intent opts))
+                                  (if (= :route/decide (:intent opts))
                                      (throw (ex-info
                                              "Call node failed quality/dispatch policy"
                                              {:error :runtime/invoke-failed
+                                              :attempts 3
+                                              :last-check {:ok? false
+                                                           :error :invalid-result
+                                                           :reason :output/schema-invalid
+                                                           :intent :route/decide
+                                                           :result/type :value
+                                                           :details {:reason :schema/invalid
+                                                                     :schema :res/route}}
                                               :failure/type :schema/invalid
                                               :node {:op :call
                                                      :intent :route/decide
@@ -584,6 +694,11 @@
       (is (= :route/decide (:route/intent details)))
       (is (= :llm/meta (:route/cap-id details)))
       (is (= :schema/invalid (:failure/type details)))
+      (is (= 3 (:attempts details)))
+      (is (= :invalid-result (get-in details [:last-check :error])))
+      (is (= :output/schema-invalid (get-in details [:last-check :reason])))
+      (is (= :schema/invalid (get-in details [:last-check :details :reason])))
+      (is (= :res/route (get-in details [:last-check :details :schema])))
       (is (= :schema/invalid (get-in details [:outcome :failure/type])))
       (is (= {:same-cap-max 1 :fallback-max 1} (:retry-policy details)))
       (is (= [:llm/meta :llm/solver] (:candidates details)))
@@ -676,6 +791,44 @@
       (is (= 200 (:status response)))
       (is (= :llm/voice (:cap-id @seen)))
       (is (= "fallback-ok" (get-in response [:body :result :out :text]))))))
+
+(deftest invoke-act-meta-routing-retries-decider-then-fails-open-deterministically
+  (testing "With non-strict mode, route/decide retries on same cap then fail-opens to static capability."
+    (let [calls (atom [])
+          telemetry (atom {})
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :value
+                                                               :contract/kind :route/decide}}
+                              :text/respond {:in-schema :req/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 3
+                    :policy/intents {:route/decide {:retry {:max-attempts 3}}}}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-7-retry-open"}
+                   :task {:intent :text/respond}
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/ollama-generate!
+                    (fn [{:keys [intent]}]
+                      (swap! calls conj intent)
+                      (case intent
+                        :route/decide {:response "not-a-route"}
+                        :text/respond {:response "fallback-ok"}
+                        {:response "unexpected"}))]
+        (let [response (http/invoke-act runtime payload telemetry nil)
+              snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+          (is (= 200 (:status response)))
+          (is (= "fallback-ok" (get-in response [:body :result :out :text])))
+          (is (= [:route/decide :route/decide :route/decide :text/respond] @calls))
+          (is (= 1 (get-in snapshot [:act :routing :route/decide-hit])))
+          (is (= 1 (get-in snapshot [:act :routing :route/fail-open])))
+          (is (= 0 (get-in snapshot [:act :routing :route/fail-closed])))
+          (is (= 0 (get-in snapshot [:act :routing :route/strict]))))))))
 
 (deftest invoke-act-meta-routing-can-return-final-response
   (testing "if route/decide does not emit a routing decision map, invoke-act returns that response directly."
@@ -864,3 +1017,89 @@
       (is (= 200 (:status @seen)))
       (is (= 42 (:principal-id @seen)))
       (is (= "audit@example.com" (:principal-email @seen))))))
+
+(deftest invoke-act-response-cache-hit-and-telemetry
+  (testing "When response cache is enabled, identical requests hit cache and update cache telemetry."
+    (let [calls (atom 0)
+          runtime {:protocol {}
+                   :resolver {}
+                   :response-cache {:enabled? true
+                                    :ttl-ms 120000
+                                    :max-size 32
+                                    :state (atom {:entries {}
+                                                  :order []})}}
+          telemetry (atom {})
+          payload {:proto 1
+                   :trace {:id "cache-hit-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :session/id "session/cache-hit-1"
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      (swap! calls inc)
+                      {:result {:type :value
+                                :out {:text "ok"}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry nil))))
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry nil)))))
+      (is (= 1 @calls))
+      (let [snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= 2 (get-in snapshot [:act :cache :lookups])))
+        (is (= 1 (get-in snapshot [:act :cache :hits])))
+        (is (= 1 (get-in snapshot [:act :cache :misses])))
+        (is (= 1 (get-in snapshot [:act :cache :stores])))
+        (is (= 0.5 (get-in snapshot [:kpi :cache-hit-rate :value])))))))
+
+(deftest session-mutation-invalidates-act-response-cache
+  (testing "Session mutation actions invalidate cached /v1/act responses for the same session id."
+    (let [calls (atom 0)
+          session-store (atom {})
+          runtime {:protocol {}
+                   :resolver {}
+                   :session {:put-var! (fn [sid k v _opts]
+                                         (swap! session-store assoc-in [sid k] v)
+                                         true)}
+                   :response-cache {:enabled? true
+                                    :ttl-ms 120000
+                                    :max-size 32
+                                    :state (atom {:entries {}
+                                                  :order []})}}
+          telemetry (atom {})
+          payload {:proto 1
+                   :trace {:id "cache-inv-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :session/id "session/cache-inv-1"
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      (swap! calls inc)
+                      {:result {:type :value
+                                :out {:text "ok"}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry nil))))
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry nil))))
+        (is (= 1 @calls))
+        (is (= 200 (:status (#'ferment.http/session-action-response
+                             runtime
+                             {:action :session/put-var
+                              :session/id "session/cache-inv-1"
+                              :key :session/context-summary
+                              :value "new-context"}
+                             telemetry))))
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry nil)))))
+      (is (= 2 @calls))
+      (let [snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (pos? (long (or (get-in snapshot [:act :cache :invalidations]) 0))))
+        (is (>= (long (or (get-in snapshot [:kpi :cache-hit-rate :lookups]) 0)) 3))))))
+
+(deftest telemetry-snapshot-exposes-lifecycle-events
+  (testing "Diagnostics snapshot includes lifecycle telemetry branch."
+    (telemetry/clear-lifecycle!)
+    (telemetry/record-lifecycle! :app :start {:profile :test})
+    (telemetry/record-lifecycle! :http :error {:error "boom"})
+    (let [snapshot (#'ferment.http/telemetry-snapshot (atom {}))]
+      (is (= 2 (get-in snapshot [:lifecycle :total])))
+      (is (= 1 (get-in snapshot [:lifecycle :errors])))
+      (is (= 1 (get-in snapshot [:lifecycle :components :app :start])))
+      (is (= 1 (get-in snapshot [:lifecycle :components :http :error]))))
+    (telemetry/clear-lifecycle!)))

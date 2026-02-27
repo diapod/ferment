@@ -29,6 +29,7 @@
                 "--model" #ref :ferment.model.id/solver]
   :invoke/http {:base-url #ref :ferment.env/ferment.model.solver.base.url
                 :endpoint #ref :ferment.env/ferment.model.solver.endpoint
+                :max-tokens 768
                 :model    #ref :ferment.model.id/solver}
   :http     {:enabled? true :endpoint "solver/responses"}
   :name     "solver model runtime"}
@@ -53,6 +54,7 @@
   :invoke/http {:base-url #ref :ferment.env/ferment.model.voice.base.url
                 :endpoint #ref :ferment.env/ferment.model.voice.endpoint
                 :temperature 0.0
+                :max-tokens 384
                 :model    #ref :ferment.model.id/voice}
   :http     {:enabled? true :endpoint "voice/responses"}
   :name     "voice model runtime"}
@@ -100,6 +102,7 @@
   :invoke/http {:base-url #ref :ferment.env/ferment.model.meta.base.url
                 :endpoint #ref :ferment.env/ferment.model.meta.endpoint
                 :temperature 0.0
+                :max-tokens 256
                 :model    #ref :ferment.model.id/meta}
   :http        {:enabled? true :endpoint "meta/responses"}
   :name        "meta model runtime"}

@@ -9,6 +9,7 @@
             [ferment.contracts :as contracts]
             [ferment.memory :as memory]
             [ferment.model :as model]
+            [io.randomseed.utils :as utils]
             [ferment.router :as router]
             [ferment.workflow :as workflow]
             [ferment.system :as system])
@@ -61,10 +62,17 @@
       (if (map? cfg) cfg {}))
     {}))
 
+(defn- prompt-text
+  [s]
+  (cond
+    (vector? s) (str/join " " s)
+    (list? s) (str/join " " s)
+    :else (utils/some-str s)))
+
 (defn- join-system-prompt
   [parts]
   (let [parts' (->> parts
-                    (keep #(some-> % str str/trim not-empty))
+                    (keep prompt-text)
                     vec)]
     (when (seq parts')
       (str/join "\n\n" parts'))))
@@ -73,7 +81,7 @@
   [protocol intent role]
   (let [intent-cfg (intent-config protocol intent)]
     (or
-     (some-> (:system intent-cfg) str str/trim not-empty)
+     (prompt-text (:system intent-cfg))
      ;; Prompt package composition (default + role + intent + addendum).
      (join-system-prompt [(get-in protocol [:prompts :default])
                           (get-in protocol [:prompts :roles role])
@@ -93,6 +101,11 @@
 (defn- intent-default-constraints
   [protocol intent]
   (let [cfg (get-in protocol [:intents intent :constraints])]
+    (if (map? cfg) cfg nil)))
+
+(defn- intent-default-budget
+  [protocol intent]
+  (let [cfg (get-in protocol [:intents intent :budget])]
     (if (map? cfg) cfg nil)))
 
 (defn- intent-judge-config
@@ -116,6 +129,18 @@
                   (Double/parseDouble (str/trim v))
                   (catch Throwable _ nil))
     :else nil))
+
+(defn- positive-long-safe
+  [v]
+  (let [n (cond
+            (integer? v) (long v)
+            (number? v) (long v)
+            (string? v) (try
+                          (Long/parseLong (str/trim v))
+                          (catch Throwable _ nil))
+            :else nil)]
+    (when (and (integer? n) (pos? n))
+      n)))
 
 (defn- keywordish
   [v]
@@ -219,8 +244,72 @@
             text (or (when (string? (:text out)) (:text out))
                      (when (string? (:content out)) (:content out))
                      (when (string? out) out)
-                     "")]
+            "")]
         (not (list-expansion? text))))))
+
+(def ^:private sentence-end-pattern
+  #"(?is).*[.!?…](?:[\s\"'\)\]\}»”]*)$")
+
+(def ^:private prompt-needs-example-pattern
+  #"(?i)\b(example|examples|for instance|e\.g\.|przyk[łl]ad|przyk[łl]ady|na przyk[łl]ad)\b")
+
+(def ^:private prompt-needs-detail-pattern
+  #"(?i)\b(explain|describe|analyze|analyse|compare|detail|details|why|how|wyjaśnij|opisz|porównaj|szczeg[oó]ł)\b")
+
+(def ^:private prompt-asks-brief-pattern
+  #"(?i)\b(brief|briefly|short|few words|one sentence|two sentences|1 sentence|2 sentences|kr[oó]tko|zwi[eę]źle|jednym zdaniem|dw[oó]ch zdaniach|2 zdaniach)\b")
+
+(def ^:private uncertain-answer-pattern
+  #"(?i)\b(i don'?t know|not sure|uncertain|cannot determine|nie wiem|nie jestem pew|brak danych|trudno powiedzie[ćc])\b")
+
+(defn- sentence-count
+  [s]
+  (if (string? s)
+    (count (re-seq #"[.!?…]+" s))
+    0))
+
+(defn- sufficient-detail?
+  [call-node _env result]
+  (let [intent (keywordish (:intent call-node))]
+    (if (not= :text/respond intent)
+      true
+      (let [prompt (some-> (get-in call-node [:input :prompt]) str str/trim)
+            out (contracts/result-out-of result)
+            text (or (when (string? (:text out)) (:text out))
+                     (when (string? (:content out)) (:content out))
+                     (when (string? out) out)
+                     "")
+            text' (str/trim text)
+            asks-example? (and (string? prompt)
+                               (boolean (re-find prompt-needs-example-pattern prompt)))
+            asks-detail? (and (string? prompt)
+                              (boolean (re-find prompt-needs-detail-pattern prompt)))
+            asks-brief? (and (string? prompt)
+                             (boolean (re-find prompt-asks-brief-pattern prompt)))
+            mentions-example? (boolean (re-find prompt-needs-example-pattern text'))
+            uncertain? (boolean (re-find uncertain-answer-pattern text'))
+            short? (< (count text') 120)
+            single-sentence? (< (sentence-count text') 2)]
+        (and (not (str/blank? text'))
+             (not uncertain?)
+             (or (not asks-example?) mentions-example?)
+             (or asks-brief?
+                 (not asks-detail?)
+                 (not (and short? single-sentence?))))))))
+
+(defn- no-truncated-ending?
+  [call-node _env result]
+  (let [intent (keywordish (:intent call-node))]
+    (if (not (contains? #{:problem/solve :text/respond} intent))
+      true
+      (let [out (contracts/result-out-of result)
+            text (or (when (string? (:text out)) (:text out))
+                     (when (string? (:content out)) (:content out))
+                     (when (string? out) out)
+                     "")
+            text' (str/trim text)]
+        (and (not (str/blank? text'))
+             (boolean (re-matches sentence-end-pattern text')))))))
 
 (defn- schema-valid?
   [protocol call-node result]
@@ -232,13 +321,17 @@
 (def ^:private builtin-check-fns
   {:tests-pass tests-pass?
    :no-hallucinated-apis no-hallucinated-apis?
-   :no-list-expansion no-list-expansion?})
+   :no-list-expansion no-list-expansion?
+   :sufficient-detail sufficient-detail?
+   :no-truncated-ending no-truncated-ending?})
 
 (def ^:private default-check-descriptors
   {:schema-valid :builtin/schema-valid
    :tests-pass :builtin/tests-pass
    :no-hallucinated-apis :builtin/no-hallucinated-apis
-   :no-list-expansion :builtin/no-list-expansion})
+   :sufficient-detail :builtin/sufficient-detail
+   :no-list-expansion :builtin/no-list-expansion
+   :no-truncated-ending :builtin/no-truncated-ending})
 
 (defn- resolve-check-descriptor
   [protocol descriptor]
@@ -250,7 +343,9 @@
 
     (= descriptor :builtin/tests-pass) tests-pass?
     (= descriptor :builtin/no-hallucinated-apis) no-hallucinated-apis?
+    (= descriptor :builtin/sufficient-detail) sufficient-detail?
     (= descriptor :builtin/no-list-expansion) no-list-expansion?
+    (= descriptor :builtin/no-truncated-ending) no-truncated-ending?
     (keyword? descriptor) (get builtin-check-fns descriptor)
     (ifn? descriptor) descriptor
     :else nil))
@@ -434,35 +529,53 @@
         ec  (.waitFor p)]
     {:exit ec :out out :err err}))
 
-(defn- model-id-by-key
-  [runtime model-k]
-  (case model-k
-    :ferment.model/coding (model/coding-id runtime)
-    :ferment.model/solver (model/solver-id runtime)
-    :ferment.model/meta   (model/meta-id runtime)
-    :ferment.model/voice  (model/voice-id runtime)
-    (or (when (keyword? model-k)
-          (model/model-id runtime model-k nil))
-        (model/solver-id runtime))))
+(defn- normalize-model-selector-keyword
+  [k]
+  (when (keyword? k)
+    (if (= "ferment.model" (namespace k))
+      k
+      (keyword "ferment.model" (name k)))))
 
-(def ^:private known-model-keys
+(def ^:private fallback-known-model-keys
   #{:ferment.model/coding
     :ferment.model/solver
     :ferment.model/meta
     :ferment.model/voice})
 
+(defn- configured-model-keys
+  [runtime]
+  (let [models (some-> (runtime-config runtime) :models)]
+    (if (map? models)
+      (->> (keys models)
+           (keep normalize-model-selector-keyword)
+           set)
+      #{})))
+
+(defn- known-model-keys
+  [runtime]
+  (into fallback-known-model-keys
+        (configured-model-keys runtime)))
+
+(defn- model-id-by-key
+  [runtime model-k]
+  (let [selector-k (normalize-model-selector-keyword model-k)]
+    (or (when (keyword? selector-k)
+          (model/model-id runtime selector-k nil))
+        (model/solver-id runtime))))
+
 (defn- known-model-key?
-  [k]
-  (and (keyword? k)
-       (contains? known-model-keys k)))
+  [runtime k]
+  (let [selector-k (normalize-model-selector-keyword k)]
+    (and (keyword? selector-k)
+         (contains? (known-model-keys runtime) selector-k))))
 
 (defn- resolve-invocation-model-id
   [runtime model model-k]
   (or (when (string? model)
         (some-> model str str/trim not-empty))
-      (when (known-model-key? model)
+      (when (known-model-key? runtime model)
         (model-id-by-key runtime model))
-      (when (known-model-key? model-k)
+      (when (known-model-key? runtime model-k)
         (model-id-by-key runtime model-k))
       (when (some? model)
         (some-> model str str/trim not-empty))))
@@ -517,7 +630,8 @@
 
 (defn ollama-generate!
   "Model generator (HF/MLX command backend, mock-aware)."
-  [{:keys [runtime resolver cap-id intent model prompt system mode session-id]}]
+  [{:keys [runtime resolver cap-id intent model prompt system mode session-id
+           max-tokens top-p]}]
   (if (= :mock mode)
     {:response (mock-llm-response {:prompt (compose-prompt system prompt)})
      :raw {:mode :mock}}
@@ -527,7 +641,9 @@
                              runtime
                              model-k
                              {:prompt prompt
-                              :system system}
+                              :system system
+                              :max-tokens max-tokens
+                              :top-p top-p}
                              {:session/id session-id}))
           invoke-text (runtime-invoke-text invoke-response)]
       (cond
@@ -619,7 +735,17 @@
                        (when (seq merged) merged))
         done'        (or done
                          (intent-default-done protocol' intent))
-        budget'      (or budget (protocol-default protocol' :budget/default nil))
+        budget-default (if (map? (protocol-default protocol' :budget/default nil))
+                         (protocol-default protocol' :budget/default nil)
+                         {})
+        budget-intent  (if (map? (intent-default-budget protocol' intent))
+                         (intent-default-budget protocol' intent)
+                         {})
+        budget-local   (if (map? budget) budget {})
+        budget'        (let [merged (merge budget-default
+                                           budget-intent
+                                           budget-local)]
+                         (when (seq merged) merged))
         effects'     (or effects (protocol-default protocol' :effects/default nil))
         requires'    (contracts/normalize-requires requires)
         input'       (if (map? input) input {:prompt (input->prompt input)})]
@@ -813,7 +939,7 @@
 
   Returns validated result envelope (`:result` or `:error`), which may represent
   `:value`, `:plan` or `:stream` depending on the configured parser."
-  [runtime {:keys [role intent cap-id model system prompt input temperature
+  [runtime {:keys [role intent cap-id model system prompt input temperature max-tokens top-p
                    max-attempts result-parser context constraints done budget effects
                    requires
                    request-id trace proto session-version resolver]
@@ -836,8 +962,8 @@
                  input
                  {:prompt (or prompt "")})
         prompt' (input->prompt input')
-        system' (or (some-> system str str/trim not-empty)
-                    (some-> input' :system str str/trim not-empty)
+        system' (or (prompt-text system)
+                    (prompt-text (:system input'))
                     (intent-system-prompt protocol intent role))
         session-runtime (open-runtime-session! runtime opts)
         session-service (:service session-runtime)
@@ -862,6 +988,13 @@
                                         :session-version (or session-version
                                                              (:session/version session-state))
                                         :session-state session-state})
+        request-budget (:budget request)
+        max-tokens' (or (positive-long-safe max-tokens)
+                        (positive-long-safe (or (:max-tokens request-budget)
+                                                (:max_tokens request-budget))))
+        top-p' (or (parse-double-safe top-p)
+                   (parse-double-safe (or (:top-p request-budget)
+                                          (:top_p request-budget))))
         _ (append-session-turn-safe! session-service session-id
                                      {:turn/role :user
                                       :turn/text prompt'
@@ -878,6 +1011,8 @@
                                                     :prompt prompt'
                                                     :session-id session-id
                                                     :temperature temperature
+                                                    :max-tokens max-tokens'
+                                                    :top-p top-p'
                                                     :mode mode})
                           text (:response result)
                           text' (if (string? text) text "")]
@@ -1085,13 +1220,33 @@
          distinct
          vec)))
 
-(defn- public-plan-run
+(defn- run-transcript
   [run]
+  (->> (if (sequential? (:transcript run))
+         (:transcript run)
+         [])
+       (filter map?)
+       vec))
+
+(defn- run-timings
+  [run]
+  (->> (if (sequential? (:timings run))
+         (:timings run)
+         [])
+       (filter map?)
+       vec))
+
+(defn- public-plan-run
+  [run debug-transcript?]
   (let [ok? (boolean (:ok? run))
-        participants (run-participants run)]
+        participants (run-participants run)
+        transcript (run-transcript run)
+        timings (run-timings run)]
     (cond-> {:ok? ok?}
       (map? (:telemetry run)) (assoc :telemetry (:telemetry run))
       (seq participants) (assoc :participants participants)
+      (seq timings) (assoc :timings timings)
+      debug-transcript? (assoc :transcript transcript)
       (and (not ok?) (keyword? (:failure/type run))) (assoc :failure/type (:failure/type run))
       (and (not ok?) (some? (:error run))) (assoc :error (:error run)))))
 
@@ -1107,6 +1262,7 @@
          check-fns     (runtime-check-fns runtime)
          judge-fn      (runtime-judge-fn runtime resolver opts)
          debug-plan?   (true? (:debug/plan? opts))
+         debug-transcript? (true? (:debug/transcript? opts))
          protocol      (or (runtime-protocol runtime) {})
          resolver'     (cond-> (if (map? resolver) resolver {})
                          (map? protocol) (assoc :protocol protocol))
@@ -1131,12 +1287,13 @@
                                    (tool-adapter/invoke! effects-cfg tool-node env))
                     :check-fns check-fns
                     :judge-fn judge-fn
-                    :env workflow-env})
+                    :env workflow-env
+                    :debug/transcript? debug-transcript?})
              out  (emitted->out (:emitted run))]
          (assoc base-result
                 :result (cond-> {:type :value
                                  :out out
-                                 :plan/run (public-plan-run run)}
+                                 :plan/run (public-plan-run run debug-transcript?)}
                           debug-plan? (assoc :plan/debug plan))))
        base-result))))
 

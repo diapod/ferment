@@ -78,7 +78,15 @@ curl -s http://127.0.0.1:12002/diag/telemetry
 - `retry-rate`
 - `fallback-rate`
 - `judge-pass-rate`
+- `cache-hit-rate`
 - `failure-taxonomy` (`by-type` + `by-domain`)
+
+Lifecycle observability is available under `telemetry.lifecycle` (`total`, `errors`, per-component transitions, recent events window).
+
+Optional `/v1/act` response cache is configured in `resources/config/common/prod/http.edn` under `:response-cache`:
+- `:enabled?` (default `false`)
+- `:ttl-ms`
+- `:max-size`
 
 Prompt tuning source of truth:
 - `resources/config/common/prod/protocol.edn`
