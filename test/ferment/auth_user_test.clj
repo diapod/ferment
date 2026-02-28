@@ -2,7 +2,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [ferment.auth :as auth]
-            [ferment.auth.algo.pbkdf2]
+            [io.randomseed.utils.auth.algo.pbkdf2]
             [ferment.auth.user :as auth-user]
             [ferment.session :as session]
             [ferment.session.store :as session-store]
@@ -262,7 +262,7 @@
                          :wait-random [0 0.001]
                          :wait-nouser 0
                          :suite       [{:name         :pbkdf2
-                                        :handler      'ferment.auth.algo.pbkdf2/handler
+                                        :handler      'io.randomseed.utils.auth.algo.pbkdf2/handler
                                         :iterations   2000
                                         :salt-length  8
                                         :salt-charset "abcdefghijklmnopqrstuvwzyx0123456789"}]})

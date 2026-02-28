@@ -12,6 +12,7 @@
             [ferment.auth :as auth]
             [ferment.db :as db]
             [ferment.identity :as identity]
+            [io.randomseed.utils.auth.types :as auth-types]
             [io.randomseed.utils :refer [safe-parse-long
                                          some-keyword
                                          some-str]]))
@@ -519,8 +520,7 @@
   [connectable auth-config plain-password]
   (when-some [suites (auth/make-password-json plain-password auth-config)]
     (when-some [suite-id (create-or-get-shared-suite-id connectable (:shared suites))]
-      {:password-suite-id suite-id
-       :password          (:intrinsic suites)})))
+      (auth-types/->DBPassword suite-id (:intrinsic suites)))))
 
 (defn create-user!
   "Creates a new user with encrypted password.

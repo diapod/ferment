@@ -11,11 +11,12 @@
   (:require [ferment.db             :as        db]
             [ferment.db.sql         :as       sql]
             [ferment.logging        :as       log]
-            [ferment.auth.pwd       :as       pwd]
             [ferment.system         :as    system]
             [ferment.proto.auth     :as         p]
             [ferment.types.auth     :refer   :all]
             [ferment                :refer   :all]
+            [io.randomseed.utils.auth :as  auth-utils]
+            [io.randomseed.utils.auth.types :as auth-types]
             [io.randomseed.utils      :refer   :all]
             [io.randomseed.utils.time :as      time]
             [io.randomseed.utils.var  :as       var]
@@ -23,14 +24,16 @@
             [tick.core                :as         t])
 
   (:import (ferment                 AccountTypes
-                                    AuthLocking
                                     AuthConfirmation
-                                    AuthPasswords
                                     AuthConfig
                                     AuthSettings)
            (clojure.lang           Keyword
                                    Associative
                                    IPersistentMap)
+           (io.randomseed.utils.auth.types AuthLocking
+                                           AuthPasswords
+                                           Suites
+                                           SuitesJSON)
            (io.randomseed.lazy_map LazyMap)
            (javax.sql              DataSource)
            (java.time              Duration)))
@@ -79,49 +82,87 @@
 
 ;; Password authentication
 
+(defn- ->auth-passwords-record
+  [passwords]
+  (when passwords
+    (if (instance? AuthPasswords passwords)
+      passwords
+      (auth-types/->AuthPasswords (or (:id passwords) (:handler-id passwords))
+                                  (:suite passwords)
+                                  (or (:check passwords) (:check-fn passwords))
+                                  (or (:check-json passwords) (:check-json-fn passwords))
+                                  (or (:encrypt passwords) (:encrypt-fn passwords))
+                                  (or (:encrypt-json passwords) (:encrypt-json-fn passwords))
+                                  (or (:wait passwords) (:wait-fn passwords))))))
+
+(defn- ->auth-locking-record
+  [locking]
+  (when locking
+    (if (instance? AuthLocking locking)
+      locking
+      (auth-types/->AuthLocking (:max-attempts locking)
+                                (:lock-wait locking)
+                                (:fail-expires locking)))))
+
+(defn- ->suites-record
+  [suites]
+  (if (and (map? suites)
+           (contains? suites :shared)
+           (contains? suites :intrinsic))
+    (if (instance? Suites suites)
+      suites
+      (auth-types/->Suites (:shared suites) (:intrinsic suites)))
+    suites))
+
+(defn- ->suites-json-record
+  [suites]
+  (if (and (map? suites)
+           (contains? suites :shared)
+           (contains? suites :intrinsic))
+    (if (instance? SuitesJSON suites)
+      suites
+      (auth-types/->SuitesJSON (:shared suites) (:intrinsic suites)))
+    suites))
+
 (defn check-password
   "Checks password for a user against an encrypted password given in password
   suites. Specific authentication configuration map must be given."
   ([password pwd-suites auth-config]
-   (if (and password pwd-suites auth-config)
-     (if-some [checker (.check ^AuthPasswords (.passwords ^AuthConfig auth-config))]
-       (if (map? pwd-suites)
-         (checker password pwd-suites)
-         (checker password nil pwd-suites)))))
+   (auth-utils/check-password password
+                              (->suites-record pwd-suites)
+                              auth-config))
   ([password pwd-shared-suite pwd-user-suite auth-config]
-   (if (and password pwd-shared-suite pwd-user-suite auth-config)
-     (if-some [checker (.check ^AuthPasswords (.passwords ^AuthConfig auth-config))]
-       (checker password pwd-shared-suite pwd-user-suite)))))
+   (auth-utils/check-password password
+                              pwd-shared-suite
+                              pwd-user-suite
+                              auth-config)))
 
 (defn check-password-json
   "Checks password for a user against a JSON-encoded password suites. Specific
   authentication configuration map must be given."
   ([password json-pwd-suites auth-config]
-   (if (and password json-pwd-suites auth-config)
-     (if-some [checker (.check-json ^AuthPasswords (.passwords ^AuthConfig auth-config))]
-       (if (map? json-pwd-suites)
-         (checker password json-pwd-suites)
-         (checker password nil json-pwd-suites)))))
+   (auth-utils/check-password-json password
+                                   (->suites-json-record json-pwd-suites)
+                                   auth-config))
   ([password json-pwd-shared-suite json-pwd-user-suite auth-config]
-   (if (and password json-pwd-shared-suite json-pwd-user-suite auth-config)
-     (if-some [checker (.check-json ^AuthPasswords (.passwords ^AuthConfig auth-config))]
-       (checker password json-pwd-shared-suite json-pwd-user-suite)))))
+   (auth-utils/check-password-json password
+                                   json-pwd-shared-suite
+                                   json-pwd-user-suite
+                                   auth-config)))
 
 (defn make-password
   "Creates new password for a user. Specific authentication configuration map must be
   given."
   [password auth-config]
-  (if (and password auth-config)
-    (if-some [encryptor (.encrypt ^AuthPasswords (.passwords ^AuthConfig auth-config))]
-      (encryptor password))))
+  (some-> (auth-utils/make-password password auth-config)
+          ->suites-record))
 
 (defn make-password-json
   "Creates new password for a user in JSON format. Specific authentication
   configuration map must be given."
   [password auth-config]
-  (if (and password auth-config)
-    (if-some [encryptor (.encrypt-json ^AuthPasswords (.passwords ^AuthConfig auth-config))]
-      (encryptor password))))
+  (some-> (auth-utils/make-password-json password auth-config)
+          ->suites-json-record))
 
 ;; Authenticable implementation
 
@@ -247,10 +288,10 @@
 
 (defn make-passwords
   [m]
-  (if (instance? AuthPasswords m) m
-      (apply ->AuthPasswords
-             (map (:passwords m)
-                  [:id :suite :check-fn :check-json-fn :encrypt-fn :encrypt-json-fn :wait-fn]))))
+  (if (instance? AuthPasswords m)
+    m
+    (some-> (auth-utils/make-passwords m)
+            ->auth-passwords-record)))
 
 (defn parse-account-ids
   ([v]
@@ -294,23 +335,31 @@
 
 (defn make-locking
   [m]
-  (if (instance? AuthLocking m) m
-      (->AuthLocking
-       (safe-parse-long (:locking/max-attempts m) 10)
-       ((fnil time/parse-duration [10 :minutes]) (:locking/lock-wait    m))
-       ((fnil time/parse-duration [ 1 :minutes]) (:locking/fail-expires m)))))
+  (if (instance? AuthLocking m)
+    m
+    (some-> (auth-utils/make-locking m)
+            ->auth-locking-record)))
 
 (defn make-auth
   ([m]
    (make-auth nil m))
   ([k m]
-   (if (instance? AuthConfig m) m
-       (map->AuthConfig {:id            (keyword (or (:id m) k))
-                         :db            (db/ds          (:db m))
-                         :passwords     (make-passwords      m)
-                         :account-types (make-account-types  m)
-                         :locking       (make-locking        m)
-                         :confirmation  (make-confirmation   m)}))))
+   (if (instance? AuthConfig m)
+     m
+     (let [m         (or m {})
+           base      (or (auth-utils/make-auth k m) {})
+           id        (keyword (or (:id base) (:id m) k))
+           db-src    (db/ds (or (:db m) (:db base)))
+           passwords (or (some-> (:passwords base) ->auth-passwords-record)
+                         (make-passwords m))
+           locking   (or (some-> (:locking base) ->auth-locking-record)
+                         (make-locking m))]
+       (map->AuthConfig {:id            id
+                         :db            db-src
+                         :passwords     passwords
+                         :account-types (make-account-types m)
+                         :locking       locking
+                         :confirmation  (make-confirmation m)})))))
 
 (defn init-auth
   "Authentication configurator."
@@ -351,7 +400,9 @@
 (defn init-config
   "Prepares authentication settings."
   [config]
-  (let [config (map/update-existing config :db db/ds)
+  (let [config (or config {})
+        config (auth-utils/init-config config)
+        config (map/update-existing config :db db/ds)
         config (update config :types index-by-type (:db config))]
     (-> config
         (assoc :default (get (:types config) (:default-type config)))

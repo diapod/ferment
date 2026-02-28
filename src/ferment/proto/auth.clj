@@ -8,9 +8,7 @@
 
   (:require [ferment] [ferment.types.auth])
   (:import  (ferment     AccountTypes
-                         AuthLocking
                          AuthConfirmation
-                         AuthPasswords
                          AuthConfig
                          AuthSettings)
             (javax.sql   DataSource)

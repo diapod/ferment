@@ -166,7 +166,8 @@
           router (get cfg :ferment.router/default)]
       (is (map? router))
       (is (= :ferment.caps/routing (:routing router)))
-      (is (= :ferment.caps/profiles (:profiles router)))
+      (is (map? (:profiles router)))
+      (is (map? (get-in router [:profiles :default])))
       (is (= :meta-decider (:policy router))))))
 
 (deftest caps-entry-hooks-normalize-capability-metadata

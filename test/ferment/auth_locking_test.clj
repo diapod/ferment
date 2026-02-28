@@ -1,7 +1,7 @@
 (ns ferment.auth-locking-test
   (:require [clojure.test :refer [deftest is testing]]
             [tick.core :as t]
-            [ferment.auth.locking :as locking]))
+            [io.randomseed.utils.auth.locking :as locking]))
 
 (deftest hard-lock-detection
   (testing "hard-locked? is true when hard lock timestamp exists."

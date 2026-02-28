@@ -14,19 +14,19 @@
 
  :ferment.auth.pwd/suite.strong
  [{:name        :scrypt
-   :handler     ferment.auth.algo.scrypt/handler
+   :handler     io.randomseed.utils.auth.algo.scrypt/handler
    :salt-length 8
    :parallel    1}
 
   {:name         :pbkdf2
-   :handler      ferment.auth.algo.pbkdf2/handler
+   :handler      io.randomseed.utils.auth.algo.pbkdf2/handler
    :iterations   100000
    :salt-length  16
    :salt-charset "abcdefghijklmnopqrstuvwzyx0123456789-."}]
 
  :ferment.auth.pwd/suite.simple
  [{:name         :pbkdf2
-   :handler      ferment.auth.algo.pbkdf2/handler
+   :handler      io.randomseed.utils.auth.algo.pbkdf2/handler
    :iterations   100000
    :salt-length  16
    :salt-charset "abcdefghijklmnopqrstuvwzyxABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-."}]

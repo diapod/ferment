@@ -9,12 +9,10 @@
   (:require [clojure.string :as str]
             [tick.core :as t]
             [ferment.auth :as auth]
-            [ferment.auth.locking :as locking]
+            [io.randomseed.utils.auth.locking :as locking]
             [ferment.db :as db]
             [ferment.session :as session]
-            [ferment.user :as user])
-
-  (:import (ferment AuthConfig)))
+            [ferment.user :as user]))
 
 (def ^:private login-select-prefix
   (str "SELECT users.id AS id, users.email AS email, users.account_type AS account_type,"
@@ -66,11 +64,10 @@
 
 (defn- wait-no-user!
   [auth-config]
-  (when (instance? AuthConfig auth-config)
-    (when-some [wait-fn (some-> ^AuthConfig auth-config :passwords :wait)]
-      (try
-        (wait-fn false)
-        (catch Throwable _ nil)))))
+  (when-some [wait-fn (some-> auth-config :passwords :wait)]
+    (try
+      (wait-fn false)
+      (catch Throwable _ nil))))
 
 (defn- login-row->data
   [row]

@@ -27,7 +27,11 @@
            io.randomseed/smangler               {:mvn/version "1.0.4"}        ;; fast string trimming
            io.randomseed/bankster               {:mvn/version "2.2.4"}        ;; currency and money
            io.randomseed/phone-number           {:mvn/version "8.13.6-3"}     ;; phone number validation
-           io.randomseed/utils                  {:mvn/version "2.0.5"}        ;; random utilities
+           io.randomseed/utils                  {:mvn/version "2.0.6"}        ;; random utilities
+           io.randomseed/utils-core             {:mvn/version "2.0.6"}        ;; random utilities (core)
+           io.randomseed/utils-crypto           {:mvn/version "2.0.6"}        ;; random utilities (crypto)
+           io.randomseed/utils-time             {:mvn/version "2.0.6"}        ;; random utilities (time)
+           io.randomseed/utils-auth             {:mvn/version "2.0.6"}        ;; random utilities (auth)
            crypto-equality/crypto-equality      {:mvn/version "1.0.0"}        ;; avoiding timing attacks when comparing
            com.lambdaworks/scrypt               {:mvn/version "1.4.0"}        ;; password encryption
            dev.weavejester/ragtime              {:mvn/version "0.12.1"}       ;; database migrations
