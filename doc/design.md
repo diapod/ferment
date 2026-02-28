@@ -145,6 +145,47 @@ Profile convention:
 Practical objective:
 - keep a clear layered configuration model (`common` + `local`, `prod` + environment overlay), with deterministic file loading (non-recursive scan + source-order deduplication) and no divergence between app and shell scripts.
 
+### 6.2. `/v1/act` Middleware Contract (data-first pipeline)
+
+`/v1/act` is executed through a compiled middleware chain configured under `:ferment.http/default :act/middleware`.
+
+Middleware module contract:
+
+```clojure
+{:name :act.middleware/some-stage
+ :compile (fn [runtime opts]
+            (fn [next]
+              (fn [ctx]
+                ;; transform ctx and call next
+                (next ctx))))}
+```
+
+- `:name` must be a keyword.
+- `:compile` must return a handler wrapper (`handler -> handler`).
+- Runtime validates module shape and fails fast on invalid modules.
+
+Canonical chain (default):
+- `:act.middleware/prepare`
+- `:act.middleware/route`
+- `:act.middleware/execute`
+- `:act.middleware/finalize`
+
+Execution context (`ctx`) is a map. Important keys:
+- input keys: `:runtime`, `:payload`, `:auth`
+- shared helpers: `:act/fns`
+- output keys expected by `invoke-act`: `:response`, optional telemetry keys (`:route-telemetry`, `:cache/telemetry`), and `:request*` for audit/report.
+
+Required helper functions in `:act/fns`:
+- `:prepare-request`
+- `:accepted-mode?`
+- `:effective-resolver`
+- `:route-phase`
+- `:execute-phase`
+- `:finalize-phase`
+
+If middleware is configured in `http.edn`, it is compiled once during HTTP service startup and stored in runtime (`:act/pipeline`).
+If no middleware is configured, runtime falls back to canonical default modules.
+
 ## 7. Data Contracts (v1)
 
 ### 7.1. Input

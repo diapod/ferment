@@ -458,3 +458,58 @@
       (is (= {:nodes [{:op :emit
                        :input "gotowe"}]}
              (contracts/materialize-plan plan bindings))))))
+
+(deftest queue-job-accepted-contract-validation
+  (testing "Accepted queue payload requires canonical queued shape."
+    (let [ok {:job/id "job/1"
+              :job/status :queued
+              :submitted-at "2026-02-28T10:00:00Z"
+              :updated-at "2026-02-28T10:00:00Z"
+              :queue/class :interactive
+              :attempt 0}
+          bad-status (assoc ok :job/status :running)
+          bad-time (assoc ok :submitted-at "soon")
+          bad-unknown (assoc ok :foo "bar")]
+      (is (:ok? (contracts/validate-queue-job-accepted ok)))
+      (is (= :queue/job-accepted-status-not-queued
+             (:reason (contracts/validate-queue-job-accepted bad-status))))
+      (is (= :queue/job-submitted-at-invalid
+             (:reason (contracts/validate-queue-job-accepted bad-time))))
+      (is (= :queue/job-accepted-unknown-keys
+             (:reason (contracts/validate-queue-job-accepted bad-unknown)))))))
+
+(deftest queue-job-status-contract-validation
+  (testing "Queue status payload validates lifecycle-dependent timestamps."
+    (let [running-ok {:job/id "job/2"
+                      :job/status :running
+                      :submitted-at "2026-02-28T10:00:00Z"
+                      :updated-at "2026-02-28T10:00:05Z"
+                      :started-at "2026-02-28T10:00:01Z"
+                      :attempt 1}
+          running-bad (dissoc running-ok :started-at)
+          done-ok {:job/id "job/2"
+                   :job/status :completed
+                   :submitted-at "2026-02-28T10:00:00Z"
+                   :updated-at "2026-02-28T10:00:06Z"
+                   :completed-at "2026-02-28T10:00:06Z"}
+          done-bad (dissoc done-ok :completed-at)]
+      (is (:ok? (contracts/validate-queue-job-status running-ok)))
+      (is (= :queue/job-started-at-invalid
+             (:reason (contracts/validate-queue-job-status running-bad))))
+      (is (:ok? (contracts/validate-queue-job-status done-ok)))
+      (is (= :queue/job-completed-at-invalid
+             (:reason (contracts/validate-queue-job-status done-bad)))))))
+
+(deftest queue-job-cancel-contract-validation
+  (testing "Cancel response requires boolean accepted flag and canceled status when accepted."
+    (let [ok {:job/id "job/3"
+              :job/status :canceled
+              :cancel/accepted? true
+              :updated-at "2026-02-28T10:00:10Z"}
+          bad-accepted (assoc ok :cancel/accepted? "yes")
+          bad-status (assoc ok :job/status :running)]
+      (is (:ok? (contracts/validate-queue-job-cancel ok)))
+      (is (= :queue/job-cancel-accepted-not-boolean
+             (:reason (contracts/validate-queue-job-cancel bad-accepted))))
+      (is (= :queue/job-cancel-accepted-status-not-canceled
+             (:reason (contracts/validate-queue-job-cancel bad-status)))))))

@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [ferment.core :as core]
             [ferment.http :as http]
+            [ferment.queue :as queue]
             [ferment.telemetry :as telemetry]))
 
 (deftest invoke-act-injects-auth-principal-into-core-options
@@ -42,6 +43,37 @@
       (is (= #{:role/operator :role/reviewer}
              (set (get-in @seen [:session/meta :user/roles]))))
       (is (= (:roles runtime) (:roles @seen))))))
+
+(deftest invoke-act-uses-configured-middleware-chain
+  (testing "invoke-act may run through configured act middleware chain compiled from data modules."
+    (let [called (atom 0)
+          custom-module {:name :test/act-shortcut
+                         :compile (fn [_runtime _opts]
+                                    (fn [_next]
+                                      (fn [ctx]
+                                        (assoc ctx
+                                               :request* {:trace {:id "mw-1"}}
+                                               :response {:status 200
+                                                          :body {:proto 1
+                                                                 :trace {:id "mw-1"}
+                                                                 :result {:type :value
+                                                                          :out {:text "middleware-ok"}}}}))))}
+          runtime {:protocol {}
+                   :resolver {}
+                   :act/middleware [custom-module]}
+          payload {:proto 1
+                   :trace {:id "mw-1"}
+                   :task {:intent :text/respond}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver _opts]
+                                   (swap! called inc)
+                                   {:result {:type :value
+                                             :out {:text "core"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= "middleware-ok" (get-in response [:body :result :out :text])))
+      (is (zero? @called)))))
 
 (deftest invoke-act-derives-role-from-resolver-config
   (testing "invoke-act derives execution role from resolver capability/routing maps (not hardcoded HTTP table)."
@@ -145,6 +177,64 @@
           (is (= :pl (get-in @seen [:constraints :language])))
           (is (= "acid" (get-in @seen [:context :topic]))))))))
 
+(deftest invoke-act-session-defaults-arity-adapter-learns-once
+  (testing "Session defaults adapter may fall back to 2-arity get-vars! once and reuse learned arity on next calls."
+    (let [cache (var-get #'ferment.http/session-get-vars-invokers)
+          counts (atom {:two 0 :three 0})
+          seen (atom nil)]
+      (reset! cache {:entries {} :order []})
+      (let [get-vars-fn (fn
+                          ([sid ks]
+                           (swap! counts update :two inc)
+                           (is (= "sess-ctx-arity-1" sid))
+                           (is (= #{:request/topic} (set ks)))
+                           {:request/topic "acid"})
+                          ([sid ks _opts]
+                           (swap! counts update :three inc)
+                           (throw (clojure.lang.ArityException. 3 "get-vars-fn"))))
+            runtime {:protocol {}
+                     :resolver {}
+                     :session {:store {:session-vars/contract
+                                       {:request/default-bindings
+                                        {:request/topic {:target [:context :topic]
+                                                         :coerce :trimmed-string}}}}
+                               :get-vars! get-vars-fn}}
+            payload {:proto 1
+                     :trace {:id "t-session-defaults-arity-1"}
+                     :session/id "sess-ctx-arity-1"
+                     :task {:intent :text/respond
+                            :cap/id :llm/voice}
+                     :input {:prompt "hej"}}]
+        (with-redefs [core/call-capability
+                      (fn [_runtime _resolver opts]
+                        (reset! seen opts)
+                        {:result {:type :value
+                                  :out {:text "ok"}}})]
+          (is (= 200 (:status (http/invoke-act runtime payload nil nil))))
+          (is (= "acid" (get-in @seen [:context :topic])))
+          (is (= 200 (:status (http/invoke-act runtime
+                                               (assoc payload :trace {:id "t-session-defaults-arity-2"})
+                                               nil
+                                               nil)))))
+        (is (= 1 (:three @counts)))
+        (is (= 2 (:two @counts)))
+        (is (= 1 (count (:entries @cache))))))))
+
+(deftest invoke-act-session-defaults-invoker-cache-is-bounded
+  (testing "Invoker cache uses bounded size and evicts oldest entries under high churn."
+    (let [cache (var-get #'ferment.http/session-get-vars-invokers)
+          max-size (var-get #'ferment.http/session-get-vars-invokers-max-size)]
+      (reset! cache {:entries {} :order []})
+      (dotimes [_ (+ max-size 32)]
+        (let [service {:get-vars! (fn
+                                    ([sid ks] {})
+                                    ([sid ks opts] {}))}]
+          (#'ferment.http/session-get-vars-invoker service)))
+      (is (= (count (:entries @cache))
+             (count (:order @cache))))
+      (is (<= (count (:entries @cache))
+              max-size)))))
+
 (deftest invoke-act-maps-forbidden-effect-to-403
   (testing "auth/forbidden-effect error from workflow/core is exposed as HTTP 403 envelope."
     (let [runtime {:roles {:enabled? true
@@ -243,6 +333,87 @@
       (is (= :stream (:response/type @seen)))
       (is (= :stream (get-in response [:body :result :type])))
       (is (= "czesc" (get-in response [:body :result :stream 0 :text]))))))
+
+(deftest invoke-act-accepted-submits-async-job
+  (testing "response/type=accepted enqueues job and returns 202 accepted envelope without invoking core runtime."
+    (let [calls (atom 0)
+          runtime {:protocol {}
+                   :resolver {}
+                   :queue/service (queue/init-service {:enabled? true
+                                                       :max-size 8})}
+          payload {:proto 1
+                   :trace {:id "t-accepted-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :response/type :accepted
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [& _]
+                                   (swap! calls inc)
+                                   {:result {:type :value
+                                             :out {:text "nope"}}})]
+                     (http/invoke-act runtime payload nil nil))
+          out (get-in response [:body :result :out])]
+      (is (= 202 (:status response)))
+      (is (= :accepted (get-in response [:body :response/type])))
+      (is (= :value (get-in response [:body :result :type])))
+      (is (= :queued (:job/status out)))
+      (is (string? (:job/id out)))
+      (is (zero? @calls)))))
+
+(deftest invoke-act-accepted-maps-queue-full-to-overload
+  (testing "When async queue is full, invoke-act returns deterministic overload error."
+    (let [runtime {:protocol {}
+                   :resolver {}
+                   :queue/service (queue/init-service {:enabled? true
+                                                       :max-size 1})}
+          payload {:proto 1
+                   :trace {:id "t-accepted-full-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :response/type :accepted
+                   :input {:prompt "hej"}}]
+      (is (= 202 (:status (http/invoke-act runtime payload nil nil))))
+      (let [response (http/invoke-act runtime
+                                      (assoc payload :trace {:id "t-accepted-full-2"})
+                                      nil
+                                      nil)]
+        (is (= 503 (:status response)))
+        (is (= :runtime/overloaded (get-in response [:body :error :type])))
+        (is (= :queue/full (get-in response [:body :error :details :error])))))))
+
+(deftest queue-job-status-response-returns-canonical-payload
+  (testing "Queue job status endpoint response returns canonical payload for existing and missing jobs."
+    (let [service (queue/init-service {:enabled? true
+                                       :max-size 8})
+          runtime {:queue/service service}
+          submit (queue/submit! service {:task {:intent :text/respond}
+                                         :input {:prompt "hej"}})
+          job-id (get-in submit [:job :job/id])
+          existing (#'ferment.http/queue-job-status-response runtime {:trace {:id "q-status-1"}} job-id)
+          missing (#'ferment.http/queue-job-status-response runtime {:trace {:id "q-status-2"}} "job/404")]
+      (is (= 200 (:status existing)))
+      (is (= job-id (get-in existing [:body :result :out :job/id])))
+      (is (= :queued (get-in existing [:body :result :out :job/status])))
+      (is (= 404 (:status missing)))
+      (is (= :queue/job-not-found (get-in missing [:body :error :type]))))))
+
+(deftest queue-job-cancel-response-handles-accepted-and-rejected-cancel
+  (testing "Cancel endpoint returns accepted=true on first cancel and accepted=false on repeated cancel."
+    (let [service (queue/init-service {:enabled? true
+                                       :max-size 8})
+          runtime {:queue/service service}
+          submit (queue/submit! service {:task {:intent :text/respond}
+                                         :input {:prompt "hej"}})
+          job-id (get-in submit [:job :job/id])
+          first-cancel (#'ferment.http/queue-job-cancel-response runtime {:trace {:id "q-cancel-1"}} job-id :user-request)
+          second-cancel (#'ferment.http/queue-job-cancel-response runtime {:trace {:id "q-cancel-2"}} job-id :user-request)]
+      (is (= 200 (:status first-cancel)))
+      (is (= true (get-in first-cancel [:body :result :out :cancel/accepted?])))
+      (is (= :canceled (get-in first-cancel [:body :result :out :job/status])))
+      (is (= 200 (:status second-cancel)))
+      (is (= false (get-in second-cancel [:body :result :out :cancel/accepted?])))
+      (is (= :canceled (get-in second-cancel [:body :result :out :job/status]))))))
 
 (deftest invoke-act-meta-routing-overrides-capability-when-decision-is-valid
   (testing "invoke-act runs route/decide first and uses decided :cap/id for the main call."

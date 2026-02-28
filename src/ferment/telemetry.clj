@@ -150,3 +150,165 @@
            :components {}
            :max-events default-lifecycle-max-events})
   nil)
+
+(def ^:private default-queue-max-events
+  512)
+
+(def ^:private queue-wait-buckets
+  [{:limit-ms 100 :bucket :<=100ms}
+   {:limit-ms 500 :bucket :<=500ms}
+   {:limit-ms 1000 :bucket :<=1s}
+   {:limit-ms 5000 :bucket :<=5s}
+   {:limit-ms 15000 :bucket :<=15s}])
+
+(defonce ^:private queue-state
+  (atom {:seq 0
+         :events []
+         :max-events default-queue-max-events
+         :counters {:jobs/submitted 0
+                    :jobs/started 0
+                    :jobs/completed 0
+                    :jobs/failed 0
+                    :jobs/canceled 0
+                    :jobs/expired 0}
+         :wait-time-ms {:count 0
+                        :sum 0.0
+                        :max 0.0
+                        :buckets {}}
+         :depth {:last 0
+                 :max 0}}))
+
+(defn- queue-transition
+  [v]
+  (cond
+    (keyword? v) v
+    (string? v) (some-> v str str/trim not-empty keyword)
+    :else nil))
+
+(defn- queue-depth
+  [v]
+  (when (number? v)
+    (max 0 (long (Math/floor (double v))))))
+
+(defn- queue-wait-ms
+  [v]
+  (when (number? v)
+    (max 0.0 (double v))))
+
+(defn- queue-wait-bucket
+  [wait-ms]
+  (or (some (fn [{:keys [limit-ms bucket]}]
+              (when (<= wait-ms (double limit-ms))
+                bucket))
+            queue-wait-buckets)
+      :>15s))
+
+(defn- queue-counter-key
+  [transition]
+  (case transition
+    :queued :jobs/submitted
+    :running :jobs/started
+    :completed :jobs/completed
+    :failed :jobs/failed
+    :canceled :jobs/canceled
+    :expired :jobs/expired
+    nil))
+
+(defn record-queue-transition!
+  "Records queue lifecycle transition and updates queue counters.
+
+  Supported details keys:
+  - `:job/id` (string)
+  - `:queue/depth` (non-negative number)
+  - `:wait-time-ms` (non-negative number, usually for `:running`)
+  - `:count` (positive integer, batched transitions)"
+  ([transition]
+   (record-queue-transition! transition nil))
+  ([transition details]
+   (let [transition' (queue-transition transition)
+         details' (if (map? details) details {})
+         count' (let [n (:count details')]
+                  (if (and (integer? n) (pos? n))
+                    (long n)
+                    1))
+         depth' (queue-depth (:queue/depth details'))
+         wait-ms' (queue-wait-ms (:wait-time-ms details'))
+         counter-k (queue-counter-key transition')
+         max-events (long (or (:max-events @queue-state)
+                              default-queue-max-events))]
+     (swap! queue-state
+            (fn [state]
+              (let [seq' (inc (long (or (:seq state) 0)))
+                    event (cond-> {:seq seq'
+                                   :at (str (Instant/now))
+                                   :transition (or transition' :unknown)
+                                   :count count'}
+                            (some? (:job/id details')) (assoc :job/id (:job/id details'))
+                            (number? depth') (assoc :queue/depth depth')
+                            (number? wait-ms') (assoc :wait-time-ms wait-ms'))
+                    events' (let [events0 (conj (vec (or (:events state) [])) event)
+                                  overflow (max 0 (- (count events0) (int max-events)))]
+                              (if (pos? overflow)
+                                (subvec events0 overflow)
+                                events0))
+                    state' (cond-> (assoc state
+                                          :seq seq'
+                                          :events events'
+                                          :max-events max-events)
+                             (keyword? counter-k)
+                             (update-in [:counters counter-k] (fnil + 0) count')
+
+                             (number? depth')
+                             (assoc-in [:depth :last] depth')
+
+                             (number? depth')
+                             (update-in [:depth :max] (fnil max 0) depth')
+
+                             (number? wait-ms')
+                             (update-in [:wait-time-ms :count] (fnil + 0) count')
+
+                             (number? wait-ms')
+                             (update-in [:wait-time-ms :sum] (fnil + 0.0) (* wait-ms' count'))
+
+                             (number? wait-ms')
+                             (update-in [:wait-time-ms :max] (fnil max 0.0) wait-ms')
+
+                             (number? wait-ms')
+                             (update-in [:wait-time-ms :buckets (queue-wait-bucket wait-ms')] (fnil + 0) count'))]
+                state'))))
+   nil))
+
+(defn queue-snapshot
+  "Returns queue telemetry snapshot."
+  []
+  (let [state @queue-state
+        wait-count (long (or (get-in state [:wait-time-ms :count]) 0))
+        wait-sum (double (or (get-in state [:wait-time-ms :sum]) 0.0))
+        wait-avg (if (pos? wait-count) (/ wait-sum wait-count) 0.0)]
+    {:counters (or (:counters state) {})
+     :depth (or (:depth state) {:last 0 :max 0})
+     :wait-time-ms (assoc (or (:wait-time-ms state) {})
+                          :avg wait-avg)
+     :events (vec (or (:events state) []))
+     :max-events (long (or (:max-events state) default-queue-max-events))}))
+
+(defn clear-queue!
+  "Clears global queue telemetry registry."
+  []
+  (reset! queue-state
+          {:seq 0
+           :events []
+           :max-events default-queue-max-events
+           :counters {:jobs/submitted 0
+                      :jobs/started 0
+                      :jobs/completed 0
+                      :jobs/failed 0
+                      :jobs/canceled 0
+                      :jobs/expired 0}
+           :wait-time-ms {:count 0
+                          :sum 0.0
+                          :max 0.0
+                          :buckets {}}
+           :depth {:last 0
+                   :max 0}})
+  nil)

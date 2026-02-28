@@ -88,6 +88,17 @@ Optional `/v1/act` response cache is configured in `resources/config/common/prod
 - `:ttl-ms`
 - `:max-size`
 
+Optional `/v1/act` middleware chain is configured in `resources/config/common/prod/http.edn` under `:act/middleware`:
+- each entry is a `#ref` to a middleware module key,
+- each middleware module must resolve to a map with `:name` and `:compile`,
+- chain is compiled at HTTP startup (`:ferment.http/default`) and then used for every `/v1/act` request.
+
+Default chain in production config:
+- `#ref :ferment.http.act.middleware/prepare`
+- `#ref :ferment.http.act.middleware/route`
+- `#ref :ferment.http.act.middleware/execute`
+- `#ref :ferment.http.act.middleware/finalize`
+
 Prompt tuning source of truth:
 - `resources/config/common/prod/protocol.edn`
   - `:prompts/:default`

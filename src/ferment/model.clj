@@ -1724,6 +1724,65 @@
                                    :reset-response response})))))
             (swap! registry assoc model-k sid')))))))
 
+(defn- invoke-model-plan
+  [runtime model-id opts]
+  (let [opts'   (if (map? opts) opts {})
+        model-k (normalize-model-key model-id)
+        sid     (normalize-runtime-session-id (or (:session/id opts')
+                                                  (:session-id opts')))]
+    (expire-session-workers! runtime)
+    (let [session-entry (when sid
+                          (ensure-session-worker! runtime model-k sid))
+          worker-state  (or (:worker-state session-entry)
+                            (some-> (model-entry runtime model-k) :runtime))
+          worker        (some-> worker-state :worker)]
+      {:model-k model-k
+       :session/id sid
+       :session-entry session-entry
+       :worker-state worker-state
+       :worker worker})))
+
+(defn- invoke-worker-once
+  [runtime model-k sid worker-state worker payload]
+  (when worker
+    (try
+      (maybe-reset-shared-worker-for-session! runtime model-k sid worker-state)
+      (command-bot-worker! worker :invoke payload)
+      (catch Throwable t
+        {:ok? false
+         :error :invoke-failed
+         :message (.getMessage t)
+         :details (merge {:error :runtime-session-reset-failed}
+                         (when (instance? clojure.lang.ExceptionInfo t)
+                           (select-keys (ex-data t)
+                                        [:error
+                                         :model
+                                         :previous-session/id
+                                         :session/id
+                                         :reset-response])))}))))
+
+(defn- restart-session-worker-and-invoke
+  [runtime model-k sid payload]
+  (drop-session-worker! runtime model-k sid :session/restart)
+  (when-some [retry-entry (ensure-session-worker! runtime model-k sid)]
+    (when-some [retry-worker (some-> retry-entry :worker-state :worker)]
+      (command-bot-worker! retry-worker :invoke payload))))
+
+(defn- invoke-model-with-recovery
+  [runtime {:keys [model-k worker-state worker] :as plan} payload]
+  (let [sid (:session/id plan)
+        response0 (invoke-worker-once runtime model-k sid worker-state worker payload)]
+    (if (and sid (restartable-invoke-error? response0))
+      (restart-session-worker-and-invoke runtime model-k sid payload)
+      response0)))
+
+(defn- touch-invocation-session!
+  [runtime model-k sid response]
+  (when (and sid (some? response))
+    (touch-runtime-session! runtime sid model-k)
+    (when-some [registry (runtime-session-registry runtime)]
+      (touch-session-entry! registry model-k sid))))
+
 (defn invoke-model!
   "Invokes model runtime worker with optional session-aware worker lifecycle.
 
@@ -1732,44 +1791,11 @@
   ([runtime model-id payload]
    (invoke-model! runtime model-id payload nil))
   ([runtime model-id payload opts]
-   (let [opts'    (if (map? opts) opts {})
-         model-k  (normalize-model-key model-id)
-         sid      (normalize-runtime-session-id (or (:session/id opts')
-                                                   (:session-id opts')))
-         _        (expire-session-workers! runtime)
-         session-entry (when sid (ensure-session-worker! runtime model-k sid))
-         worker-state  (or (:worker-state session-entry)
-                           (some-> (model-entry runtime model-k) :runtime))
-         worker        (some-> worker-state :worker)
-         invoke!       (fn [wrk]
-                         (when wrk
-                           (command-bot-worker! wrk :invoke payload)))
-         response0     (when worker
-                         (try
-                           (maybe-reset-shared-worker-for-session! runtime model-k sid worker-state)
-                           (invoke! worker)
-                           (catch Throwable t
-                             {:ok? false
-                              :error :invoke-failed
-                              :message (.getMessage t)
-                              :details (merge {:error :runtime-session-reset-failed}
-                                              (when (instance? clojure.lang.ExceptionInfo t)
-                                                (select-keys (ex-data t)
-                                                             [:error
-                                                              :model
-                                                              :previous-session/id
-                                                              :session/id
-                                                              :reset-response])))})))
-         response      (if (and sid (restartable-invoke-error? response0))
-                         (do
-                           (drop-session-worker! runtime model-k sid :session/restart)
-                           (when-some [retry-entry (ensure-session-worker! runtime model-k sid)]
-                             (invoke! (some-> retry-entry :worker-state :worker))))
-                         response0)]
-     (when (and sid (some? response))
-       (touch-runtime-session! runtime sid model-k)
-       (when-some [registry (runtime-session-registry runtime)]
-         (touch-session-entry! registry model-k sid)))
+   (let [{:keys [model-k] :as plan}
+         (invoke-model-plan runtime model-id opts)
+         sid (:session/id plan)
+         response (invoke-model-with-recovery runtime plan payload)]
+     (touch-invocation-session! runtime model-k sid response)
      response)))
 
 (defn model-id

@@ -118,7 +118,6 @@
                                               :temperature    0.0}
                                 :system      ["You are CODER generating code."
                                               "Generate idiomatic solutions"
-                                              "(prefer Clojure unless context says otherwise)."
                                               "Be concrete and avoid filler."
                                               "Use English for developer-facing output"
                                               "unless constraints require otherwise."

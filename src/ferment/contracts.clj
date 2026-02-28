@@ -68,6 +68,14 @@
   [v]
   (boolean (trim-s v)))
 
+(defn- instant-string?
+  [v]
+  (try
+    (when (nonblank-string? v)
+      (java.time.Instant/parse (str v))
+      true)
+    (catch Throwable _ false)))
+
 (defn- contains-nonblank-string?
   [m ks]
   (boolean
@@ -183,6 +191,159 @@
   [v]
   (map? v))
 
+(def queue-job-statuses
+  #{:queued :running :completed :failed :canceled :expired})
+
+(def queue-terminal-statuses
+  #{:completed :failed :canceled :expired})
+
+(def ^:private queue-job-accepted-keys
+  #{:job/id :job/status :submitted-at :updated-at :deadline-at :queue/class :attempt})
+
+(def ^:private queue-job-status-keys
+  #{:job/id :job/status :submitted-at :updated-at :started-at :completed-at
+    :deadline-at :queue/class :attempt :result :error :cancel/reason})
+
+(def ^:private queue-job-cancel-keys
+  #{:job/id :job/status :cancel/accepted? :updated-at})
+
+(defn validate-queue-job-accepted
+  "Validates canonical accepted job payload."
+  [payload]
+  (let [unknown (when (map? payload)
+                  (seq (remove queue-job-accepted-keys (keys payload))))]
+    (cond
+      (not (map? payload))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-accepted-not-map}
+
+      (seq unknown)
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-accepted-unknown-keys
+       :unknown (vec (sort-by str unknown))}
+
+      (not (nonblank-string? (:job/id payload)))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-id-invalid}
+
+      (not= :queued (keywordish (:job/status payload)))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-accepted-status-not-queued}
+
+      (not (instant-string? (:submitted-at payload)))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-submitted-at-invalid}
+
+      (not (instant-string? (:updated-at payload)))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-updated-at-invalid}
+
+      (and (contains? payload :deadline-at)
+           (not (or (nil? (:deadline-at payload))
+                    (instant-string? (:deadline-at payload)))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-deadline-at-invalid}
+
+      (and (contains? payload :queue/class)
+           (not (keyword? (:queue/class payload))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-class-not-keyword}
+
+      (and (contains? payload :attempt)
+           (not (and (integer? (:attempt payload)) (<= 0 (:attempt payload)))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-attempt-not-nonneg-int}
+
+      :else
+      {:ok? true})))
+
+(defn validate-queue-job-status
+  "Validates canonical job status payload."
+  [payload]
+  (let [unknown (when (map? payload)
+                  (seq (remove queue-job-status-keys (keys payload))))
+        status  (keywordish (:job/status payload))]
+    (cond
+      (not (map? payload))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-status-not-map}
+
+      (seq unknown)
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-status-unknown-keys
+       :unknown (vec (sort-by str unknown))}
+
+      (not (nonblank-string? (:job/id payload)))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-id-invalid}
+
+      (not (contains? queue-job-statuses status))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-status-invalid}
+
+      (not (instant-string? (:submitted-at payload)))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-submitted-at-invalid}
+
+      (not (instant-string? (:updated-at payload)))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-updated-at-invalid}
+
+      (and (= :running status)
+           (not (instant-string? (:started-at payload))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-started-at-invalid}
+
+      (and (contains? queue-terminal-statuses status)
+           (not (instant-string? (:completed-at payload))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-completed-at-invalid}
+
+      (and (contains? payload :deadline-at)
+           (not (or (nil? (:deadline-at payload))
+                    (instant-string? (:deadline-at payload)))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-deadline-at-invalid}
+
+      (and (contains? payload :queue/class)
+           (not (keyword? (:queue/class payload))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-class-not-keyword}
+
+      (and (contains? payload :attempt)
+           (not (and (integer? (:attempt payload)) (<= 0 (:attempt payload)))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-attempt-not-nonneg-int}
+
+      :else
+      {:ok? true})))
+
+(defn validate-queue-job-cancel
+  "Validates canonical cancel response payload."
+  [payload]
+  (let [unknown (when (map? payload)
+                  (seq (remove queue-job-cancel-keys (keys payload))))
+        status  (keywordish (:job/status payload))
+        accepted? (:cancel/accepted? payload)]
+    (cond
+      (not (map? payload))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-cancel-not-map}
+
+      (seq unknown)
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-cancel-unknown-keys
+       :unknown (vec (sort-by str unknown))}
+
+      (not (nonblank-string? (:job/id payload)))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-id-invalid}
+
+      (not (contains? queue-job-statuses status))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-status-invalid}
+
+      (not (boolean? accepted?))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-cancel-accepted-not-boolean}
+
+      (and accepted? (not= :canceled status))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-cancel-accepted-status-not-canceled}
+
+      (and (contains? payload :updated-at)
+           (not (instant-string? (:updated-at payload))))
+      {:ok? false :error :invalid-queue-payload :reason :queue/job-updated-at-invalid}
+
+      :else
+      {:ok? true})))
+
+(defn- queue-job-accepted?
+  [v]
+  (:ok? (validate-queue-job-accepted v)))
+
+(defn- queue-job-status?
+  [v]
+  (:ok? (validate-queue-job-status v)))
+
+(defn- queue-job-cancel?
+  [v]
+  (:ok? (validate-queue-job-cancel v)))
+
 (s/def :req/any map?)
 (s/def :req/route req-route?)
 (s/def :req/context req-context?)
@@ -203,6 +364,9 @@
 (s/def :res/review res-review?)
 (s/def :res/eval res-eval?)
 (s/def :res/meta res-meta?)
+(s/def :res/job-accepted queue-job-accepted?)
+(s/def :res/job-status queue-job-status?)
+(s/def :res/job-cancel queue-job-cancel?)
 
 (defn normalize-requires
   "Normalizes `:task/:requires` map into canonical keyword-based shape."
@@ -332,7 +496,10 @@
    :res/explanation     :res/explanation
    :res/review          :res/review
    :res/eval            :res/eval
-   :res/meta            :res/meta})
+   :res/meta            :res/meta
+   :res/job-accepted    :res/job-accepted
+   :res/job-status      :res/job-status
+   :res/job-cancel      :res/job-cancel})
 
 (defn- validate-schema-by-spec
   [spec-kw value]

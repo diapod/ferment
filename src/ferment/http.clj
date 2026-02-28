@@ -15,8 +15,13 @@
             [ferment.contracts :as contracts]
             [ferment.core :as core]
             [ferment.memory :as memory]
+            [ferment.middleware.act.execute :as act-middleware-execute]
+            [ferment.middleware.act.finalize :as act-middleware-finalize]
+            [ferment.middleware.act.prepare :as act-middleware-prepare]
+            [ferment.middleware.act.route :as act-middleware-route]
             [ferment.middleware.remote-ip :as remote-ip]
             [ferment.oplog :as oplog]
+            [ferment.queue :as queue]
             [ferment.roles :as roles]
             [ferment.router :as router]
             [ferment.system :as system]
@@ -26,7 +31,7 @@
 
   (:import (com.sun.net.httpserver HttpExchange HttpHandler HttpServer)
     (java.io OutputStream)
-    (java.net InetSocketAddress)
+    (java.net InetSocketAddress URLDecoder)
     (java.nio.charset StandardCharsets)
     (java.util Base64 Base64$Decoder)
     (java.util.concurrent ExecutorService Executors ThreadFactory TimeUnit)
@@ -170,116 +175,121 @@
              (some? retryable?) (assoc :retryable? (boolean retryable?))
              (map? details) (assoc :details details))}))
 
+(defn- coerce-keyword-coll
+  [v]
+  (cond
+    (nil? v)        nil
+    (set? v)        (into #{} (keep keywordish) v)
+    (sequential? v) (into [] (keep keywordish) v)
+    :else           v))
+
+(defn- coerce-bool
+  [v]
+  (cond
+    (boolean? v) v
+    (number? v)  (not (zero? (long v)))
+    (string? v)  (contains? #{"1" "true" "yes" "on"}
+                            (-> v str/trim str/lower-case))
+    (nil? v)     nil
+    :else        (boolean v)))
+
+(defn- coerce-int
+  [v default]
+  (cond
+    (integer? v) (int v)
+    (number? v)  (int (Math/round (double v)))
+    (string? v)  (try
+                   (Integer/parseInt (str/trim v))
+                   (catch Throwable _ default))
+    :else        default))
+
+(defn- normalize-act-routing
+  [routing]
+  (let [routing'    (if (map? routing) routing {})
+        intent      (keywordish (:intent routing'))
+        cap-id      (keywordish (:cap/id routing'))
+        profile     (keywordish (:profile routing'))
+        meta?       (coerce-bool (:meta? routing'))
+        strict?     (coerce-bool (:strict? routing'))
+        force?      (coerce-bool (:force? routing'))
+        on-error    (keywordish (:on-error routing'))
+        debug-plan? (coerce-bool (or (:debug/plan? routing')
+                                     (:debug-plan? routing')
+                                     (get-in routing' [:debug :plan?])))
+        debug-transcript? (coerce-bool (or (:debug/transcript? routing')
+                                           (:debug-transcript? routing')
+                                           (get-in routing' [:debug :transcript?])))]
+    (cond-> routing'
+      (keyword? intent)                               (assoc :intent intent)
+      (keyword? cap-id)                               (assoc :cap/id cap-id)
+      (keyword? profile)                              (assoc :profile profile)
+      (some? meta?)                                   (assoc :meta? meta?)
+      (some? strict?)                                 (assoc :strict? strict?)
+      (some? force?)                                  (assoc :force? force?)
+      (contains? #{:fail-open :fail-closed} on-error) (assoc :on-error on-error)
+      (some? debug-plan?)                             (assoc :debug/plan? debug-plan?)
+      (some? debug-transcript?)                       (assoc :debug/transcript? debug-transcript?))))
+
+(defn- normalize-act-top
+  [request]
+  (let [intent        (or (some-> request :task :intent keywordish)
+                          (some-> request :intent keywordish))
+        cap-id        (or (some-> request :task :cap/id keywordish)
+                          (some-> request :cap/id keywordish))
+        requires      (contracts/normalize-requires
+                       (or (get-in request [:task :requires])
+                           (:requires request)))
+        role          (keywordish (:role request))
+        response-type (or (some-> request :response/type keywordish)
+                          (some-> request :response :type keywordish))
+        stream?       (or (coerce-bool (:stream? request))
+                          (coerce-bool (get-in request [:response :stream?])))]
+    (cond-> request
+      (keyword? intent)          (assoc-in [:task :intent] intent)
+      (keyword? cap-id)          (assoc-in [:task :cap/id] cap-id)
+      (map? requires)            (assoc-in [:task :requires] requires)
+      (keyword? role)            (assoc :role role)
+      (keyword? response-type)   (assoc :response/type response-type)
+      (some? stream?)            (assoc :stream? stream?)
+      (contains? request :proto) (update :proto coerce-int 1)
+      (contains? request :done)
+      (-> (update-in [:done :must] coerce-keyword-coll)
+          (update-in [:done :should] coerce-keyword-coll))
+      (contains? request :effects)
+      (update-in [:effects :allowed] coerce-keyword-coll)
+      (contains? request :budget)
+      (update-in [:budget :max-roundtrips] coerce-int nil)
+      (contains? request :constraints)
+      (update-in [:constraints :language] #(or (keywordish %) %))
+      (contains? request :routing)
+      (update :routing normalize-act-routing))))
+
 (defn- coerce-act-request
   [payload]
-  (letfn [(->keyword-coll
-            [v]
-            (cond
-              (nil? v)        nil
-              (set? v)        (into #{} (keep keywordish) v)
-              (sequential? v) (into [] (keep keywordish) v)
-              :else           v))
-          (->bool
-            [v]
-            (cond
-              (boolean? v) v
-              (number? v)  (not (zero? (long v)))
-              (string? v)  (contains? #{"1" "true" "yes" "on"}
-                                      (-> v str/trim str/lower-case))
-              (nil? v)     nil
-              :else        (boolean v)))
-          (->int
-            [v default]
-            (cond
-              (integer? v) (int v)
-              (number? v)  (int (Math/round (double v)))
-              (string? v)  (try
-                             (Integer/parseInt (str/trim v))
-                             (catch Throwable _ default))
-              :else        default))
-          (normalize-routing
-            [routing]
-            (let [routing'    (if (map? routing) routing {})
-                  intent      (keywordish (:intent routing'))
-                  cap-id      (keywordish (:cap/id routing'))
-                  profile     (keywordish (:profile routing'))
-                  meta?       (->bool (:meta? routing'))
-                  strict?     (->bool (:strict? routing'))
-                  force?      (->bool (:force? routing'))
-                  on-error    (keywordish (:on-error routing'))
-                  debug-plan? (->bool (or (:debug/plan? routing')
-                                          (:debug-plan? routing')
-                                          (get-in routing' [:debug :plan?])))
-                  debug-transcript? (->bool (or (:debug/transcript? routing')
-                                                (:debug-transcript? routing')
-                                                (get-in routing' [:debug :transcript?])))]
-              (cond-> routing'
-                (keyword? intent)                               (assoc :intent intent)
-                (keyword? cap-id)                               (assoc :cap/id cap-id)
-                (keyword? profile)                              (assoc :profile profile)
-                (some? meta?)                                   (assoc :meta? meta?)
-                (some? strict?)                                 (assoc :strict? strict?)
-                (some? force?)                                  (assoc :force? force?)
-                (contains? #{:fail-open :fail-closed} on-error) (assoc :on-error on-error)
-                (some? debug-plan?)                             (assoc :debug/plan? debug-plan?)
-                (some? debug-transcript?)                       (assoc :debug/transcript? debug-transcript?))))
-          (normalize-top
-            [request]
-            (let [intent        (or (some-> request :task :intent keywordish)
-                                     (some-> request :intent keywordish))
-                  cap-id        (or (some-> request :task :cap/id keywordish)
-                                    (some-> request :cap/id keywordish))
-                  requires      (contracts/normalize-requires
-                                 (or (get-in request [:task :requires])
-                                     (:requires request)))
-                  role          (keywordish (:role request))
-                  response-type (or (some-> request :response/type keywordish)
-                                    (some-> request :response :type keywordish))
-                  stream?       (or (->bool (:stream? request))
-                                    (->bool (get-in request [:response :stream?])))]
-              (cond-> request
-                (keyword? intent)          (assoc-in [:task :intent] intent)
-                (keyword? cap-id)          (assoc-in [:task :cap/id] cap-id)
-                (map? requires)            (assoc-in [:task :requires] requires)
-                (keyword? role)            (assoc :role role)
-                (keyword? response-type)   (assoc :response/type response-type)
-                (some? stream?)            (assoc :stream? stream?)
-                (contains? request :proto) (update :proto ->int 1)
-                (contains? request :done)
-                (-> (update-in [:done :must] ->keyword-coll)
-                    (update-in [:done :should] ->keyword-coll))
-                (contains? request :effects)
-                (update-in [:effects :allowed] ->keyword-coll)
-                (contains? request :budget)
-                (update-in [:budget :max-roundtrips] ->int nil)
-                (contains? request :constraints)
-                (update-in [:constraints :language] #(or (keywordish %) %))
-                (contains? request :routing)
-                (update :routing normalize-routing))))]
-    (cond
-      (and (map? payload) (map? (:task payload)))
-      (normalize-top payload)
+  (cond
+    (and (map? payload) (map? (:task payload)))
+    (normalize-act-top payload)
 
-      (string? payload)
-      {:proto 1
-       :trace {:id (str (java.util.UUID/randomUUID))}
-       :task  {:intent :text/respond}
-       :input {:prompt payload}}
+    (string? payload)
+    {:proto 1
+     :trace {:id (str (java.util.UUID/randomUUID))}
+     :task  {:intent :text/respond}
+     :input {:prompt payload}}
 
-      (map? payload)
-      (let [trace (or (:trace payload)
-                      {:id (str (java.util.UUID/randomUUID))})
-            req   (-> payload
-                      (assoc :proto (or (:proto payload) 1))
-                      (assoc :trace trace)
-                      (assoc :task (or (:task payload) {:intent :text/respond}))
-                      (assoc :input (or (:input payload)
-                                        (if (contains? payload :prompt)
-                                          {:prompt (:prompt payload)}
-                                          {}))))]
-        (normalize-top req))
+    (map? payload)
+    (let [trace (or (:trace payload)
+                    {:id (str (java.util.UUID/randomUUID))})
+          req   (-> payload
+                    (assoc :proto (or (:proto payload) 1))
+                    (assoc :trace trace)
+                    (assoc :task (or (:task payload) {:intent :text/respond}))
+                    (assoc :input (or (:input payload)
+                                      (if (contains? payload :prompt)
+                                        {:prompt (:prompt payload)}
+                                        {}))))]
+      (normalize-act-top req))
 
-      :else payload)))
+    :else payload))
 
 (defn- cap-id->role
   [runtime resolver cap-id intent]
@@ -519,7 +529,8 @@
         state' (assoc-in state [:act :latency-ms :avg] avg)]
     (assoc state'
            :kpi (telemetry-kpi state')
-           :lifecycle (telemetry/lifecycle-snapshot))))
+           :lifecycle (telemetry/lifecycle-snapshot)
+           :queue (telemetry/queue-snapshot))))
 
 (defn- resolve-cap-id
   [resolver request]
@@ -649,6 +660,7 @@
 (defn- cacheable-act-request?
   [request]
   (and (map? request)
+       (not= :accepted (keywordish (:response/type request)))
        (not (true? (:stream? request)))
        (not= :stream (keywordish (:response/type request)))))
 
@@ -870,9 +882,78 @@
              request
              (if (map? bindings) bindings {})))
 
+(def ^:private session-get-vars-invokers-max-size
+  256)
+
+(def ^:private session-get-vars-invokers
+  (atom {:entries {}
+         :order []}))
+
+(defn- prune-session-get-vars-invokers
+  [cache]
+  (let [entries (if (map? (:entries cache)) (:entries cache) {})
+        order0  (if (vector? (:order cache))
+                  (:order cache)
+                  (vec (keys entries)))
+        order1  (->> order0
+                     (filter #(contains? entries %))
+                     vec)
+        overflow (max 0 (- (count order1) session-get-vars-invokers-max-size))
+        evict-keys (if (pos? overflow) (subvec order1 0 overflow) [])
+        entries' (if (seq evict-keys)
+                   (apply dissoc entries evict-keys)
+                   entries)
+        order' (if (pos? overflow)
+                 (subvec order1 overflow)
+                 order1)]
+    {:entries entries'
+     :order (vec order')}))
+
+(defn- make-session-get-vars-invoker
+  [get-vars-fn]
+  (let [mode (volatile! :auto)]
+    (fn [sid ks opts]
+      (case @mode
+        :with-opts (get-vars-fn sid ks opts)
+        :plain (get-vars-fn sid ks)
+        (try
+          (let [result (get-vars-fn sid ks opts)]
+            (vreset! mode :with-opts)
+            result)
+          (catch clojure.lang.ArityException _
+            (vreset! mode :plain)
+            (get-vars-fn sid ks)))))))
+
+(defn- session-get-vars-invoker
+  [service]
+  (let [get-vars-fn (when (map? service) (:get-vars! service))]
+    (when (fn? get-vars-fn)
+      (or (get-in @session-get-vars-invokers [:entries get-vars-fn])
+          (let [invoker (make-session-get-vars-invoker get-vars-fn)
+                cache' (swap! session-get-vars-invokers
+                              (fn [cache]
+                                (let [entries (if (map? (:entries cache))
+                                                (:entries cache)
+                                                {})]
+                                  (if (contains? entries get-vars-fn)
+                                    (prune-session-get-vars-invokers cache)
+                                    (let [order0 (if (vector? (:order cache))
+                                                   (:order cache)
+                                                   (vec (keys entries)))
+                                          order1 (conj (->> order0
+                                                            (remove #(identical? % get-vars-fn))
+                                                            vec)
+                                                       get-vars-fn)]
+                                      (prune-session-get-vars-invokers
+                                       {:entries (assoc entries get-vars-fn invoker)
+                                        :order order1}))))))
+                cached (get-in cache' [:entries get-vars-fn])]
+            (or cached invoker))))))
+
 (defn- request-with-session-defaults
   [runtime request]
   (let [service (when (map? runtime) (:session runtime))
+        get-vars-invoker (session-get-vars-invoker service)
         bindings (session-request-default-bindings runtime)
         binding-keys (->> (keys bindings)
                           (keep keywordish)
@@ -884,19 +965,220 @@
                   (keyword? intent) (assoc :intent intent))]
     (if (and (map? request)
              (map? service)
-             (fn? (:get-vars! service))
+             (fn? get-vars-invoker)
              sid
              (seq binding-keys))
       (let [vars (try
-                   (memory/get-vars! service sid binding-keys opts)
-                   (catch clojure.lang.ArityException _
-                     (memory/get-vars! service sid binding-keys))
+                   (get-vars-invoker sid binding-keys opts)
                    (catch Throwable _
                      nil))]
         (if (map? vars)
           (apply-session-var-defaults request vars bindings)
           request))
       request)))
+
+(def ^:private queue-job-accepted-public-keys
+  [:job/id :job/status :submitted-at :updated-at :deadline-at :queue/class :attempt])
+
+(def ^:private queue-job-status-public-keys
+  [:job/id :job/status :submitted-at :updated-at :started-at :completed-at
+   :deadline-at :queue/class :attempt :result :error :cancel/reason])
+
+(def ^:private queue-job-cancel-public-keys
+  [:job/id :job/status :cancel/accepted? :updated-at])
+
+(defn- value-envelope
+  [request out]
+  {:proto (request-proto request)
+   :trace (request-trace request)
+   :result {:type :value
+            :out out}})
+
+(defn- accepted-envelope
+  [request out]
+  (assoc (value-envelope request out) :response/type :accepted))
+
+(defn- response-type-accepted?
+  [request]
+  (= :accepted (keywordish (:response/type request))))
+
+(defn- runtime-queue-service
+  [runtime]
+  (when (map? runtime)
+    (:queue/service runtime)))
+
+(defn- queue-submit-options
+  [request]
+  (let [queue-map (if (map? (:queue request)) (:queue request) {})
+        task-map (if (map? (:task request)) (:task request) {})
+        class-k (or (keywordish (:queue/class request))
+                    (keywordish (:queue/class queue-map))
+                    (keywordish (:class queue-map))
+                    (keywordish (:queue/class task-map)))
+        deadline-ms (or (parse-non-negative-long (:deadline-ms request))
+                        (parse-non-negative-long (:deadline-ms queue-map))
+                        (parse-non-negative-long (:job/deadline-ms queue-map))
+                        (parse-non-negative-long (:deadline-ms task-map)))]
+    (cond-> {}
+      (keyword? class-k) (assoc :queue/class class-k)
+      (some? deadline-ms) (assoc :deadline-ms deadline-ms))))
+
+(defn- queue-job->accepted-payload
+  [job]
+  (select-keys job queue-job-accepted-public-keys))
+
+(defn- queue-job->status-payload
+  [job]
+  (select-keys job queue-job-status-public-keys))
+
+(defn- queue-job->cancel-payload
+  [job accepted?]
+  (-> {:job/id (:job/id job)
+       :job/status (:job/status job)
+       :cancel/accepted? (boolean accepted?)}
+      (cond-> (contains? job :updated-at)
+        (assoc :updated-at (:updated-at job)))
+      (select-keys queue-job-cancel-public-keys)))
+
+(defn- queue-schema-response
+  [request schema-k payload status accepted?]
+  (let [check (contracts/validate-schema schema-k payload)]
+    (if (:ok? check)
+      {:status status
+       :body   (if accepted?
+                 (accepted-envelope request payload)
+                 (value-envelope request payload))}
+      {:status 500
+       :body   (error-envelope request
+                               :runtime/internal
+                               "Queue response payload failed schema validation."
+                               {:schema schema-k
+                                :reason (:reason check)})})))
+
+(defn- async-submit-response
+  [runtime request]
+  (let [service (runtime-queue-service runtime)]
+    (if-not (queue/service? service)
+      {:status 503
+       :body   (error-envelope request
+                               :queue/unavailable
+                               "Asynchronous queue is unavailable."
+                               {:error :queue/not-initialized}
+                               true)}
+      (let [submit (queue/submit! service request (queue-submit-options request))]
+        (cond
+          (:ok? submit)
+          (queue-schema-response request
+                                 :res/job-accepted
+                                 (queue-job->accepted-payload (:job submit))
+                                 202
+                                 true)
+
+          (= :queue/full (:error submit))
+          {:status 503
+           :body   (error-envelope request
+                                   :runtime/overloaded
+                                   "Queue is full."
+                                   {:error :queue/full
+                                    :max-size (:max-size submit)}
+                                   true)}
+
+          (= :queue/disabled (:error submit))
+          {:status 503
+           :body   (error-envelope request
+                                   :queue/unavailable
+                                   "Asynchronous queue is disabled."
+                                   {:error :queue/disabled}
+                                   true)}
+
+          :else
+          {:status 500
+           :body   (error-envelope request
+                                   :runtime/internal
+                                   "Failed to submit async job."
+                                   {:error (:error submit)})})))))
+
+(defn- queue-job-status-response
+  [runtime request job-id]
+  (let [service (runtime-queue-service runtime)]
+    (if-not (queue/service? service)
+      {:status 503
+       :body   (error-envelope request
+                               :queue/unavailable
+                               "Asynchronous queue is unavailable."
+                               {:error :queue/not-initialized}
+                               true)}
+      (let [poll (queue/poll! service job-id)]
+        (cond
+          (:ok? poll)
+          (queue-schema-response request
+                                 :res/job-status
+                                 (queue-job->status-payload (:job poll))
+                                 200
+                                 false)
+
+          (= :queue/job-not-found (:error poll))
+          {:status 404
+           :body   (error-envelope request
+                                   :queue/job-not-found
+                                   "Queue job not found."
+                                   {:job/id (:job/id poll)})}
+
+          :else
+          {:status 500
+           :body   (error-envelope request
+                                   :runtime/internal
+                                   "Failed to poll queue job."
+                                   {:error (:error poll)
+                                    :job/id job-id})})))))
+
+(defn- queue-job-cancel-response
+  [runtime request job-id reason]
+  (let [service (runtime-queue-service runtime)]
+    (if-not (queue/service? service)
+      {:status 503
+       :body   (error-envelope request
+                               :queue/unavailable
+                               "Asynchronous queue is unavailable."
+                               {:error :queue/not-initialized}
+                               true)}
+      (let [cancel (queue/cancel! service job-id reason)]
+        (cond
+          (:ok? cancel)
+          (queue-schema-response request
+                                 :res/job-cancel
+                                 (queue-job->cancel-payload (:job cancel) true)
+                                 200
+                                 false)
+
+          (= :queue/job-not-found (:error cancel))
+          {:status 404
+           :body   (error-envelope request
+                                   :queue/job-not-found
+                                   "Queue job not found."
+                                   {:job/id (:job/id cancel)})}
+
+          (= :queue/invalid-transition (:error cancel))
+          (let [current (queue/get-job service job-id)]
+            (if (:ok? current)
+              (queue-schema-response request
+                                     :res/job-cancel
+                                     (queue-job->cancel-payload (:job current) false)
+                                     200
+                                     false)
+              {:status 404
+               :body   (error-envelope request
+                                       :queue/job-not-found
+                                       "Queue job not found."
+                                       {:job/id job-id})}))
+
+          :else
+          {:status 500
+           :body   (error-envelope request
+                                   :runtime/internal
+                                   "Failed to cancel queue job."
+                                   {:error (:error cancel)
+                                    :job/id job-id})})))))
 
 (defn- response-error-type
   [response]
@@ -1626,6 +1908,352 @@
       (= :fail-closed reason) (update :route/fail-closed (fnil inc 0))
       strict? (update :route/strict (fnil inc 0)))))
 
+(defn- invoke-act-prepared-request
+  [runtime payload auth]
+  (let [auth-user      (some-> auth :user auth-user-public)
+        auth-source-k  (some-> auth :source keywordish)
+        auth-session   (when (map? (:session auth))
+                         (:session auth))
+        auth-session-id (or (some-> auth-session :session/id trim-s)
+                            (some-> auth-session :id trim-s))
+        request0       (coerce-act-request payload)
+        request1       (cond-> request0
+                         (map? auth-user) (assoc :auth/user auth-user)
+                         (keyword? auth-source-k) (assoc :auth/source auth-source-k)
+                         (and (map? request0)
+                              auth-session-id
+                              (nil? (:session/id request0)))
+                         (assoc :session/id auth-session-id))]
+    (request-with-session-defaults runtime request1)))
+
+(defn- invoke-act-route-phase
+  [runtime request accepted-mode? protocol resolver]
+  (let [req-check        (contracts/validate-request protocol request)
+        meta-step        (when (and (:ok? req-check)
+                                    (not accepted-mode?))
+                           (maybe-apply-meta-routing runtime resolver request))
+        route-mode       (or (:mode meta-step) :none)
+        request*         (or (:request meta-step) request)
+        routed?          (not= request request*)
+        post-route-check (cond
+                           (not (:ok? req-check)) req-check
+                           (#{:error :final} route-mode) {:ok? true}
+                           routed? (contracts/validate-request protocol request*)
+                           :else req-check)]
+    {:req-check req-check
+     :meta-step meta-step
+     :route-mode route-mode
+     :request* request*
+     :routed? routed?
+     :post-route-check post-route-check
+     :route-telemetry (routing-telemetry-counters meta-step)}))
+
+(defn- invoke-act-capability-error-response
+  [request* ^clojure.lang.ExceptionInfo e]
+  (let [data   (or (ex-data e) {})
+        reason (or (:error data)
+                   (:failure/type data))]
+    (case reason
+      :invalid-request
+      {:status 400
+       :body   (error-envelope request*
+                               :input/invalid
+                               (.getMessage e)
+                               (select-keys data [:reason :intent]))}
+
+      :invalid-result-after-retries
+      {:status 502
+       :body   (error-envelope request*
+                               :schema/invalid
+                               (.getMessage e)
+                               (select-keys data [:attempts :last-check])
+                               true)}
+
+      :auth/forbidden-effect
+      {:status 403
+       :body   (error-envelope request*
+                               :auth/forbidden-effect
+                               (.getMessage e)
+                               (select-keys data [:requested-effects
+                                                  :denied-effects
+                                                  :failure/type]))}
+
+      :effects/scope-denied
+      {:status 403
+       :body   (error-envelope request*
+                               :effects/scope-denied
+                               (.getMessage e)
+                               (select-keys data [:effect
+                                                  :reason
+                                                  :path
+                                                  :cwd
+                                                  :url
+                                                  :allow
+                                                  :allow-cwd
+                                                  :allow-hosts
+                                                  :allow-ports
+                                                  :allow-schemes]))}
+
+      :effects/invalid-input
+      {:status 400
+       :body   (error-envelope request*
+                               :effects/invalid-input
+                               (.getMessage e)
+                               (select-keys data [:reason
+                                                  :tool/id
+                                                  :required-effect
+                                                  :requested-effects]))}
+
+      :effects/not-declared
+      {:status 400
+       :body   (error-envelope request*
+                               :effects/invalid-input
+                               (.getMessage e)
+                               (merge {:reason :effects/not-declared}
+                                      (select-keys data [:tool/id
+                                                         :requested-effects])))}
+
+      :effects/unsupported-tool
+      {:status 422
+       :body   (error-envelope request*
+                               :effects/unsupported-tool
+                               (.getMessage e)
+                               (select-keys data [:tool/id :known-tools]))}
+
+      (let [invoke-response (:invoke-response data)
+            details' (merge (select-keys data [:error :reason :cap-id :intent :model-key :session/id])
+                            (when (map? invoke-response)
+                              (select-keys invoke-response [:error :message :details])))]
+        {:status 502
+         :body   (error-envelope request*
+                                 :runtime/invoke-failed
+                                 (.getMessage e)
+                                 (when (seq details')
+                                   details'))}))))
+
+(defn- invoke-act-runtime-response
+  [runtime resolver request* cap-id]
+  (try
+    {:status 200
+     :body   (core/call-capability
+              runtime
+              resolver
+              (act-request->invoke-opts runtime resolver request* cap-id))}
+    (catch clojure.lang.ExceptionInfo e
+      (invoke-act-capability-error-response request* e))
+    (catch Throwable t
+      {:status 500
+       :body   (error-envelope request*
+                               :runtime/internal
+                               (.getMessage t))})))
+
+(defn- invoke-act-cache-phase
+  [runtime request* accepted-mode? cap-id]
+  (let [cache-key     (when (and (cacheable-act-request? request*)
+                                 (not accepted-mode?)
+                                 (keyword? cap-id))
+                        (act-cache-key request* cap-id))
+        cache-lookup  (act-cache-get! runtime cache-key)
+        cache-hit?    (true? (:hit? cache-lookup))
+        cache-telemetry0 (if (map? (:telemetry cache-lookup))
+                           (:telemetry cache-lookup)
+                           {})]
+    {:cache/key cache-key
+     :cache/lookup cache-lookup
+     :cache/hit? cache-hit?
+     :cache/telemetry0 cache-telemetry0}))
+
+(defn- invoke-act-response
+  [runtime phase]
+  (let [{:keys [request
+                request*
+                accepted-mode?
+                req-check
+                post-route-check
+                route-mode
+                meta-step
+                routed?
+                resolver
+                cap-id]} phase
+        cache-lookup (:cache/lookup phase)
+        cache-hit?   (:cache/hit? phase)]
+    (cond
+    (not (map? request))
+    {:status 400
+     :body   (error-envelope nil :input/invalid
+                             "Request payload must be a map (EDN/JSON object).")}
+
+    (not (:ok? req-check))
+    {:status 400
+     :body   (error-envelope request
+                             :input/invalid
+                             "Request does not satisfy protocol contract."
+                             (select-keys req-check [:reason :intent]))}
+
+    accepted-mode?
+    (async-submit-response runtime request*)
+
+    (= :error route-mode)
+    {:status (or (:status meta-step) 502)
+     :body   (or (:body meta-step)
+                 (error-envelope request
+                                 :route/decide-failed
+                                 "Meta routing failed."
+                                 nil
+                                 true))}
+
+    (= :final route-mode)
+    {:status 200
+     :body   (or (:response meta-step)
+                 (error-envelope request
+                                 :route/decide-failed
+                                 "Meta routing returned invalid response."
+                                 nil
+                                 true))}
+
+    (not (:ok? post-route-check))
+    (if routed?
+      {:status 502
+       :body   (error-envelope request*
+                               :route/decide-failed
+                               "Meta routing returned invalid request mutations."
+                               (select-keys post-route-check [:reason :intent])
+                               true)}
+      {:status 400
+       :body   (error-envelope request*
+                               :input/invalid
+                               "Request does not satisfy protocol contract."
+                               (select-keys post-route-check [:reason :intent]))})
+
+    :else
+    (if-not (keyword? cap-id)
+      {:status 422
+       :body   (error-envelope request*
+                               :unsupported/intent
+                               "No capability can handle the requested intent."
+                               {:intent (get-in request* [:task :intent])})}
+      (if (and cache-hit? (map? (:response cache-lookup)))
+        (:response cache-lookup)
+        (invoke-act-runtime-response runtime resolver request* cap-id))))))
+
+(defn- invoke-act-execute-phase
+  [runtime phase]
+  (let [{:keys [request*
+                accepted-mode?
+                req-check
+                post-route-check
+                route-mode
+                resolver]} phase
+        cap-id (when (and (map? request*)
+                          (:ok? req-check)
+                          (:ok? post-route-check)
+                          (not accepted-mode?)
+                          (not= :error route-mode)
+                          (not= :final route-mode))
+                 (resolve-cap-id resolver request*))
+        cache-phase (invoke-act-cache-phase runtime request* accepted-mode? cap-id)
+        phase' (merge phase cache-phase {:cap-id cap-id})
+        response (invoke-act-response runtime phase')
+        cache-store-telemetry (if (or (:cache/hit? phase')
+                                     (not (cacheable-act-request? request*)))
+                                {}
+                                (act-cache-put! runtime (:cache/key phase') response))
+        cache-telemetry (ferment.telemetry/merge-counters
+                         (:cache/telemetry0 phase')
+                         cache-store-telemetry)]
+    (assoc phase'
+           :response response
+           :cache/telemetry cache-telemetry)))
+
+(defn- invoke-act-session-view
+  [runtime request*]
+  (let [sid (or (some-> (:session/id request*) trim-s)
+                (some-> (:session-id request*) trim-s))
+        session-state (when sid
+                        (let [service (when (map? runtime) (:session runtime))]
+                          (when (map? service)
+                            (try
+                              (memory/get! service sid)
+                              (catch Throwable _ nil)))))]
+    (when (map? session-state)
+      (select-keys session-state
+                   [:session/id
+                    :session/version
+                    :session/state
+                    :session/frozen?
+                    :session/updated-at
+                    :session/last-access-at
+                    :session/frozen-at
+                    :session/thawed-at]))))
+
+(defn- invoke-act-finalize-phase
+  [runtime {:keys [response request*] :as phase}]
+  (let [session-view (invoke-act-session-view runtime request*)
+        response'    (if (and (map? (:body response))
+                              (map? session-view))
+                       (update response :body merge session-view)
+                       response)
+        response''   (attach-response-participants response')]
+    (assoc phase :response/final response'')))
+
+(defn- default-act-middleware-modules
+  []
+  [(act-middleware-prepare/middleware :act.middleware/prepare nil)
+   (act-middleware-route/middleware :act.middleware/route nil)
+   (act-middleware-execute/middleware :act.middleware/execute nil)
+   (act-middleware-finalize/middleware :act.middleware/finalize nil)])
+
+(defn- act-middleware-module?
+  [v]
+  (and (map? v)
+       (keyword? (:name v))
+       (fn? (:compile v))))
+
+(defn- compile-act-middleware-stage
+  [runtime idx module]
+  (when-not (act-middleware-module? module)
+    (throw (ex-info "Act middleware module has invalid shape."
+                    {:error :act/middleware-invalid
+                     :index idx
+                     :module module})))
+  (let [compiled ((:compile module) runtime {:index idx
+                                             :module/name (:name module)})]
+    (when-not (fn? compiled)
+      (throw (ex-info "Act middleware module compile did not return a handler wrapper."
+                      {:error :act/middleware-compile-invalid
+                       :index idx
+                       :module/name (:name module)
+                       :compiled compiled})))
+    compiled))
+
+(defn- compile-act-middleware-chain
+  [runtime modules]
+  (let [modules'  (->> modules (remove nil?) vec)
+        modules'' (if (seq modules')
+                    modules'
+                    (default-act-middleware-modules))
+        wrappers  (mapv (fn [idx module]
+                          (compile-act-middleware-stage runtime idx module))
+                        (range)
+                        modules'')]
+    (reduce (fn [handler wrapper]
+              (wrapper handler))
+            (fn [ctx] ctx)
+            (reverse wrappers))))
+
+(def ^:private default-act-pipeline
+  (delay (compile-act-middleware-chain nil nil)))
+
+(defn- runtime-act-pipeline
+  [runtime]
+  (let [pipeline (when (map? runtime) (:act/pipeline runtime))]
+    (if (fn? pipeline)
+      pipeline
+      (let [modules (when (map? runtime) (:act/middleware runtime))]
+        (if (sequential? modules)
+          (compile-act-middleware-chain runtime modules)
+          @default-act-pipeline)))))
+
 (defn invoke-act
   "Runs canonical `/v1/act` request through contract validation and core capability flow.
 
@@ -1636,228 +2264,28 @@
   ([runtime payload telemetry]
    (invoke-act runtime payload telemetry nil))
   ([runtime payload telemetry auth]
-   (let [started-at (now-nanos)
-         auth-user (some-> auth :user auth-user-public)
-         auth-source-k (some-> auth :source keywordish)
-         auth-session (when (map? (:session auth))
-                        (:session auth))
-         auth-session-id (or (some-> auth-session :session/id trim-s)
-                             (some-> auth-session :id trim-s))
-         request0  (coerce-act-request payload)
-         request1  (cond-> request0
-                     (map? auth-user) (assoc :auth/user auth-user)
-                     (keyword? auth-source-k) (assoc :auth/source auth-source-k)
-                     (and (map? request0)
-                          auth-session-id
-                          (nil? (:session/id request0)))
-                     (assoc :session/id auth-session-id))
-         request   (request-with-session-defaults runtime request1)
-         protocol (or (:protocol runtime) {})
-         resolver (effective-resolver runtime)
-         req-check (contracts/validate-request protocol request)
-         meta-step (when (:ok? req-check)
-                     (maybe-apply-meta-routing runtime resolver request))
-         route-mode (or (:mode meta-step) :none)
-         request* (or (:request meta-step) request)
-         routed? (not= request request*)
-         post-route-check (cond
-                            (not (:ok? req-check)) req-check
-                            (#{:error :final} route-mode) {:ok? true}
-                            routed? (contracts/validate-request protocol request*)
-                            :else req-check)
-         cap-id* (when (and (map? request*)
-                            (:ok? req-check)
-                            (:ok? post-route-check)
-                            (not= :error route-mode)
-                            (not= :final route-mode))
-                   (resolve-cap-id resolver request*))
-         cache-key (when (and (cacheable-act-request? request*)
-                              (keyword? cap-id*))
-                     (act-cache-key request* cap-id*))
-         cache-lookup (act-cache-get! runtime cache-key)
-         cache-hit? (true? (:hit? cache-lookup))
-         cache-telemetry0 (if (map? (:telemetry cache-lookup))
-                            (:telemetry cache-lookup)
-                            {})
-         route-telemetry (routing-telemetry-counters meta-step)
-         response
-         (cond
-           (not (map? request))
-           {:status 400
-            :body   (error-envelope nil :input/invalid
-                                    "Request payload must be a map (EDN/JSON object).")}
-
-           (not (:ok? req-check))
-           {:status 400
-            :body   (error-envelope request
-                                    :input/invalid
-                                    "Request does not satisfy protocol contract."
-                                    (select-keys req-check [:reason :intent]))}
-
-           (= :error route-mode)
-           {:status (or (:status meta-step) 502)
-            :body   (or (:body meta-step)
-                        (error-envelope request
-                                        :route/decide-failed
-                                        "Meta routing failed."
-                                        nil
-                                        true))}
-
-           (= :final route-mode)
-           {:status 200
-            :body   (or (:response meta-step)
-                        (error-envelope request
-                                        :route/decide-failed
-                                        "Meta routing returned invalid response."
-                                        nil
-                                        true))}
-
-           (not (:ok? post-route-check))
-           (if routed?
-             {:status 502
-              :body   (error-envelope request*
-                                      :route/decide-failed
-                                      "Meta routing returned invalid request mutations."
-                                      (select-keys post-route-check [:reason :intent])
-                                      true)}
-             {:status 400
-              :body   (error-envelope request*
-                                      :input/invalid
-                                      "Request does not satisfy protocol contract."
-                                      (select-keys post-route-check [:reason :intent]))})
-
-           :else
-           (if-not (keyword? cap-id*)
-               {:status 422
-                :body   (error-envelope request*
-                                        :unsupported/intent
-                                        "No capability can handle the requested intent."
-                                        {:intent (get-in request* [:task :intent])})}
-             (if (and cache-hit? (map? (:response cache-lookup)))
-               (:response cache-lookup)
-               (try
-                 {:status 200
-                  :body   (core/call-capability
-                           runtime
-                           resolver
-                           (act-request->invoke-opts runtime resolver request* cap-id*))}
-                 (catch clojure.lang.ExceptionInfo e
-                   (let [data (or (ex-data e) {})
-                         reason (or (:error data)
-                                    (:failure/type data))]
-                     (case reason
-                       :invalid-request
-                       {:status 400
-                        :body   (error-envelope request*
-                                                :input/invalid
-                                                (.getMessage e)
-                                                (select-keys data [:reason :intent]))}
-
-                       :invalid-result-after-retries
-                        {:status 502
-                         :body   (error-envelope request*
-                                                 :schema/invalid
-                                                 (.getMessage e)
-                                                 (select-keys data [:attempts :last-check])
-                                                 true)}
-
-                       :auth/forbidden-effect
-                       {:status 403
-                        :body   (error-envelope request*
-                                                :auth/forbidden-effect
-                                                (.getMessage e)
-                                                (select-keys data [:requested-effects
-                                                                   :denied-effects
-                                                                   :failure/type]))}
-
-                       :effects/scope-denied
-                       {:status 403
-                        :body   (error-envelope request*
-                                                :effects/scope-denied
-                                                (.getMessage e)
-                                                (select-keys data [:effect
-                                                                   :reason
-                                                                   :path
-                                                                   :cwd
-                                                                   :url
-                                                                   :allow
-                                                                   :allow-cwd
-                                                                   :allow-hosts
-                                                                   :allow-ports
-                                                                   :allow-schemes]))}
-
-                       :effects/invalid-input
-                       {:status 400
-                        :body   (error-envelope request*
-                                                :effects/invalid-input
-                                                (.getMessage e)
-                                                (select-keys data [:reason
-                                                                   :tool/id
-                                                                   :required-effect
-                                                                   :requested-effects]))}
-
-                       :effects/not-declared
-                       {:status 400
-                        :body   (error-envelope request*
-                                                :effects/invalid-input
-                                                (.getMessage e)
-                                                (merge {:reason :effects/not-declared}
-                                                       (select-keys data [:tool/id
-                                                                          :requested-effects])))}
-
-                       :effects/unsupported-tool
-                       {:status 422
-                        :body   (error-envelope request*
-                                                :effects/unsupported-tool
-                                                (.getMessage e)
-                                                (select-keys data [:tool/id :known-tools]))}
-
-                       (let [invoke-response (:invoke-response data)
-                             details' (merge (select-keys data [:error :reason :cap-id :intent :model-key :session/id])
-                                             (when (map? invoke-response)
-                                               (select-keys invoke-response [:error :message :details])))]
-                         {:status 502
-                          :body   (error-envelope request*
-                                                  :runtime/invoke-failed
-                                                  (.getMessage e)
-                                                  (when (seq details')
-                                                    details'))}))))
-                 (catch Throwable t
-                   {:status 500
-                    :body   (error-envelope request*
-                                            :runtime/internal
-                                            (.getMessage t))})))))
-         cache-store-telemetry (if (or cache-hit?
-                                      (not (cacheable-act-request? request*)))
-                                {}
-                                (act-cache-put! runtime cache-key response))
-         cache-telemetry (ferment.telemetry/merge-counters cache-telemetry0 cache-store-telemetry)
-         elapsed-ms (nanos->millis started-at)
-         sid        (or (some-> (:session/id request*) trim-s)
-                        (some-> (:session-id request*) trim-s))
-         session-state
-         (when sid
-           (let [service (when (map? runtime) (:session runtime))]
-             (when (map? service)
-               (try
-                 (memory/get! service sid)
-                 (catch Throwable _ nil)))))
-         session-view
-         (when (map? session-state)
-           (select-keys session-state
-                        [:session/id
-                         :session/version
-                         :session/state
-                         :session/frozen?
-                         :session/updated-at
-                         :session/last-access-at
-                         :session/frozen-at
-                         :session/thawed-at]))
-         response'   (if (and (map? (:body response))
-                              (map? session-view))
-                       (update response :body merge session-view)
-                       response)
-         response''  (attach-response-participants response')]
+   (let [started-at      (now-nanos)
+         phase3          ((runtime-act-pipeline runtime)
+                          {:runtime runtime
+                           :payload payload
+                           :act/fns {:prepare-request invoke-act-prepared-request
+                                     :accepted-mode? response-type-accepted?
+                                     :effective-resolver effective-resolver
+                                     :route-phase invoke-act-route-phase
+                                     :execute-phase invoke-act-execute-phase
+                                     :finalize-phase invoke-act-finalize-phase}
+                           :telemetry telemetry
+                           :auth auth})
+         response''      (or (:response phase3)
+                             (:response/final phase3)
+                             {:status 500
+                              :body   (error-envelope nil
+                                                      :runtime/internal
+                                                      "Act middleware pipeline produced invalid response envelope.")})
+         elapsed-ms      (nanos->millis started-at)
+         route-telemetry (:route-telemetry phase3)
+         cache-telemetry (:cache/telemetry phase3)
+         request*        (:request* phase3)]
      (record-act-telemetry! telemetry response'' elapsed-ms route-telemetry cache-telemetry)
      (report-act! runtime request* response'' auth elapsed-ms)
      response'')))
@@ -2733,6 +3161,51 @@
           session-state)
       session-state)))
 
+(defn- authorize-authenticated-principal
+  [runtime exchange operation {:keys [auth-op
+                                      source
+                                      user
+                                      session
+                                      user-id
+                                      success-message
+                                      denied-message]}]
+  (let [allowed? (roles/allowed? (:roles runtime) operation user)]
+    (if allowed?
+      (do
+        (report-auth! runtime exchange
+                      {:operation auth-op
+                       :success true
+                       :user-id user-id
+                       :message success-message})
+        {:ok? true
+         :auth (cond-> {:source source}
+                 (map? user) (assoc :user user)
+                 (map? session) (assoc :session session))})
+      (do
+        (report-auth! runtime exchange
+                      {:operation auth-op
+                       :success false
+                       :level :warning
+                       :user-id user-id
+                       :message denied-message})
+        {:ok? false
+         :response (forbidden-response "Missing required role for this operation.")}))))
+
+(defn- auth-request-strategy
+  [runtime exchange operation]
+  (let [basic-credentials (parse-basic-credentials exchange)
+        session-principal? (auth-session-principal-enabled? runtime operation)]
+    (cond
+      (map? basic-credentials)
+      {:strategy :basic
+       :basic-credentials basic-credentials}
+
+      session-principal?
+      {:strategy :session-principal}
+
+      :else
+      {:strategy :missing-credentials})))
+
 (defn- authenticate-request-via-basic
   [runtime exchange payload operation basic-credentials]
   (if-not (some? (auth-source runtime))
@@ -2753,29 +3226,20 @@
                   (auth-options runtime exchange payload))]
       (if (:ok? result)
         (let [user      (when (map? result) (:user result))
-              user'     (auth-user-public user)
-              allowed?  (roles/allowed? (:roles runtime) operation user')]
-          (if allowed?
-            (do
-              (report-auth! runtime exchange
-                            {:operation :auth/http-basic
-                             :success true
-                             :user-id (get-in result [:user :user/id])
-                             :message "HTTP basic auth accepted."})
-              {:ok? true
-               :auth (cond-> {:source :http/basic}
-                       (map? user') (assoc :user user')
-                       (map? (:session result)) (assoc :session (:session result)))})
-            (do
-              (report-auth! runtime exchange
-                            {:operation :auth/http-basic
-                             :success false
-                             :level :warning
-                             :user-id (get-in result [:user :user/id])
-                             :message (str "HTTP auth forbidden for operation "
-                                           (or operation :unknown) ".")})
-              {:ok? false
-               :response (forbidden-response "Missing required role for this operation.")})))
+              user'     (auth-user-public user)]
+          (authorize-authenticated-principal
+           runtime
+           exchange
+           operation
+           {:auth-op :auth/http-basic
+            :source :http/basic
+            :user user'
+            :session (when (map? (:session result))
+                       (:session result))
+            :user-id (get-in result [:user :user/id])
+            :success-message "HTTP basic auth accepted."
+            :denied-message (str "HTTP auth forbidden for operation "
+                                 (or operation :unknown) ".")}))
         (do
           (report-auth! runtime exchange
                         {:operation :auth/http-basic
@@ -2844,38 +3308,28 @@
                :response (unauthorized-response runtime "Session principal expired. Re-authenticate with Basic Auth.")})
 
             :else
-            (let [allowed?       (roles/allowed? (:roles runtime) operation user)
-                  session-state' (refresh-session-principal runtime sid session-state user)]
-              (if allowed?
-                (do
-                  (report-auth! runtime exchange
-                                {:operation :auth/http-session
-                                 :success true
-                                 :user-id (:user/id user)
-                                 :message "Session principal auth accepted."})
-                  {:ok? true
-                   :auth {:source :http/session-principal
-                          :user user
-                          :session (cond-> {:session/id sid}
-                                     (map? session-state')
-                                     (merge (select-keys session-state'
-                                                         [:session/version
-                                                          :session/state
-                                                          :session/frozen?
-                                                          :session/updated-at
-                                                          :session/last-access-at
-                                                          :session/frozen-at
-                                                          :session/thawed-at])))}})
-                (do
-                  (report-auth! runtime exchange
-                                {:operation :auth/http-session
-                                 :success false
-                                 :level :warning
-                                 :user-id (:user/id user)
-                                 :message (str "Session auth forbidden for operation "
-                                               (or operation :unknown) ".")})
-                  {:ok? false
-                   :response (forbidden-response "Missing required role for this operation.")})))))
+            (let [session-state' (refresh-session-principal runtime sid session-state user)]
+              (authorize-authenticated-principal
+               runtime
+               exchange
+               operation
+               {:auth-op :auth/http-session
+                :source :http/session-principal
+                :user user
+                :session (cond-> {:session/id sid}
+                           (map? session-state')
+                           (merge (select-keys session-state'
+                                               [:session/version
+                                                :session/state
+                                                :session/frozen?
+                                                :session/updated-at
+                                                :session/last-access-at
+                                                :session/frozen-at
+                                                :session/thawed-at])))
+                :user-id (:user/id user)
+                :success-message "Session principal auth accepted."
+                :denied-message (str "Session auth forbidden for operation "
+                                     (or operation :unknown) ".")}))))
         (do
           (report-auth! runtime exchange
                         {:operation :auth/http-session
@@ -2893,16 +3347,15 @@
   ([runtime exchange payload operation]
    (if-not (auth-enabled? runtime)
      {:ok? true}
-     (let [basic-credentials (parse-basic-credentials exchange)
-           session-principal? (auth-session-principal-enabled? runtime operation)]
-       (cond
-         (map? basic-credentials)
+     (let [{:keys [strategy basic-credentials]}
+           (auth-request-strategy runtime exchange operation)]
+       (case strategy
+         :basic
          (authenticate-request-via-basic runtime exchange payload operation basic-credentials)
 
-         session-principal?
+         :session-principal
          (authenticate-request-via-session-principal runtime exchange payload operation)
 
-         :else
          (do
            (report-auth! runtime exchange
                          {:operation :auth/http-basic
@@ -3003,6 +3456,107 @@
                                     (error-envelope nil
                                                     :input/invalid
                                                     (.getMessage t)))))))))))))
+
+(defn- decode-uri-part
+  [v]
+  (try
+    (some-> v str (URLDecoder/decode StandardCharsets/UTF_8) trim-s)
+    (catch Throwable _
+      nil)))
+
+(defn- parse-job-route
+  [^HttpExchange exchange]
+  (let [path (some-> exchange .getRequestURI .getPath trim-s)
+        prefix "/v1/act/jobs/"]
+    (when (and (string? path)
+               (str/starts-with? path prefix))
+      (let [tail0 (subs path (count prefix))
+            tail  (if (str/ends-with? tail0 "/")
+                    (subs tail0 0 (dec (count tail0)))
+                    tail0)]
+        (cond
+          (str/blank? tail)
+          nil
+
+          (str/ends-with? tail "/cancel")
+          (let [raw-id (subs tail 0 (- (count tail) (count "/cancel")))]
+            (when-some [job-id (decode-uri-part raw-id)]
+              {:action :cancel
+               :job/id job-id}))
+
+          :else
+          (when-some [job-id (decode-uri-part tail)]
+            {:action :status
+             :job/id job-id}))))))
+
+(defn- act-jobs-handler
+  [runtime]
+  (reify HttpHandler
+    (handle [_ exchange]
+      (let [route (parse-job-route exchange)
+            method (some-> (.getRequestMethod exchange) str/upper-case)]
+        (cond
+          (not (map? route))
+          (write-response! exchange
+                           404
+                           (encode-response
+                            (error-envelope nil
+                                            :not-found
+                                            "Queue job endpoint not found.")))
+
+          (= :status (:action route))
+          (if (not= "GET" method)
+            (write-response! exchange
+                             405
+                             (encode-response
+                              (error-envelope nil
+                                              :method-not-allowed
+                                              "Only GET is supported for job status endpoint."
+                                              {:allowed ["GET"]})))
+            (let [authn (authenticate-request runtime exchange nil :http.v1/act)]
+              (if-not (:ok? authn)
+                (let [{:keys [status body headers]} (:response authn)]
+                  (write-response! exchange status (encode-response body) headers))
+                (let [{:keys [status body]} (queue-job-status-response runtime {} (:job/id route))]
+                  (write-response! exchange status (encode-response body))))))
+
+          (= :cancel (:action route))
+          (if (not= "POST" method)
+            (write-response! exchange
+                             405
+                             (encode-response
+                              (error-envelope nil
+                                              :method-not-allowed
+                                              "Only POST is supported for job cancel endpoint."
+                                              {:allowed ["POST"]})))
+            (let [ctype        (content-type exchange)
+                  body-str     (read-body exchange)
+                  auth-payload (safe-decode-request-body body-str ctype)
+                  authn        (authenticate-request runtime exchange auth-payload :http.v1/act)]
+              (if-not (:ok? authn)
+                (let [{:keys [status body headers]} (:response authn)]
+                  (write-response! exchange status (encode-response body) headers))
+                (try
+                  (let [payload (decode-request-body body-str ctype)
+                        reason  (or (some-> payload :cancel/reason keywordish)
+                                    (some-> payload :reason keywordish))
+                        {:keys [status body]} (queue-job-cancel-response runtime payload (:job/id route) reason)]
+                    (write-response! exchange status (encode-response body)))
+                  (catch Throwable t
+                    (write-response! exchange
+                                     400
+                                     (encode-response
+                                      (error-envelope nil
+                                                      :input/invalid
+                                                      (.getMessage t)))))))))
+
+          :else
+          (write-response! exchange
+                           404
+                           (encode-response
+                            (error-envelope nil
+                                            :not-found
+                                            "Queue job endpoint not found."))))))))
 
 (defn- telemetry-handler
   [telemetry]
@@ -3143,14 +3697,20 @@
           host     (or (trim-s (:host cfg)) "127.0.0.1")
           port     (parse-port (:port cfg))
           response-cache (normalize-act-response-cache cfg)
-          runtime  (let [r (if (map? (:runtime cfg)) (:runtime cfg) {})]
+          act-middleware (when (sequential? (:act/middleware cfg))
+                           (vec (:act/middleware cfg)))
+          runtime0 (let [r (if (map? (:runtime cfg)) (:runtime cfg) {})]
                      (cond-> (if (contains? r :models)
                                r
                                (assoc r :models (:models cfg)))
                        (contains? cfg :auth)
                        (assoc :auth (:auth cfg))
                        (map? response-cache)
-                       (assoc :response-cache response-cache)))
+                       (assoc :response-cache response-cache)
+                       (seq act-middleware)
+                       (assoc :act/middleware act-middleware)))
+          runtime  (assoc runtime0
+                          :act/pipeline (compile-act-middleware-chain runtime0 act-middleware))
           routes   (model-http-routes (:models runtime))
           public-model-routes
           (into {}
@@ -3161,6 +3721,8 @@
           public-routes
           (assoc public-model-routes
                  "/v1/act" {:type :protocol-act}
+                 "/v1/act/jobs/{job-id}" {:type :protocol-act-job-status}
+                 "/v1/act/jobs/{job-id}/cancel" {:type :protocol-act-job-cancel}
                  "/v1/session" {:type :session-bridge}
                  "/v1/admin" {:type :admin}
                  "/health" {:type :health}
@@ -3172,6 +3734,7 @@
       (doseq [[endpoint route] routes]
         (.createContext server endpoint (invoke-handler route)))
       (.createContext server "/v1/act" (act-handler runtime telemetry-state))
+      (.createContext server "/v1/act/jobs" (act-jobs-handler runtime))
       (.createContext server "/v1/session" (session-handler runtime telemetry-state))
       (.createContext server "/v1/admin" (admin-handler runtime))
       (.createContext server "/health" (health-handler (count public-routes)))
@@ -3183,6 +3746,9 @@
                                                  :host host
                                                  :port port
                                                  :routes (count public-routes)
+                                                 :act/middleware (count (if (seq act-middleware)
+                                                                          act-middleware
+                                                                          (default-act-middleware-modules)))
                                                  :cache/enabled? (true? (:enabled? response-cache))})
       {:host host
        :port port

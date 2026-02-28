@@ -327,65 +327,87 @@
                m)
     {}))
 
+(def ^:private contract-absent ::contract-absent)
+
+(defn- resolve-contract-value
+  [src k default parse-fn]
+  (let [raw (if (contains? src k)
+              (get src k)
+              contract-absent)]
+    (if (identical? raw contract-absent)
+      default
+      (parse-fn raw))))
+
 (defn- normalize-session-vars-contract
   [cfg]
   (let [src (if (map? (:session-vars/contract cfg))
               (:session-vars/contract cfg)
               {})
-        require-qualified? (if (contains? src :keys/require-qualified?)
-                             (truthy? (:keys/require-qualified? src))
-                             (:keys/require-qualified? default-session-vars-contract))
-        allowed-namespaces (if (contains? src :keys/allowed-namespaces)
-                             (normalize-key-namespace-set (:keys/allowed-namespaces src))
-                             (:keys/allowed-namespaces default-session-vars-contract))
-        default-ttl-ms (if (contains? src :ttl/default-ms)
-                         (non-negative-int-or-nil (:ttl/default-ms src))
-                         (:ttl/default-ms default-session-vars-contract))
-        max-ttl-ms (if (contains? src :ttl/max-ms)
-                     (positive-int (:ttl/max-ms src)
-                                   (:ttl/max-ms default-session-vars-contract))
-                     (:ttl/max-ms default-session-vars-contract))
-        allow-write? (if (contains? src :freeze/allow-write?)
-                       (truthy? (:freeze/allow-write? src))
-                       (:freeze/allow-write? default-session-vars-contract))
-        allow-delete? (if (contains? src :freeze/allow-delete?)
-                        (truthy? (:freeze/allow-delete? src))
-                        (:freeze/allow-delete? default-session-vars-contract))
-        max-vars (if (contains? src :limits/max-vars)
-                   (positive-int (:limits/max-vars src)
-                                 (:limits/max-vars default-session-vars-contract))
-                   (:limits/max-vars default-session-vars-contract))
-        max-key-chars (if (contains? src :limits/max-key-chars)
-                        (positive-int (:limits/max-key-chars src)
-                                      (:limits/max-key-chars default-session-vars-contract))
-                        (:limits/max-key-chars default-session-vars-contract))
-        max-value-bytes (if (contains? src :limits/max-value-bytes)
-                          (positive-int (:limits/max-value-bytes src)
-                                        (:limits/max-value-bytes default-session-vars-contract))
-                          (:limits/max-value-bytes default-session-vars-contract))
-        policy-default (if (contains? src :policy/default)
-                         (normalize-vars-policy-entry (:policy/default src))
-                         (:policy/default default-session-vars-contract))
-        policy-by-intent (if (contains? src :policy/by-intent)
-                           (normalize-vars-policy-map (:policy/by-intent src))
-                           (:policy/by-intent default-session-vars-contract))
-        policy-by-operation (if (contains? src :policy/by-operation)
-                              (normalize-vars-policy-map (:policy/by-operation src))
-                              (:policy/by-operation default-session-vars-contract))
-        class-default (if (contains? src :class/default)
-                        (or (keywordish (:class/default src))
-                            (:class/default default-session-vars-contract))
-                        (:class/default default-session-vars-contract))
-        class-by-namespace (if (contains? src :class/by-namespace)
-                             (normalize-class-by-namespace (:class/by-namespace src))
-                             (:class/by-namespace default-session-vars-contract))
-        class-policy (if (contains? src :class/policy)
-                       (normalize-class-policy-map (:class/policy src))
-                       (:class/policy default-session-vars-contract))
-        request-default-bindings (if (contains? src :request/default-bindings)
-                                   (normalize-request-default-bindings
-                                    (:request/default-bindings src))
-                                   (:request/default-bindings default-session-vars-contract))
+        defaults default-session-vars-contract
+        require-qualified? (resolve-contract-value src
+                                                  :keys/require-qualified?
+                                                  (:keys/require-qualified? defaults)
+                                                  truthy?)
+        allowed-namespaces (resolve-contract-value src
+                                                  :keys/allowed-namespaces
+                                                  (:keys/allowed-namespaces defaults)
+                                                  normalize-key-namespace-set)
+        default-ttl-ms (resolve-contract-value src
+                                              :ttl/default-ms
+                                              (:ttl/default-ms defaults)
+                                              non-negative-int-or-nil)
+        max-ttl-ms (resolve-contract-value src
+                                          :ttl/max-ms
+                                          (:ttl/max-ms defaults)
+                                          #(positive-int % (:ttl/max-ms defaults)))
+        allow-write? (resolve-contract-value src
+                                            :freeze/allow-write?
+                                            (:freeze/allow-write? defaults)
+                                            truthy?)
+        allow-delete? (resolve-contract-value src
+                                             :freeze/allow-delete?
+                                             (:freeze/allow-delete? defaults)
+                                             truthy?)
+        max-vars (resolve-contract-value src
+                                        :limits/max-vars
+                                        (:limits/max-vars defaults)
+                                        #(positive-int % (:limits/max-vars defaults)))
+        max-key-chars (resolve-contract-value src
+                                             :limits/max-key-chars
+                                             (:limits/max-key-chars defaults)
+                                             #(positive-int % (:limits/max-key-chars defaults)))
+        max-value-bytes (resolve-contract-value src
+                                               :limits/max-value-bytes
+                                               (:limits/max-value-bytes defaults)
+                                               #(positive-int % (:limits/max-value-bytes defaults)))
+        policy-default (resolve-contract-value src
+                                              :policy/default
+                                              (:policy/default defaults)
+                                              normalize-vars-policy-entry)
+        policy-by-intent (resolve-contract-value src
+                                                :policy/by-intent
+                                                (:policy/by-intent defaults)
+                                                normalize-vars-policy-map)
+        policy-by-operation (resolve-contract-value src
+                                                   :policy/by-operation
+                                                   (:policy/by-operation defaults)
+                                                   normalize-vars-policy-map)
+        class-default (resolve-contract-value src
+                                             :class/default
+                                             (:class/default defaults)
+                                             #(or (keywordish %) (:class/default defaults)))
+        class-by-namespace (resolve-contract-value src
+                                                  :class/by-namespace
+                                                  (:class/by-namespace defaults)
+                                                  normalize-class-by-namespace)
+        class-policy (resolve-contract-value src
+                                            :class/policy
+                                            (:class/policy defaults)
+                                            normalize-class-policy-map)
+        request-default-bindings (resolve-contract-value src
+                                                        :request/default-bindings
+                                                        (:request/default-bindings defaults)
+                                                        normalize-request-default-bindings)
         default-ttl-ms' (when (some? default-ttl-ms)
                           (if (pos? max-ttl-ms)
                             (min default-ttl-ms max-ttl-ms)

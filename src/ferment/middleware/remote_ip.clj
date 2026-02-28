@@ -132,7 +132,7 @@
      (qassoc req
              :remote-ip        (delay (nth @addrs 0 nil))
              :remote-ip/str    (delay (nth @addrs 1 nil))
-             :remote-ip/proxy? (delay (nth @addrs 3 nil))))))
+             :remote-ip/proxy? (delay (boolean (nth @addrs 2 nil)))))))
 
 ;; Configuration initializers
 

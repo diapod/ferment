@@ -1,5 +1,13 @@
-{:ferment.http/default {:host   "0.0.0.0"
+{:ferment.http.act.middleware/prepare {}
+ :ferment.http.act.middleware/route {}
+ :ferment.http.act.middleware/execute {}
+ :ferment.http.act.middleware/finalize {}
+ :ferment.http/default {:host   "0.0.0.0"
                         :port   12002
+                        :act/middleware [#ref :ferment.http.act.middleware/prepare
+                                         #ref :ferment.http.act.middleware/route
+                                         #ref :ferment.http.act.middleware/execute
+                                         #ref :ferment.http.act.middleware/finalize]
                         :response-cache {:enabled? false
                                          :ttl-ms   120000
                                          :max-size 256}
@@ -9,5 +17,4 @@
                                  :session-principal {:enabled?   true
                                                      :operations #{:http.v1/act}
                                                      :ttl-ms     1800000
-                                                     :refresh-ms 300000}}}
- }
+                                                     :refresh-ms 300000}}}}

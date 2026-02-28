@@ -556,6 +556,348 @@
       (telemetry-inc! telemetry :quality/judge-pass)
       (telemetry-inc! telemetry :quality/judge-fail))))
 
+(declare execute-plan)
+
+(defn- execute-sub-plan
+  [ctx env result]
+  (let [rtype (contracts/result-type-of result)]
+    (when (= :plan rtype)
+      (let [sub-plan (or (contracts/materialize-plan-result result)
+                         (contracts/result-plan-of result))]
+        (execute-plan {:plan sub-plan
+                       :resolver (:resolver ctx)
+                       :invoke-call (:invoke-call ctx)
+                       :invoke-tool (:invoke-tool ctx)
+                       :check-fns (:check-fns ctx)
+                       :judge-fn (:judge-fn ctx)
+                       :env env
+                       :telemetry (:telemetry* ctx)
+                       :timings (:timings* ctx)
+                       :debug/transcript? (:debug-transcript? ctx)
+                       :transcript (:transcript* ctx)})))))
+
+(defn- record-call-artifacts!
+  [ctx candidate-node result attempt candidate-idx failure-type run* latency-ms]
+  (when (instance? clojure.lang.Atom (:timings* ctx))
+    (swap! (:timings* ctx) conj
+           (call-timing-entry candidate-node
+                              result
+                              attempt
+                              candidate-idx
+                              failure-type
+                              latency-ms)))
+  (when (instance? clojure.lang.Atom (:transcript* ctx))
+    (swap! (:transcript* ctx) conj
+           (call-transcript-entry candidate-node
+                                  result
+                                  attempt
+                                  candidate-idx
+                                  failure-type
+                                  run*
+                                  latency-ms))))
+
+(defn- evaluate-call-attempt
+  [ctx env switch-on candidate-node cap-id attempt candidate-idx]
+  (let [call-start (now-nanos)
+        result (let [invoke-call (:invoke-call ctx)]
+                 (invoke-call candidate-node env))
+        latency-ms (nanos->millis call-start)
+        _ (when (> attempt 1)
+            (telemetry-inc! (:telemetry* ctx) :calls/retries))
+        run* (execute-sub-plan ctx env result)
+        slot-val (if run*
+                   (assoc (normalize-call-result cap-id result)
+                          :out (:emitted run*)
+                          :plan/run run*)
+                   (normalize-call-result cap-id result))
+        verify-result (if run*
+                        {:result {:type :value
+                                  :out (:emitted run*)}}
+                        result)
+        done-eval (evaluate-done (:protocol ctx)
+                                 candidate-node
+                                 env
+                                 verify-result
+                                 (:check-fns ctx)
+                                 (:judge-fn ctx))
+        _ (telemetry-record-quality! (:telemetry* ctx) done-eval)
+        failure-type (call-failure-type (:protocol ctx) candidate-node result done-eval)
+        recover? (recoverable-failure? failure-type switch-on)
+        failed? (keyword? failure-type)
+        slot-val' (cond-> slot-val
+                    failed? (assoc :failure/type failure-type
+                                   :failure/recover? recover?))
+        accepted? (not failed?)
+        outcome {:ok? accepted?
+                 :cap/id cap-id
+                 :result result
+                 :slot-val slot-val'
+                 :emitted (when run* (:emitted run*))
+                 :plan/run run*
+                 :attempt attempt
+                 :latency-ms latency-ms
+                 :done/eval done-eval
+                 :failure/type failure-type
+                 :failure/recover? recover?}]
+    (record-call-artifacts! ctx
+                            candidate-node
+                            result
+                            attempt
+                            candidate-idx
+                            failure-type
+                            run*
+                            latency-ms)
+    outcome))
+
+(defn- attempt-candidate
+  [ctx env switch-on candidate-node cap-id candidate-idx same-cap-attempts]
+  (loop [attempt 1
+         last-attempt nil]
+    (if (> attempt same-cap-attempts)
+      (or last-attempt
+          {:ok? false
+           :failure/type :schema/invalid
+           :failure/recover? false
+           :cap/id cap-id})
+      (let [outcome (evaluate-call-attempt ctx
+                                           env
+                                           switch-on
+                                           candidate-node
+                                           cap-id
+                                           attempt
+                                           candidate-idx)]
+        (if (and (:failure/recover? outcome)
+                 (< attempt same-cap-attempts))
+          (recur (inc attempt) outcome)
+          outcome)))))
+
+(defn- resolve-call-outcome
+  [ctx env base-node switch-on candidates same-cap-attempts]
+  (loop [candidate-idx 0
+         last-outcome nil]
+    (if (>= candidate-idx (count candidates))
+      (or last-outcome
+          {:ok? false
+           :failure/type :unsupported/intent
+           :failure/recover? false})
+      (let [cap-id (nth candidates candidate-idx)
+            _ (when (pos? candidate-idx)
+                (telemetry-inc! (:telemetry* ctx) :calls/fallback-hops))
+            candidate-node (assoc base-node :cap/id cap-id)
+            candidate-outcome (attempt-candidate ctx
+                                                 env
+                                                 switch-on
+                                                 candidate-node
+                                                 cap-id
+                                                 candidate-idx
+                                                 same-cap-attempts)]
+        (if (and (:failure/recover? candidate-outcome)
+                 (< candidate-idx (dec (count candidates))))
+          (recur (inc candidate-idx) candidate-outcome)
+          candidate-outcome)))))
+
+(defn- run-let-node
+  [node env emitted]
+  (let [value (contracts/materialize-plan (:value node) env)
+        env'  (if (keyword? (:as node))
+                (assoc env (:as node) value)
+                env)]
+    {:env env'
+     :emitted emitted}))
+
+(defn- run-call-node
+  [ctx node env emitted]
+  (let [base-node    (-> node
+                         (update :input contracts/materialize-plan env)
+                         normalize-call-node)
+        resolver     (:resolver ctx)
+        _            (enforce-effects-authorization! resolver base-node env)
+        retry-policy (resolve-retry-policy resolver base-node)
+        switch-on    (resolve-switch-on resolver base-node)
+        candidates0  (resolve-candidates resolver base-node)
+        rejected     (-> candidates0 meta :routing/rejected)
+        candidates   (vec (take (inc (:fallback-max retry-policy))
+                                candidates0))
+        telemetry*   (:telemetry* ctx)]
+    (telemetry-inc! telemetry* :calls/total)
+    (when-not (seq candidates)
+      (throw (ex-info "Unable to resolve capability candidates for call node"
+                      {:node node
+                       :resolver resolver
+                       :rejected-candidates rejected})))
+    (let [same-cap-attempts (inc (:same-cap-max retry-policy))
+          call-outcome (resolve-call-outcome ctx
+                                             env
+                                             base-node
+                                             switch-on
+                                             candidates
+                                             same-cap-attempts)]
+      (if (:ok? call-outcome)
+        (do
+          (telemetry-inc! telemetry* :calls/succeeded)
+          {:env (if (keyword? (:as node))
+                  (assoc env (:as node) (:slot-val call-outcome))
+                  env)
+           :emitted (or (:emitted call-outcome) emitted)})
+        (let [allow-failure? (true? (get-in base-node [:dispatch :allow-failure?]))
+              _ (telemetry-inc! telemetry* :calls/failed)
+              _ (when (keyword? (:failure/type call-outcome))
+                  (telemetry-inc-in! telemetry* [:calls/failure-types (:failure/type call-outcome)]))]
+          (if allow-failure?
+            {:env (if (keyword? (:as node))
+                    (assoc env (:as node) (:slot-val call-outcome))
+                    env)
+             :emitted emitted}
+            (throw (ex-info "Call node failed quality/dispatch policy"
+                            {:node node
+                             :outcome call-outcome
+                             :switch-on switch-on
+                             :retry-policy retry-policy
+                             :candidates candidates
+                             :rejected-candidates rejected}))))))))
+
+(defn- run-tool-node
+  [ctx node env emitted]
+  (let [base-node      (-> node
+                           (update :input contracts/materialize-plan env)
+                           normalize-call-node)
+        tool-id        (:tool/id base-node)
+        req-effects    (requested-effects base-node)
+        allow-failure? (true? (get-in base-node [:dispatch :allow-failure?]))
+        resolver       (:resolver ctx)
+        invoke-tool    (:invoke-tool ctx)
+        telemetry*     (:telemetry* ctx)]
+    (when-not (keyword? tool-id)
+      (throw (ex-info "Tool node requires :tool/id keyword."
+                      {:node node
+                       :error :effects/invalid-input
+                       :failure/type :effects/invalid-input})))
+    (when-not (seq req-effects)
+      (throw (ex-info "Tool node must declare requested effects in :effects/:allowed."
+                      {:node node
+                       :tool/id tool-id
+                       :error :effects/invalid-input
+                       :failure/type :effects/invalid-input
+                       :reason :effects/not-declared
+                       :retryable? false})))
+    (when-not (fn? invoke-tool)
+      (throw (ex-info "Workflow runtime is missing :invoke-tool handler."
+                      {:node node
+                       :tool/id tool-id
+                       :error :effects/runtime-missing
+                       :failure/type :effects/runtime-missing
+                       :retryable? false})))
+    (let [authz-ctx (enforce-effects-authorization! resolver base-node env)
+          tool-node (cond-> base-node
+                      (map? (:auth/user authz-ctx))
+                      (assoc :auth/user (:auth/user authz-ctx))
+                      (map? (:roles/config authz-ctx))
+                      (assoc :roles/config (:roles/config authz-ctx))
+                      (map? (:auth/effects authz-ctx))
+                      (assoc :auth/effects (:auth/effects authz-ctx)))]
+      (telemetry-inc! telemetry* :calls/total)
+      (let [outcome
+            (try
+              (let [raw-result (invoke-tool tool-node env)
+                    result (if (and (map? raw-result)
+                                    (or (contains? raw-result :result)
+                                        (contains? raw-result :error)))
+                             raw-result
+                             {:result {:type :value
+                                       :out (cond
+                                              (map? raw-result) raw-result
+                                              (string? raw-result) {:text raw-result}
+                                              (nil? raw-result) {}
+                                              :else {:value raw-result})}})
+                    done-eval (evaluate-done (:protocol ctx)
+                                             base-node
+                                             env
+                                             result
+                                             (:check-fns ctx)
+                                             (:judge-fn ctx))
+                    _ (telemetry-record-quality! telemetry* done-eval)
+                    failure-type (call-failure-type (:protocol ctx) base-node result done-eval)
+                    failed? (keyword? failure-type)
+                    slot-val (normalize-tool-result tool-id result)]
+                {:ok? (not failed?)
+                 :tool/id tool-id
+                 :result result
+                 :slot-val slot-val
+                 :done/eval done-eval
+                 :failure/type failure-type
+                 :failure/recover? false})
+              (catch clojure.lang.ExceptionInfo e
+                (let [data (or (ex-data e) {})
+                      failure-type (or (:failure/type data)
+                                       (:error data)
+                                       :effects/runtime-failed)
+                      slot-val {:tool/id tool-id
+                                :error (:error data)
+                                :details data}]
+                  {:ok? false
+                   :tool/id tool-id
+                   :slot-val slot-val
+                   :failure/type failure-type
+                   :failure/recover? false
+                   :details data}))
+              (catch Throwable t
+                {:ok? false
+                 :tool/id tool-id
+                 :slot-val {:tool/id tool-id
+                            :error :effects/runtime-failed
+                            :message (.getMessage t)}
+                 :failure/type :effects/runtime-failed
+                 :failure/recover? false
+                 :details {:message (.getMessage t)}}))]
+        (if (:ok? outcome)
+          (do
+            (telemetry-inc! telemetry* :calls/succeeded)
+            {:env (if (keyword? (:as node))
+                    (assoc env (:as node) (:slot-val outcome))
+                    env)
+             :emitted emitted})
+          (do
+            (telemetry-inc! telemetry* :calls/failed)
+            (when (keyword? (:failure/type outcome))
+              (telemetry-inc-in! telemetry* [:calls/failure-types (:failure/type outcome)]))
+            (if allow-failure?
+              {:env (if (keyword? (:as node))
+                      (assoc env (:as node) (:slot-val outcome))
+                      env)
+               :emitted emitted}
+              (throw (ex-info "Tool node execution failed"
+                              (merge {:node node
+                                      :outcome outcome}
+                                     (when (map? (:details outcome))
+                                       (:details outcome))))))))))))
+
+(defn- run-emit-node
+  [node env]
+  {:env env
+   :emitted (materialize-emit-input (:input node) env)})
+
+(defn- run-node
+  [ctx node env emitted]
+  (case (:op node)
+    :let (run-let-node node env emitted)
+    :call (run-call-node ctx node env emitted)
+    :tool (run-tool-node ctx node env emitted)
+    :emit (run-emit-node node env)
+    (throw (ex-info "Unsupported plan node operation"
+                    {:op (:op node)
+                     :node node}))))
+
+(defn- finalize-run
+  [telemetry* timings* transcript* env emitted]
+  (cond-> {:ok? true
+           :env env
+           :emitted emitted
+           :telemetry @telemetry*}
+    (seq @timings*)
+    (assoc :timings @timings*)
+    (instance? clojure.lang.Atom transcript*)
+    (assoc :transcript @transcript*)))
+
 (defn execute-plan
   "Executes minimal plan AST with ops:
   - `:let`
@@ -586,284 +928,29 @@
         transcript* (when debug-transcript?
                       (if (instance? clojure.lang.Atom transcript)
                         transcript
-                        (atom [])))]
+                        (atom [])))
+        ctx {:resolver resolver
+             :invoke-call invoke-call
+             :invoke-tool invoke-tool
+             :check-fns check-fns
+             :judge-fn judge-fn
+             :protocol protocol
+             :telemetry* telemetry*
+             :timings* timings*
+             :transcript* transcript*
+             :debug-transcript? debug-transcript?}]
     (loop [idx 0
            env env
            emitted nil]
       (if (>= idx (count nodes))
-        (cond-> {:ok? true
-                 :env env
-                 :emitted emitted
-                 :telemetry @telemetry*}
-          (seq @timings*)
-          (assoc :timings @timings*)
-          (instance? clojure.lang.Atom transcript*)
-          (assoc :transcript @transcript*))
+        (finalize-run telemetry* timings* transcript* env emitted)
         (let [node (nth nodes idx)]
           (telemetry-inc! telemetry* :nodes/total)
           (when (keyword? (:op node))
             (telemetry-inc-in! telemetry* [:nodes/by-op (:op node)]))
           (if-not (should-run-node? node env)
             (recur (inc idx) env emitted)
-            (case (:op node)
-              :let
-              (let [value (contracts/materialize-plan (:value node) env)
-                    env'  (if (keyword? (:as node))
-                            (assoc env (:as node) value)
-                            env)]
-                (recur (inc idx) env' emitted))
-
-              :call
-              (let [base-node    (-> node
-                                     (update :input contracts/materialize-plan env)
-                                     normalize-call-node)
-                    _            (enforce-effects-authorization! resolver base-node env)
-                    retry-policy (resolve-retry-policy resolver base-node)
-                    switch-on    (resolve-switch-on resolver base-node)
-                    candidates0  (resolve-candidates resolver base-node)
-                    rejected     (-> candidates0 meta :routing/rejected)
-                    candidates   (vec (take (inc (:fallback-max retry-policy))
-                                            candidates0))]
-                (telemetry-inc! telemetry* :calls/total)
-                (when-not (seq candidates)
-                  (throw (ex-info "Unable to resolve capability candidates for call node"
-                                  {:node node
-                                   :resolver resolver
-                                   :rejected-candidates rejected})))
-                (let [same-cap-attempts (inc (:same-cap-max retry-policy))
-                      call-outcome
-                      (loop [candidate-idx 0
-                             last-outcome nil]
-                        (if (>= candidate-idx (count candidates))
-                          (or last-outcome
-                              {:ok? false
-                               :failure/type :unsupported/intent
-                               :failure/recover? false})
-                          (let [cap-id (nth candidates candidate-idx)
-                                _ (when (pos? candidate-idx)
-                                    (telemetry-inc! telemetry* :calls/fallback-hops))
-                                candidate-node (assoc base-node :cap/id cap-id)
-                                candidate-outcome
-                                (loop [attempt 1
-                                       last-attempt nil]
-                                  (if (> attempt same-cap-attempts)
-                                    (or last-attempt
-                                        {:ok? false
-                                         :failure/type :schema/invalid
-                                         :failure/recover? false
-                                         :cap/id cap-id})
-                                    (let [call-start (now-nanos)
-                                          result (invoke-call candidate-node env)
-                                          latency-ms (nanos->millis call-start)
-                                          _ (when (> attempt 1)
-                                              (telemetry-inc! telemetry* :calls/retries))
-                                          rtype (contracts/result-type-of result)
-                                          run* (when (= :plan rtype)
-                                                 (let [sub-plan (or (contracts/materialize-plan-result result)
-                                                                    (contracts/result-plan-of result))]
-                                                   (execute-plan {:plan sub-plan
-                                                                  :resolver resolver
-                                                                  :invoke-call invoke-call
-                                                                  :invoke-tool invoke-tool
-                                                                  :check-fns check-fns
-                                                                  :judge-fn judge-fn
-                                                                  :env env
-                                                                  :telemetry telemetry*
-                                                                  :timings timings*
-                                                                  :debug/transcript? debug-transcript?
-                                                                  :transcript transcript*})))
-                                          slot-val (if run*
-                                                     (assoc (normalize-call-result cap-id result)
-                                                            :out (:emitted run*)
-                                                            :plan/run run*)
-                                                     (normalize-call-result cap-id result))
-                                          verify-result (if run*
-                                                          {:result {:type :value
-                                                                    :out (:emitted run*)}}
-                                                          result)
-                                          done-eval (evaluate-done protocol candidate-node env verify-result check-fns judge-fn)
-                                          _ (telemetry-record-quality! telemetry* done-eval)
-                                          failure-type (call-failure-type protocol candidate-node result done-eval)
-                                          recover? (recoverable-failure? failure-type switch-on)
-                                          failed? (keyword? failure-type)
-                                          slot-val' (cond-> slot-val
-                                                      failed? (assoc :failure/type failure-type
-                                                                     :failure/recover? recover?))
-                                          accepted? (not failed?)
-                                          outcome {:ok? accepted?
-                                                   :cap/id cap-id
-                                                   :result result
-                                                   :slot-val slot-val'
-                                                   :emitted (when run* (:emitted run*))
-                                                   :plan/run run*
-                                                   :attempt attempt
-                                                   :latency-ms latency-ms
-                                                   :done/eval done-eval
-                                                   :failure/type failure-type
-                                                   :failure/recover? recover?}]
-                                      (when (instance? clojure.lang.Atom timings*)
-                                        (swap! timings* conj
-                                               (call-timing-entry candidate-node
-                                                                  result
-                                                                  attempt
-                                                                  candidate-idx
-                                                                  failure-type
-                                                                  latency-ms)))
-                                      (when (instance? clojure.lang.Atom transcript*)
-                                        (swap! transcript* conj
-                                               (call-transcript-entry candidate-node
-                                                                      result
-                                                                      attempt
-                                                                      candidate-idx
-                                                                      failure-type
-                                                                      run*
-                                                                      latency-ms)))
-                                      (if accepted?
-                                        outcome
-                                        (if (and recover?
-                                                 (< attempt same-cap-attempts))
-                                          (recur (inc attempt) outcome)
-                                          outcome)))))]
-                            (if (:ok? candidate-outcome)
-                              candidate-outcome
-                              (if (and (:failure/recover? candidate-outcome)
-                                       (< candidate-idx (dec (count candidates))))
-                                (recur (inc candidate-idx) candidate-outcome)
-                                candidate-outcome)))))]
-                  (if (:ok? call-outcome)
-                    (let [_ (telemetry-inc! telemetry* :calls/succeeded)
-                          env' (if (keyword? (:as node))
-                                 (assoc env (:as node) (:slot-val call-outcome))
-                                 env)
-                          emitted' (or (:emitted call-outcome) emitted)]
-                      (recur (inc idx) env' emitted'))
-                    (let [allow-failure? (true? (get-in base-node [:dispatch :allow-failure?]))
-                          _ (telemetry-inc! telemetry* :calls/failed)
-                          _ (when (keyword? (:failure/type call-outcome))
-                              (telemetry-inc-in! telemetry* [:calls/failure-types (:failure/type call-outcome)]))]
-                      (if allow-failure?
-                        (let [env' (if (keyword? (:as node))
-                                     (assoc env (:as node) (:slot-val call-outcome))
-                                     env)]
-                          (recur (inc idx) env' emitted))
-                        (throw (ex-info "Call node failed quality/dispatch policy"
-                                        {:node node
-                                         :outcome call-outcome
-                                         :switch-on switch-on
-                                         :retry-policy retry-policy
-                                         :candidates candidates
-                                         :rejected-candidates rejected})))))))
-
-              :tool
-              (let [base-node      (-> node
-                                       (update :input contracts/materialize-plan env)
-                                       normalize-call-node)
-                    tool-id        (:tool/id base-node)
-                    req-effects    (requested-effects base-node)
-                    allow-failure? (true? (get-in base-node [:dispatch :allow-failure?]))]
-                (when-not (keyword? tool-id)
-                  (throw (ex-info "Tool node requires :tool/id keyword."
-                                  {:node node
-                                   :error :effects/invalid-input
-                                   :failure/type :effects/invalid-input})))
-                (when-not (seq req-effects)
-                  (throw (ex-info "Tool node must declare requested effects in :effects/:allowed."
-                                  {:node node
-                                   :tool/id tool-id
-                                   :error :effects/invalid-input
-                                   :failure/type :effects/invalid-input
-                                   :reason :effects/not-declared
-                                   :retryable? false})))
-                (when-not (fn? invoke-tool)
-                  (throw (ex-info "Workflow runtime is missing :invoke-tool handler."
-                                  {:node node
-                                   :tool/id tool-id
-                                   :error :effects/runtime-missing
-                                   :failure/type :effects/runtime-missing
-                                   :retryable? false})))
-                (let [authz-ctx (enforce-effects-authorization! resolver base-node env)
-                      tool-node (cond-> base-node
-                                  (map? (:auth/user authz-ctx))
-                                  (assoc :auth/user (:auth/user authz-ctx))
-                                  (map? (:roles/config authz-ctx))
-                                  (assoc :roles/config (:roles/config authz-ctx))
-                                  (map? (:auth/effects authz-ctx))
-                                  (assoc :auth/effects (:auth/effects authz-ctx)))]
-                (telemetry-inc! telemetry* :calls/total)
-                (let [outcome
-                      (try
-                        (let [raw-result (invoke-tool tool-node env)
-                              result (if (and (map? raw-result)
-                                              (or (contains? raw-result :result)
-                                                  (contains? raw-result :error)))
-                                       raw-result
-                                       {:result {:type :value
-                                                 :out (cond
-                                                        (map? raw-result) raw-result
-                                                        (string? raw-result) {:text raw-result}
-                                                        (nil? raw-result) {}
-                                                        :else {:value raw-result})}})
-                              done-eval (evaluate-done protocol base-node env result check-fns judge-fn)
-                              _ (telemetry-record-quality! telemetry* done-eval)
-                              failure-type (call-failure-type protocol base-node result done-eval)
-                              failed? (keyword? failure-type)
-                              slot-val (normalize-tool-result tool-id result)]
-                          {:ok? (not failed?)
-                           :tool/id tool-id
-                           :result result
-                           :slot-val slot-val
-                           :done/eval done-eval
-                           :failure/type failure-type
-                           :failure/recover? false})
-                        (catch clojure.lang.ExceptionInfo e
-                          (let [data (or (ex-data e) {})
-                                failure-type (or (:failure/type data)
-                                                 (:error data)
-                                                 :effects/runtime-failed)
-                                slot-val {:tool/id tool-id
-                                          :error (:error data)
-                                          :details data}]
-                            {:ok? false
-                             :tool/id tool-id
-                             :slot-val slot-val
-                             :failure/type failure-type
-                             :failure/recover? false
-                             :details data}))
-                        (catch Throwable t
-                          {:ok? false
-                           :tool/id tool-id
-                           :slot-val {:tool/id tool-id
-                                      :error :effects/runtime-failed
-                                      :message (.getMessage t)}
-                           :failure/type :effects/runtime-failed
-                           :failure/recover? false
-                           :details {:message (.getMessage t)}}))]
-                  (if (:ok? outcome)
-                    (do
-                      (telemetry-inc! telemetry* :calls/succeeded)
-                      (let [env' (if (keyword? (:as node))
-                                   (assoc env (:as node) (:slot-val outcome))
-                                   env)]
-                        (recur (inc idx) env' emitted)))
-                    (do
-                      (telemetry-inc! telemetry* :calls/failed)
-                      (when (keyword? (:failure/type outcome))
-                        (telemetry-inc-in! telemetry* [:calls/failure-types (:failure/type outcome)]))
-                      (if allow-failure?
-                        (let [env' (if (keyword? (:as node))
-                                     (assoc env (:as node) (:slot-val outcome))
-                                     env)]
-                          (recur (inc idx) env' emitted))
-                        (throw (ex-info "Tool node execution failed"
-                                        (merge {:node node
-                                                :outcome outcome}
-                                                (when (map? (:details outcome))
-                                                  (:details outcome)))))))))))
-
-              :emit
-              (let [output (materialize-emit-input (:input node) env)]
-                (recur (inc idx) env output))
-
-              (throw (ex-info "Unsupported plan node operation"
-                              {:op (:op node)
-                               :node node})))))))))
+            (let [{env' :env
+                   emitted' :emitted}
+                  (run-node ctx node env emitted)]
+              (recur (inc idx) env' emitted'))))))))
