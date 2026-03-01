@@ -169,6 +169,17 @@
                                :eval/must-failed}
   :retry                     {:same-cap-max 1
                               :fallback-max 0}
+  :gateway                   {:strategy :latency-first
+                              :intent->strategy {:problem/solve :quality-first
+                                                 :code/generate :quality-first
+                                                 :code/patch :quality-first
+                                                 :text/respond :latency-first
+                                                 :route/decide :latency-first}
+                              :ema-alpha 0.25
+                              :circuit-breaker {:enabled? true
+                                                :min-samples 8
+                                                :error-rate-open 0.65
+                                                :cooldown-ms 30000}}
   :policy                    :quality-aware}
 
  ;; Runtime/profile policy knobs

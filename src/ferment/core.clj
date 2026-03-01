@@ -1358,7 +1358,9 @@
          resolver'     (cond-> (if (map? resolver) resolver {})
                          (map? protocol) (assoc :protocol protocol)
                          (keyword? policy-profile) (assoc :policy/profile policy-profile)
-                         (map? policy-profiles) (assoc :policy/profiles policy-profiles))
+                         (map? policy-profiles) (assoc :policy/profiles policy-profiles)
+                         (instance? clojure.lang.IAtom (:gateway/model-health runtime))
+                         (assoc :gateway/model-health (:gateway/model-health runtime)))
          workflow-env  (cond-> {}
                          (map? (:workflow/env opts)) (merge (:workflow/env opts))
                          (map? (:auth/user opts)) (assoc :auth/user (:auth/user opts))

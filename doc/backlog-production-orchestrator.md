@@ -7,24 +7,30 @@ Execution for top priorities is tracked in `doc/execution-plan-q1.md`.
 
 ## Priority Order
 
-1. [ ] Asynchronous execution queue with SLA controls (`#2`)
+1. [x] Asynchronous execution queue with SLA controls (`#2`)
    - Add job lifecycle for `/v1/act`: `accepted -> running -> completed/failed/canceled`.
    - Add deadline, cancellation, backpressure, and priority handling.
    - Add retry policy with jitter/backoff at orchestrator level (outside model retries).
-   - Delivery status (synced):
+   - Delivery status (synced: 2026-03-01):
      - [x] async lifecycle + endpoints (`/v1/act` accepted, job status, job cancel),
      - [x] in-memory queue workers with deadline/timeout, cancel, priority, backpressure,
      - [x] orchestrator retry with jitter/backoff for transient queue execution failures,
      - [x] queue telemetry counters and HTTP/runtime regression tests,
-     - [ ] explicit profile-level queue config overlays (`runtime.edn`) + operator usage section for async flow.
+     - [x] explicit profile-level queue config overlays (`runtime.edn`) + operator usage section for async flow.
    - Done when:
      - long requests can run async and be polled/retrieved deterministically,
      - queue saturation does not block the whole node,
      - SLA breaches are explicit in telemetry and response status.
 
-2. [ ] Deterministic replay and deep diagnostics (`#10`)
+2. [x] Deterministic replay and deep diagnostics (`#10`)
    - Add replay package: frozen request, resolved routing decision, selected candidates, and policy snapshot.
    - Add replay endpoint/tooling for post-mortem and regression diff.
+   - Delivery status (synced: 2026-03-01):
+     - [x] replay package capture on `/v1/act` (request/routing/policy/response/auth/timing),
+     - [x] deep diagnostics branch in replay (`execution-path`, telemetry `before/after/delta`),
+     - [x] replay endpoint (`/v1/act/replay/{trace-id}`) + compare mode (`?against=<trace-id>`),
+     - [x] deterministic re-execution from replay package (`POST /v1/act/replay/{trace-id}/rerun`) + path comparison,
+     - [x] automated policy/config diff report against replay baseline.
    - Done when:
      - the same replay package reproduces the same execution path,
      - policy/config diffs can be compared against replay outcomes.
@@ -32,6 +38,11 @@ Execution for top priorities is tracked in `doc/execution-plan-q1.md`.
 3. [ ] Advanced model gateway (`#3`)
    - Add per-model health/latency/error scoring.
    - Add gateway strategies: cost-aware selection, circuit breaker, optional hedging.
+   - Delivery status (sync: 2026-03-01):
+     - [x] runtime model-health registry (`:gateway/model-health`) wired to resolver/workflow,
+     - [x] candidate ranking strategies (`:latency-first`, `:quality-first`, `:cost-first`) via `:routing/:gateway`,
+     - [x] circuit-breaker quarantine on open circuits (`:gateway/circuit-open`) with cooldown,
+     - [ ] optional hedging execution (parallel probes + winner selection).
    - Done when:
      - routing can pick model by policy (`latency-first`, `quality-first`, `cost-first`),
      - unstable models are automatically quarantined/fallbacked.

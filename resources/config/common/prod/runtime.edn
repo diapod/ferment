@@ -22,6 +22,20 @@
     :allow-schemes #{:https}
     :allow-hosts []
     :allow-ports []}}
+  :queue
+  {:enabled? false
+   :max-size 256
+   :classes [:interactive :batch]
+   :priority-order [:interactive :batch]
+   :default-class :interactive
+   :workers 1
+   :poll-interval-ms 25
+   :default-timeout-ms 15000
+   :default-deadline-ms 20000
+   :max-deadline-ms 120000
+   :retry {:max-attempts 2
+           :base-backoff-ms 100
+           :jitter-ms 25}}
   :oplog    #ref :ferment.logging/oplog}
 
  }

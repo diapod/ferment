@@ -1,0 +1,13 @@
+{
+ :ferment.runtime/default
+ {:queue
+  {:enabled? true
+   :max-size 96
+   :workers 1
+   :default-timeout-ms 12000
+   :default-deadline-ms 20000
+   :max-deadline-ms 60000
+   :retry {:max-attempts 2
+           :base-backoff-ms 50
+           :jitter-ms 15}}}
+}

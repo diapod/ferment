@@ -652,6 +652,28 @@
   {:entries {}
    :order []})
 
+(def ^:private default-replay-ttl-ms
+  (* 24 60 60 1000))
+
+(def ^:private default-replay-max-size
+  512)
+
+(def ^:private default-replay-redact-keys
+  #{:password
+    :secret
+    :token
+    :authorization
+    :api-key
+    :api/key})
+
+(def ^:private replay-redacted-placeholder
+  "[REDACTED]")
+
+(defn- default-replay-state
+  []
+  {:entries {}
+   :order []})
+
 (defn- normalize-act-response-cache
   [cfg]
   (let [src (if (map? (:response-cache cfg))
@@ -669,10 +691,52 @@
      :max-size max-size
      :state state'}))
 
+(defn- normalize-replay-redact-keys
+  [v]
+  (let [xs (cond
+             (set? v) v
+             (sequential? v) v
+             (some? v) [v]
+             :else [])]
+    (->> xs
+         (keep keywordish)
+         set
+         not-empty
+         (or default-replay-redact-keys))))
+
+(defn- normalize-replay-config
+  [cfg]
+  (let [src (if (map? (:replay cfg))
+              (:replay cfg)
+              {})
+        enabled? (if (contains? src :enabled?)
+                   (boolean (:enabled? src))
+                   false)
+        ttl-ms  (or (parse-non-negative-long (:ttl-ms src))
+                    default-replay-ttl-ms)
+        max-size (parse-positive-int (:max-size src) default-replay-max-size)
+        state' (or (when (instance? clojure.lang.IAtom (:state src))
+                     (:state src))
+                   (atom (default-replay-state)))]
+    {:enabled? enabled?
+     :ttl-ms ttl-ms
+     :max-size max-size
+     :redact-keys (normalize-replay-redact-keys (:redact-keys src))
+     :state state'}))
+
 (defn- act-cache-runtime
   [runtime]
   (let [cache (when (map? runtime) (:response-cache runtime))]
     (when (map? cache) cache)))
+
+(defn- replay-runtime
+  [runtime]
+  (let [replay (when (map? runtime) (:replay runtime))]
+    (when (map? replay) replay)))
+
+(defn- replay-enabled?
+  [runtime]
+  (true? (get-in runtime [:replay :enabled?])))
 
 (defn- act-cache-enabled?
   [runtime]
@@ -716,6 +780,61 @@
                  order)]
     {:state (assoc state :entries entries' :order (vec order'))
      :evicted (count evict-keys)}))
+
+(defn- replay-prune-expired-state
+  [state now-ms]
+  (let [entries (or (:entries state) {})
+        order   (or (:order state) [])
+        [entries' expired]
+        (reduce-kv (fn [[acc removed] k entry]
+                     (let [expires-at (or (parse-non-negative-long (:expires-at entry)) 0)]
+                       (if (and (pos? expires-at) (>= now-ms expires-at))
+                         [acc (inc removed)]
+                         [(assoc acc k entry) removed])))
+                   [{} 0]
+                   entries)]
+    {:state (assoc state
+                   :entries entries'
+                   :order (vec (filter #(contains? entries' %) order)))
+     :evicted expired}))
+
+(defn- replay-prune-size-state
+  [state max-size]
+  (let [max-size' (max 1 (int (or max-size default-replay-max-size)))
+        entries   (or (:entries state) {})
+        order     (vec (or (:order state) []))
+        overflow  (max 0 (- (count order) max-size'))
+        evict-keys (if (pos? overflow) (subvec order 0 overflow) [])
+        entries'  (if (seq evict-keys)
+                    (apply dissoc entries evict-keys)
+                    entries)
+        order'    (if (pos? overflow)
+                    (subvec order overflow)
+                    order)]
+    {:state (assoc state :entries entries' :order (vec order'))
+     :evicted (count evict-keys)}))
+
+(defn- replay-redact
+  [v redact-keys]
+  (cond
+    (map? v)
+    (reduce-kv (fn [acc k value]
+                 (let [k' (keywordish k)]
+                   (assoc acc k
+                          (if (and (keyword? k')
+                                   (contains? redact-keys k'))
+                            replay-redacted-placeholder
+                            (replay-redact value redact-keys)))))
+               {}
+               v)
+
+    (vector? v)
+    (mapv #(replay-redact % redact-keys) v)
+
+    (sequential? v)
+    (into [] (map #(replay-redact % redact-keys)) v)
+
+    :else v))
 
 (defn- act-cache-key
   [request cap-id]
@@ -1420,6 +1539,260 @@
                          (assoc :principal-account-type (:user/account-type principal))
                          (seq (:user/roles principal))
                          (assoc :principal-roles (vec (:user/roles principal))))))))))
+
+(defn- replay-trace-id
+  [phase response]
+  (or (some-> phase :request* :trace :id trim-s)
+      (some-> phase :request :trace :id trim-s)
+      (some-> phase :payload :trace :id trim-s)
+      (some-> response :body :trace :id trim-s)))
+
+(defn- replay-policy-snapshot
+  [phase]
+  (let [intent   (some-> phase :request* :task :intent keywordish)
+        resolver (if (map? (:resolver phase)) (:resolver phase) {})
+        protocol (if (map? (:protocol phase)) (:protocol phase) {})
+        routing  (if (map? (:routing resolver)) (:routing resolver) {})
+        defaults (if (map? (:defaults routing)) (:defaults routing) {})
+        intent->cap (if (map? (:intent->cap routing)) (:intent->cap routing) {})
+        fallback (if (sequential? (:fallback routing))
+                   (vec (keep keywordish (:fallback routing)))
+                   [])
+        snapshot
+        (cond-> {:intent intent
+                 :routing {:defaults defaults
+                           :intent/cap (when (keyword? intent)
+                                         (get intent->cap intent))
+                           :fallback fallback
+                           :policy/profile (or (some-> phase :request* :routing :profile keywordish)
+                                               (some-> phase :request* :policy/profile keywordish)
+                                               (some-> resolver :policy/profile keywordish))}
+                 :protocol {:result/types (if (sequential? (:result/types protocol))
+                                            (vec (keep keywordish (:result/types protocol)))
+                                            [])
+                            :policy/default (if (map? (:policy/default protocol))
+                                              (:policy/default protocol)
+                                              {})}}
+          (keyword? intent)
+          (assoc-in [:protocol :intent] (if (map? (get-in protocol [:intents intent]))
+                                          (get-in protocol [:intents intent])
+                                          {}))
+          (keyword? intent)
+          (assoc-in [:protocol :policy/intent] (if (map? (get-in protocol [:policy/intents intent]))
+                                                 (get-in protocol [:policy/intents intent])
+                                                 {})))
+        snapshot-id (format "%08x" (bit-and 0xffffffff (long (hash snapshot))))]
+    {:snapshot-id snapshot-id
+     :snapshot snapshot}))
+
+(defn- numeric-map-delta
+  [before after]
+  (letfn [(delta [a b]
+            (cond
+              (and (map? a) (map? b))
+              (let [ks (into #{} (concat (keys a) (keys b)))
+                    out (reduce (fn [acc k]
+                                  (let [d (delta (get a k) (get b k))]
+                                    (if (nil? d)
+                                      acc
+                                      (assoc acc k d))))
+                                {}
+                                ks)]
+                (when (seq out) out))
+
+              (and (number? a) (number? b))
+              (let [d (- (double b) (double a))]
+                (when (not (zero? d))
+                  d))
+
+              (and (nil? a) (number? b))
+              (let [d (double b)]
+                (when (not (zero? d))
+                  d))
+
+              :else nil))]
+    (or (delta before after) {})))
+
+(defn- structured-diff
+  [left right]
+  (letfn [(diff* [a b]
+            (cond
+              (= a b)
+              nil
+
+              (and (map? a) (map? b))
+              (let [ks (into #{} (concat (keys a) (keys b)))
+                    out (reduce (fn [acc k]
+                                  (let [d (diff* (get a k) (get b k))]
+                                    (if (nil? d)
+                                      acc
+                                      (assoc acc k d))))
+                                {}
+                                ks)]
+                (when (seq out) out))
+
+              (and (sequential? a) (sequential? b))
+              (let [a' (vec a)
+                    b' (vec b)]
+                (when (not= a' b')
+                  {:from a' :to b'}))
+
+              :else
+              {:from a :to b}))]
+    (or (diff* left right) {})))
+
+(defn- replay-telemetry-view
+  [snapshot]
+  (when (map? snapshot)
+    (select-keys snapshot [:act :workflow :orchestration :kpi])))
+
+(defn- replay-execution-path
+  [phase response]
+  (let [request* (if (map? (:request* phase)) (:request* phase) {})
+        cap-decision (if (map? (:cap/decision phase)) (:cap/decision phase) {})
+        selected-cap (some-> cap-decision :cap/id keywordish)
+        candidates (->> (:candidates cap-decision)
+                        (keep keywordish)
+                        vec)
+        rejected (->> (:rejected-candidates cap-decision)
+                      (keep (fn [entry]
+                              (when (map? entry)
+                                (cond-> {}
+                                  (keyword? (keywordish (:cap/id entry)))
+                                  (assoc :cap/id (keywordish (:cap/id entry)))
+                                  (keyword? (keywordish (:reason entry)))
+                                  (assoc :reason (keywordish (:reason entry)))
+                                  (keyword? (keywordish (:intent entry)))
+                                  (assoc :intent (keywordish (:intent entry)))))))
+                      vec)]
+    (cond-> {:intent (some-> request* :task :intent keywordish)
+             :requested-cap/id (or (some-> request* :task :cap/id keywordish)
+                                   (some-> request* :cap/id keywordish))
+             :selected-cap/id selected-cap
+             :route/mode (keywordish (:route-mode phase))
+             :route/routed? (boolean (:routed? phase))
+             :response/outcome (response-outcome response)
+             :response/error-type (response-error-type response)}
+      (seq candidates) (assoc :candidates candidates)
+      (seq rejected) (assoc :rejected-candidates rejected))))
+
+(defn- replay-diagnostics
+  [phase response telemetry-before telemetry-after]
+  (let [telemetry-before' (replay-telemetry-view telemetry-before)
+        telemetry-after'  (replay-telemetry-view telemetry-after)]
+    {:execution-path (replay-execution-path phase response)
+     :telemetry {:before telemetry-before'
+                 :after telemetry-after'
+                 :delta (numeric-map-delta telemetry-before' telemetry-after')}}))
+
+(defn- replay-entry
+  [phase response auth elapsed-ms replay-cfg telemetry-before telemetry-after]
+  (let [request0 (:request phase)
+        request* (:request* phase)
+        payload  (:payload phase)
+        policy   (replay-policy-snapshot phase)
+        cap-decision (if (map? (:cap/decision phase)) (:cap/decision phase) {})
+        redact-keys (if (set? (:redact-keys replay-cfg))
+                      (:redact-keys replay-cfg)
+                      default-replay-redact-keys)
+        meta-step  (if (map? (:meta-step phase))
+                     (select-keys (:meta-step phase)
+                                  [:mode :enabled? :strict? :attempted? :reason
+                                   :latency-ms :decider-latency-ms])
+                     {})]
+    {:recorded-at (str (java.time.Instant/now))
+     :trace/id (replay-trace-id phase response)
+     :request {:payload (replay-redact payload redact-keys)
+               :prepared (replay-redact request0 redact-keys)
+               :resolved (replay-redact request* redact-keys)}
+     :routing {:mode (:route-mode phase)
+               :routed? (boolean (:routed? phase))
+               :meta-step meta-step
+               :cap/decision (replay-redact cap-decision redact-keys)
+               :route-telemetry (if (map? (:route-telemetry phase))
+                                  (:route-telemetry phase)
+                                  {})
+               :route-decide-latency-ms (:route-decide-latency-ms phase)
+               :route-phase-latency-ms (:route-phase-latency-ms phase)
+               :route-decider-latency-ms (:route-decider-latency-ms phase)}
+     :policy policy
+     :response {:status (int (or (:status response) 500))
+                :outcome (response-outcome response)
+                :error/type (response-error-type response)
+                :body (replay-redact (if (map? (:body response))
+                                       (:body response)
+                                       {})
+                                     redact-keys)}
+     :auth {:source (or (some-> auth :source keywordish)
+                        (some-> request* :auth/source keywordish))
+            :principal (replay-redact (audit-principal auth request*)
+                                      redact-keys)}
+     :diagnostics (replay-diagnostics phase response telemetry-before telemetry-after)
+     :timing {:elapsed-ms (double (or elapsed-ms 0.0))}}))
+
+(defn- record-act-replay!
+  ([runtime phase response auth elapsed-ms]
+   (record-act-replay! runtime phase response auth elapsed-ms nil nil))
+  ([runtime phase response auth elapsed-ms telemetry-before telemetry-after]
+  (when (and (replay-enabled? runtime)
+             (map? phase)
+             (map? response))
+    (let [replay-cfg (replay-runtime runtime)
+          state-atom (:state replay-cfg)
+          trace-id   (replay-trace-id phase response)]
+      (when (and (instance? clojure.lang.IAtom state-atom)
+                 (some? trace-id))
+        (let [now-ms    (System/currentTimeMillis)
+              ttl-ms    (or (parse-non-negative-long (:ttl-ms replay-cfg))
+                            default-replay-ttl-ms)
+              max-size  (or (positive-int (:max-size replay-cfg))
+                            default-replay-max-size)
+              entry0    (replay-entry phase response auth elapsed-ms replay-cfg telemetry-before telemetry-after)
+              entry     (assoc entry0 :expires-at (+ now-ms ttl-ms))]
+          (swap! state-atom
+                 (fn [state]
+                   (let [base (if (map? state) state (default-replay-state))
+                         {:keys [state]} (replay-prune-expired-state base now-ms)
+                         state' (-> state
+                                    (assoc-in [:entries trace-id] entry)
+                                    (update :order (fn [order]
+                                                     (conj (order-without order trace-id)
+                                                           trace-id))))
+                         {:keys [state]} (replay-prune-size-state state' max-size)]
+                     state)))))))
+  nil))
+
+(defn- replay-get
+  [runtime trace-id]
+  (let [trace-id' (trim-s trace-id)]
+    (cond
+      (not (replay-enabled? runtime))
+      {:ok? false :error :replay/disabled}
+
+      (nil? trace-id')
+      {:ok? false :error :replay/invalid-trace-id}
+
+      :else
+      (let [replay-cfg (replay-runtime runtime)
+            state-atom (:state replay-cfg)
+            now-ms (System/currentTimeMillis)]
+        (if-not (instance? clojure.lang.IAtom state-atom)
+          {:ok? false :error :replay/unavailable}
+          (do
+            (swap! state-atom
+                   (fn [state]
+                     (let [{:keys [state]} (replay-prune-expired-state
+                                            (if (map? state) state (default-replay-state))
+                                            now-ms)]
+                       state)))
+            (let [entry (get-in @state-atom [:entries trace-id'])]
+              (if (map? entry)
+                {:ok? true
+                 :trace/id trace-id'
+                 :replay entry}
+                {:ok? false
+                 :error :replay/not-found
+                 :trace/id trace-id'}))))))))
 
 (defn- invocation->participant
   [invocation]
@@ -2743,6 +3116,10 @@
                            (and (map? runtime)
                                 (instance? clojure.lang.IAtom telemetry))
                            (assoc :telemetry telemetry))
+         replay-enabled?* (replay-enabled? runtime*)
+         telemetry-before (when (and replay-enabled?*
+                                     (instance? clojure.lang.IAtom telemetry))
+                            (telemetry-snapshot telemetry))
          started-at      (now-nanos)
          phase3          ((runtime-act-pipeline runtime*)
                           {:runtime runtime*
@@ -2766,7 +3143,11 @@
          cache-telemetry (:cache/telemetry phase3)
          request*        (:request* phase3)]
      (record-act-telemetry! telemetry response'' elapsed-ms route-telemetry cache-telemetry)
+     (let [telemetry-after (when (and replay-enabled?*
+                                      (instance? clojure.lang.IAtom telemetry))
+                             (telemetry-snapshot telemetry))]
      (report-act! runtime* request* response'' auth elapsed-ms)
+       (record-act-replay! runtime* phase3 response'' auth elapsed-ms telemetry-before telemetry-after))
      response'')))
 
 (def ^:private session-public-keys
@@ -3943,6 +4324,21 @@
     (catch Throwable _
       nil)))
 
+(defn- parse-query-params
+  [^HttpExchange exchange]
+  (let [raw (some-> exchange .getRequestURI .getRawQuery trim-s)]
+    (if (str/blank? raw)
+      {}
+      (reduce (fn [acc part]
+                (let [[k v] (str/split (str part) #"=" 2)
+                      k' (decode-uri-part k)
+                      v' (decode-uri-part v)]
+                  (if (some? k')
+                    (assoc acc k' v')
+                    acc)))
+              {}
+              (str/split raw #"&")))))
+
 (defn- parse-job-route
   [^HttpExchange exchange]
   (let [path (some-> exchange .getRequestURI .getPath trim-s)
@@ -3967,6 +4363,284 @@
           (when-some [job-id (decode-uri-part tail)]
             {:action :status
              :job/id job-id}))))))
+
+(defn- parse-replay-route
+  [^HttpExchange exchange]
+  (let [path (some-> exchange .getRequestURI .getPath trim-s)
+        query-params (parse-query-params exchange)
+        against-trace-id (or (get query-params "against")
+                             (get query-params "compare"))
+        prefix "/v1/act/replay/"]
+    (when (and (string? path)
+               (str/starts-with? path prefix))
+      (let [tail0 (subs path (count prefix))
+            tail  (if (str/ends-with? tail0 "/")
+                    (subs tail0 0 (dec (count tail0)))
+                    tail0)]
+        (cond
+          (str/blank? tail)
+          nil
+
+          (str/ends-with? tail "/rerun")
+          (let [raw-id (subs tail 0 (- (count tail) (count "/rerun")))]
+            (when-some [trace-id (decode-uri-part raw-id)]
+              (cond-> {:action :rerun
+                       :trace/id trace-id}
+                (some? against-trace-id)
+                (assoc :against/trace-id against-trace-id))))
+
+          :else
+          (when-some [trace-id (decode-uri-part tail)]
+            (cond-> {:action :get
+                     :trace/id trace-id}
+              (some? against-trace-id)
+              (assoc :against/trace-id against-trace-id))))))))
+
+(defn- replay-error-response
+  [trace-id error]
+  (case error
+    :replay/disabled
+    {:status 404
+     :body (error-envelope nil
+                           :replay/disabled
+                           "Replay storage is disabled for this environment.")}
+
+    :replay/invalid-trace-id
+    {:status 400
+     :body (error-envelope nil
+                           :input/invalid
+                           "Replay trace id is missing or invalid.")}
+
+    :replay/not-found
+    {:status 404
+     :body (error-envelope nil
+                           :replay/not-found
+                           "Replay package not found for provided trace id."
+                           {:trace/id trace-id})}
+
+    :replay/unavailable
+    {:status 503
+     :body (error-envelope nil
+                           :runtime/unavailable
+                           "Replay storage is unavailable.")}
+
+    {:status 500
+     :body (error-envelope nil
+                           :runtime/internal
+                           "Failed to read replay package.")}))
+
+(defn- replay-entry-summary
+  [trace-id entry]
+  (let [policy-id (some-> entry :policy :snapshot-id trim-s)
+        status (some-> entry :response :status)
+        outcome (some-> entry :response :outcome keywordish)
+        error-type (some-> entry :response :error/type keywordish)]
+    (cond-> {:trace/id trace-id
+             :recorded-at (:recorded-at entry)
+             :execution-path (or (get-in entry [:diagnostics :execution-path]) {})
+             :timing (or (:timing entry) {})}
+      (some? status) (assoc :response/status status)
+      (keyword? outcome) (assoc :response/outcome outcome)
+      (keyword? error-type) (assoc :response/error-type error-type)
+      (some? policy-id) (assoc :policy/snapshot-id policy-id))))
+
+(defn- replay-comparison
+  [left-trace-id left-entry right-trace-id right-entry]
+  (let [left-policy-id (some-> left-entry :policy :snapshot-id trim-s)
+        right-policy-id (some-> right-entry :policy :snapshot-id trim-s)
+        left-policy-snapshot (if (map? (get-in left-entry [:policy :snapshot]))
+                               (get-in left-entry [:policy :snapshot])
+                               {})
+        right-policy-snapshot (if (map? (get-in right-entry [:policy :snapshot]))
+                                (get-in right-entry [:policy :snapshot])
+                                {})
+        policy-diff (structured-diff left-policy-snapshot right-policy-snapshot)
+        left-path (or (get-in left-entry [:diagnostics :execution-path]) {})
+        right-path (or (get-in right-entry [:diagnostics :execution-path]) {})
+        left-outcome (some-> left-entry :response :outcome keywordish)
+        right-outcome (some-> right-entry :response :outcome keywordish)
+        left-error (some-> left-entry :response :error/type keywordish)
+        right-error (some-> right-entry :response :error/type keywordish)
+        left-elapsed (double (or (get-in left-entry [:timing :elapsed-ms]) 0.0))
+        right-elapsed (double (or (get-in right-entry [:timing :elapsed-ms]) 0.0))
+        left-telemetry-delta (if (map? (get-in left-entry [:diagnostics :telemetry :delta]))
+                               (get-in left-entry [:diagnostics :telemetry :delta])
+                               {})
+        right-telemetry-delta (if (map? (get-in right-entry [:diagnostics :telemetry :delta]))
+                                (get-in right-entry [:diagnostics :telemetry :delta])
+                                {})
+        telemetry-diff (numeric-map-delta left-telemetry-delta right-telemetry-delta)]
+    (cond-> {:left (replay-entry-summary left-trace-id left-entry)
+             :right (replay-entry-summary right-trace-id right-entry)
+             :same-execution-path? (= left-path right-path)
+             :policy/config {:same? (and (= left-policy-id right-policy-id)
+                                         (= left-policy-snapshot right-policy-snapshot))}}
+      (not= left-policy-id right-policy-id)
+      (assoc :policy/snapshot-id {:from left-policy-id
+                                  :to right-policy-id})
+      (seq policy-diff)
+      (assoc-in [:policy/config :diff] policy-diff)
+      (not= left-path right-path)
+      (assoc :execution-path {:from left-path
+                              :to right-path})
+      (or (not= left-outcome right-outcome)
+          (not= left-error right-error))
+      (assoc :response {:outcome {:from left-outcome
+                                  :to right-outcome}
+                        :error-type {:from left-error
+                                     :to right-error}})
+      (not= left-elapsed right-elapsed)
+      (assoc :timing/elapsed-ms {:from left-elapsed
+                                 :to right-elapsed
+                                 :delta (- right-elapsed left-elapsed)})
+      (seq telemetry-diff)
+      (assoc :telemetry/delta {:from left-telemetry-delta
+                               :to right-telemetry-delta
+                               :diff telemetry-diff}))))
+
+(defn- replay-rerun-trace-id
+  [source-trace-id rerun-options]
+  (or (some-> rerun-options :trace/id trim-s)
+      (format "%s::rerun::%s"
+              source-trace-id
+              (subs (str (java.util.UUID/randomUUID)) 0 8))))
+
+(defn- replay-rerun-response
+  [runtime telemetry source-trace-id rerun-options auth]
+  (let [source-id (trim-s source-trace-id)
+        source-result (replay-get runtime source-id)]
+    (if-not (:ok? source-result)
+      (replay-error-response source-id (:error source-result))
+      (let [source-entry (:replay source-result)
+            payload0 (get-in source-entry [:request :payload])]
+        (if-not (map? payload0)
+          {:status 422
+           :body (error-envelope nil
+                                 :replay/invalid-payload
+                                 "Replay package does not contain valid request payload."
+                                 {:trace/id source-id})}
+          (let [rerun-id (replay-rerun-trace-id source-id rerun-options)
+                payload  (assoc payload0 :trace {:id rerun-id})
+                invoke-response (invoke-act runtime payload telemetry auth)
+                rerun-result (replay-get runtime rerun-id)]
+            (if-not (:ok? rerun-result)
+              {:status 502
+               :body (error-envelope nil
+                                     :replay/rerun-not-recorded
+                                     "Replay rerun finished, but replay package was not recorded."
+                                     {:trace/id source-id
+                                      :rerun/trace-id rerun-id})}
+              {:status 200
+               :body {:ok? true
+                      :source/trace-id source-id
+                      :rerun/trace-id rerun-id
+                      :rerun/response {:status (:status invoke-response)
+                                       :body (:body invoke-response)}
+                      :comparison (replay-comparison source-id
+                                                    source-entry
+                                                    rerun-id
+                                                    (:replay rerun-result))}})))))))
+
+(defn- act-replay-response
+  ([runtime trace-id]
+   (act-replay-response runtime trace-id nil))
+  ([runtime trace-id against-trace-id]
+   (let [trace-id' (trim-s trace-id)
+         against'  (trim-s against-trace-id)
+         result    (replay-get runtime trace-id')]
+     (if-not (:ok? result)
+       (replay-error-response trace-id' (:error result))
+       (if-not against'
+         {:status 200
+          :body result}
+         (let [against-result (replay-get runtime against')]
+           (if-not (:ok? against-result)
+             (let [{:keys [status body]} (replay-error-response against' (:error against-result))]
+               {:status status
+                :body (update body :error merge {:details {:against/trace-id against'}})})
+             {:status 200
+              :body {:ok? true
+                     :trace/id trace-id'
+                     :replay (:replay result)
+                     :against/trace-id against'
+                     :comparison (replay-comparison trace-id'
+                                                   (:replay result)
+                                                   against'
+                                                   (:replay against-result))}})))))))
+
+(defn- act-replay-handler
+  [runtime telemetry]
+  (reify HttpHandler
+    (handle [_ exchange]
+      (let [route (parse-replay-route exchange)
+            method (some-> (.getRequestMethod exchange) str/upper-case)]
+        (cond
+          (not (map? route))
+          (write-response! exchange
+                           404
+                           (encode-response
+                            (error-envelope nil
+                                            :not-found
+                                            "Replay endpoint not found.")))
+
+          (= :get (:action route))
+          (if (not= "GET" method)
+            (write-response! exchange
+                             405
+                             (encode-response
+                              (error-envelope nil
+                                              :method-not-allowed
+                                              "Only GET is supported for replay endpoint."
+                                              {:allowed ["GET"]})))
+            (let [authn (authenticate-request runtime exchange nil :http.v1/act)]
+              (if-not (:ok? authn)
+                (let [{:keys [status body headers]} (:response authn)]
+                  (write-response! exchange status (encode-response body) headers))
+                (let [{:keys [status body]} (act-replay-response runtime
+                                                                 (:trace/id route)
+                                                                 (:against/trace-id route))]
+                  (write-response! exchange status (encode-response body))))))
+
+          (= :rerun (:action route))
+          (if (not= "POST" method)
+            (write-response! exchange
+                             405
+                             (encode-response
+                              (error-envelope nil
+                                              :method-not-allowed
+                                              "Only POST is supported for replay rerun endpoint."
+                                              {:allowed ["POST"]})))
+            (let [ctype        (content-type exchange)
+                  body-str     (read-body exchange)
+                  auth-payload (safe-decode-request-body body-str ctype)
+                  authn        (authenticate-request runtime exchange auth-payload :http.v1/act)]
+              (if-not (:ok? authn)
+                (let [{:keys [status body headers]} (:response authn)]
+                  (write-response! exchange status (encode-response body) headers))
+                (try
+                  (let [rerun-options (decode-request-body body-str ctype)
+                        rerun-options' (if (map? rerun-options) rerun-options {})
+                        {:keys [status body]} (replay-rerun-response runtime
+                                                                     telemetry
+                                                                     (:trace/id route)
+                                                                     rerun-options'
+                                                                     (:auth authn))]
+                    (write-response! exchange status (encode-response body)))
+                  (catch Throwable t
+                    (write-response! exchange
+                                     400
+                                     (encode-response
+                                      (error-envelope nil
+                                                      :input/invalid
+                                                      (.getMessage t)))))))))
+
+          :else
+          (write-response! exchange
+                           404
+                           (encode-response
+                            (error-envelope nil
+                                            :not-found
+                                            "Replay endpoint not found."))))))))
 
 (defn- act-jobs-handler
   [runtime]
@@ -4176,6 +4850,7 @@
           host     (or (trim-s (:host cfg)) "127.0.0.1")
           port     (parse-port (:port cfg))
           response-cache (normalize-act-response-cache cfg)
+          replay (normalize-replay-config cfg)
           act-middleware (when (sequential? (:act/middleware cfg))
                            (vec (:act/middleware cfg)))
           runtime0 (let [r (if (map? (:runtime cfg)) (:runtime cfg) {})]
@@ -4186,6 +4861,8 @@
                        (assoc :auth (:auth cfg))
                        (map? response-cache)
                        (assoc :response-cache response-cache)
+                       (map? replay)
+                       (assoc :replay replay)
                        (seq act-middleware)
                        (assoc :act/middleware act-middleware)))
           runtime  (assoc runtime0
@@ -4202,6 +4879,8 @@
                  "/v1/act" {:type :protocol-act}
                  "/v1/act/jobs/{job-id}" {:type :protocol-act-job-status}
                  "/v1/act/jobs/{job-id}/cancel" {:type :protocol-act-job-cancel}
+                 "/v1/act/replay/{trace-id}" {:type :protocol-act-replay}
+                 "/v1/act/replay/{trace-id}/rerun" {:type :protocol-act-replay-rerun}
                  "/v1/session" {:type :session-bridge}
                  "/v1/admin" {:type :admin}
                  "/health" {:type :health}
@@ -4214,6 +4893,7 @@
         (.createContext server endpoint (invoke-handler route)))
       (.createContext server "/v1/act" (act-handler runtime telemetry-state))
       (.createContext server "/v1/act/jobs" (act-jobs-handler runtime))
+      (.createContext server "/v1/act/replay" (act-replay-handler runtime telemetry-state))
       (.createContext server "/v1/session" (session-handler runtime telemetry-state))
       (.createContext server "/v1/admin" (admin-handler runtime))
       (.createContext server "/health" (health-handler (count public-routes)))
@@ -4228,13 +4908,15 @@
                                                  :act/middleware (count (if (seq act-middleware)
                                                                           act-middleware
                                                                           (default-act-middleware-modules)))
-                                                 :cache/enabled? (true? (:enabled? response-cache))})
+                                                 :cache/enabled? (true? (:enabled? response-cache))
+                                                 :replay/enabled? (true? (:enabled? replay))})
       {:host host
        :port port
        :server server
        :executor executor
        :telemetry telemetry-state
        :response-cache response-cache
+       :replay replay
        :routes public-routes})
     (catch Throwable t
       (telemetry/record-lifecycle! :http :error {:key _k

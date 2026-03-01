@@ -1,0 +1,128 @@
+#!/bin/sh
+
+set -eu
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Missing required command: curl" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Missing required command: jq" >&2
+  exit 1
+fi
+
+usage() {
+  cat <<'EOF' >&2
+Usage: bin/replay-diff TRACE_A TRACE_B [--url URL] [--raw] [--save PATH]
+
+Compares two replay traces via:
+  GET /v1/act/replay/{TRACE_A}?against={TRACE_B}
+
+Options:
+  --url URL   Base endpoint (default: $FERMENT_URL or http://127.0.0.1:12002)
+  --raw       Print full JSON response without summary formatting
+  --save PATH Save full JSON response to PATH
+  -h, --help  Show this help
+EOF
+}
+
+: "${FERMENT_URL:=http://127.0.0.1:12002}"
+
+trace_a=""
+trace_b=""
+raw="false"
+url="$FERMENT_URL"
+save_path=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --raw)
+      raw="true"
+      shift
+      ;;
+    --url)
+      url="${2:-}"
+      shift 2
+      ;;
+    --save)
+      save_path="${2:-}"
+      shift 2
+      ;;
+    --*)
+      echo "Unknown option: $1" >&2
+      usage
+      exit 2
+      ;;
+    *)
+      if [ -z "$trace_a" ]; then
+        trace_a="$1"
+      elif [ -z "$trace_b" ]; then
+        trace_b="$1"
+      else
+        echo "Unexpected argument: $1" >&2
+        usage
+        exit 2
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$trace_a" ] || [ -z "$trace_b" ]; then
+  echo "Both TRACE_A and TRACE_B are required." >&2
+  usage
+  exit 2
+fi
+
+base_url="$(printf '%s' "$url" | sed 's:/*$::')"
+enc_a="$(jq -rn --arg v "$trace_a" '$v|@uri')"
+enc_b="$(jq -rn --arg v "$trace_b" '$v|@uri')"
+endpoint="${base_url}/v1/act/replay/${enc_a}?against=${enc_b}"
+
+tmp_body="$(mktemp)"
+cleanup() {
+  rm -f "$tmp_body"
+}
+trap cleanup EXIT INT TERM
+
+http_code="$(curl -sS -o "$tmp_body" -w '%{http_code}' "$endpoint")"
+
+if [ -n "$save_path" ]; then
+  save_dir="$(dirname "$save_path")"
+  mkdir -p "$save_dir"
+  cp "$tmp_body" "$save_path"
+fi
+
+if [ "$raw" = "true" ]; then
+  cat "$tmp_body"
+  echo
+  exit 0
+fi
+
+if [ "$http_code" != "200" ]; then
+  echo "Replay diff request failed (HTTP ${http_code})." >&2
+  jq -r '.error? // .' "$tmp_body" >&2
+  exit 1
+fi
+
+jq -r '
+  .comparison as $cmp
+  | [
+      ("source: " + (.trace/id // "<missing>")),
+      ("against: " + (.["against/trace-id"] // "<missing>")),
+      ("same-execution-path?: " + (($cmp["same-execution-path?"] // false)|tostring)),
+      ("policy/config.same?: " + (($cmp.policy.config["same?"] // false)|tostring)),
+      ("policy/snapshot-id change: " + ((if ($cmp["policy/snapshot-id"] // null) == null
+                                          then "no"
+                                          else "yes"
+                                          end))),
+      ("timing delta ms: " + ((($cmp["timing/elapsed-ms"].delta // 0)|tostring))),
+      ("response changed?: " + (((if ($cmp.response // null) == null then false else true end)|tostring)),
+      ("execution-path changed?: " + (((if ($cmp["execution-path"] // null) == null then false else true end)|tostring))
+    ] | .[]
+' "$tmp_body"

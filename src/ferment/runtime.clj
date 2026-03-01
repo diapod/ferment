@@ -491,10 +491,16 @@
     (let [cfg (-> (preconfigure-runtime _k config)
                   validate-router-capabilities!
                   attach-router-to-resolver)
+          gateway-health (atom {})
+          resolver' (if (map? (:resolver cfg))
+                      (assoc (:resolver cfg) :gateway/model-health gateway-health)
+                      (:resolver cfg))
           queue-service (queue/init-service (:queue cfg))
           runtime0 (assoc cfg
+                          :resolver resolver'
                           :queue (queue/config queue-service)
                           :queue/service queue-service
+                          :gateway/model-health gateway-health
                           :ferment.model.session/workers (atom {})
                           :ferment.model.session/last-id-by-model (atom {})
                           :ferment.model.session/lock (Object.))

@@ -32,7 +32,7 @@ Window: remaining Q1 2026 delivery cycle.
   - jittered retry for transient orchestrator/runtime failures
 
 ### Config
-- [ ] Add queue branch in runtime config:
+- [x] Add queue branch in runtime config:
   - `resources/config/common/prod/runtime.edn`
   - `resources/config/common/test-live/runtime.edn` (if needed as overlay)
 - [ ] Add SLA defaults per intent in protocol/router config:
@@ -92,11 +92,11 @@ Window: remaining Q1 2026 delivery cycle.
   - ensure routes are mounted in all relevant profiles.
 
 #### A5. Configuration
-- [ ] `resources/config/common/prod/runtime.edn`
+- [x] `resources/config/common/prod/runtime.edn`
   - add queue branch:
     - `enabled?`, `max-size`, `workers`, `default-timeout-ms`, `max-deadline-ms`
     - retry defaults (`max-attempts`, `base-backoff-ms`, `jitter-ms`).
-- [ ] `resources/config/common/test-live/runtime.edn`
+- [x] `resources/config/common/test-live/runtime.edn`
   - add conservative queue defaults for live smoke.
 - [ ] `resources/config/common/prod/protocol.edn`
   - add intent-level async/SLA defaults:
@@ -116,7 +116,7 @@ Window: remaining Q1 2026 delivery cycle.
   - queue counters/snapshot validated through `/diag/telemetry` assertions in `test/ferment/http_test.clj`.
 
 #### A7. Operational playbook
-- [ ] `doc/usage.md`
+- [x] `doc/usage.md`
   - document async usage examples (`submit`, `poll`, `cancel`)
   - document queue/SLA knobs and recommended defaults.
 - [ ] Smoke script update (existing benchmark pack)
@@ -149,15 +149,15 @@ Window: remaining Q1 2026 delivery cycle.
 ## Milestone C (P3): Advanced Model Gateway
 
 ### Implementation
-- [ ] Add per-model health registry:
+- [x] Add per-model health registry:
   - rolling latency/error window
   - availability status
-- [ ] Add selection strategies:
+- [x] Add selection strategies:
   - `latency-first`
   - `quality-first`
   - `cost-first`
 - [ ] Add resilience patterns:
-  - circuit breaker per model endpoint
+  - [x] circuit breaker per model endpoint
   - optional hedging for selected intents (guarded by config)
 
 ### Config
@@ -167,8 +167,8 @@ Window: remaining Q1 2026 delivery cycle.
   - strategy per intent/profile
 
 ### Tests
-- [ ] Router test: strategy chooses expected model candidate
-- [ ] Gateway test: breaker opens after threshold and routes away
+- [x] Router test: strategy chooses expected model candidate
+- [x] Gateway test: breaker opens after threshold and routes away
 - [ ] Hedge test: slower candidate is canceled/ignored after winner selected
 
 ## Rollout Sequence

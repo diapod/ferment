@@ -11,6 +11,10 @@
                         :response-cache {:enabled? false
                                          :ttl-ms   120000
                                          :max-size 256}
+                        :replay {:enabled? false
+                                 :ttl-ms 86400000
+                                 :max-size 512
+                                 :redact-keys [:password :secret :token :authorization :api-key :api/key]}
                         :models #ref :ferment/models
                         :auth   {:enabled? false
                                  :realm    "ferment"

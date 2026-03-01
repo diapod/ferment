@@ -524,6 +524,162 @@
         (is (= :runtime/overloaded (get-in response [:body :error :type])))
         (is (= :queue/full (get-in response [:body :error :details :error])))))))
 
+(deftest invoke-act-records-replay-package-when-enabled
+  (testing "invoke-act stores replay package under trace id when replay storage is enabled."
+    (let [runtime {:protocol {}
+                   :resolver {}
+                   :replay {:enabled? true
+                            :ttl-ms 60000
+                            :max-size 16
+                            :redact-keys #{:token}
+                            :state (atom {:entries {}
+                                          :order []})}}
+          telemetry (atom {})
+          payload {:proto 1
+                   :trace {:id "t-replay-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"
+                           :token "secret-token"}}
+          _response (with-redefs [core/call-capability
+                                  (fn [_runtime _resolver _opts]
+                                    {:result {:type :value
+                                              :out {:text "ok"}}})]
+                      (http/invoke-act runtime payload telemetry nil))
+          replay (#'ferment.http/replay-get runtime "t-replay-1")]
+      (is (= true (:ok? replay)))
+      (is (= "t-replay-1" (:trace/id replay)))
+      (is (= "[REDACTED]"
+             (get-in replay [:replay :request :payload :input :token])))
+      (is (= "ok"
+             (get-in replay [:replay :response :body :result :out :text])))
+      (is (= :text/respond
+             (get-in replay [:replay :diagnostics :execution-path :intent])))
+      (is (= :llm/voice
+             (get-in replay [:replay :diagnostics :execution-path :selected-cap/id])))
+      (is (pos? (double (or (get-in replay [:replay :diagnostics :telemetry :delta :act :requests])
+                            0.0)))))))
+
+(deftest act-replay-response-maps-errors-to-stable-http-statuses
+  (testing "Replay endpoint response helper maps canonical replay errors to deterministic HTTP statuses."
+    (is (= 404
+           (:status (#'ferment.http/act-replay-response {} "trace-1"))))
+    (is (= :replay/disabled
+           (get-in (#'ferment.http/act-replay-response {} "trace-1")
+                   [:body :error :type])))
+    (is (= 400
+           (:status (#'ferment.http/act-replay-response
+                     {:replay {:enabled? true
+                               :state (atom {:entries {}
+                                            :order []})}}
+                     "   "))))
+    (is (= 404
+           (:status (#'ferment.http/act-replay-response
+                     {:replay {:enabled? true
+                               :state (atom {:entries {}
+                                            :order []})}}
+                     "trace-404"))))))
+
+(deftest act-replay-response-can-compare-two-replays
+  (testing "Replay helper may compare two trace packages and return deterministic execution-path diff."
+    (let [runtime {:protocol {}
+                   :resolver {}
+                   :replay {:enabled? true
+                            :ttl-ms 60000
+                            :max-size 16
+                            :state (atom {:entries {}
+                                          :order []})}}
+          payload-a {:proto 1
+                     :trace {:id "t-replay-cmp-a"}
+                     :task {:intent :text/respond
+                            :cap/id :llm/voice}
+                     :input {:prompt "A"}}
+          payload-b {:proto 1
+                     :trace {:id "t-replay-cmp-b"}
+                     :task {:intent :text/respond
+                            :cap/id :llm/voice}
+                     :input {:prompt "B"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver opts]
+                      {:result {:type :value
+                                :out {:text (str "ok-" (get-in opts [:input :prompt]))}}})]
+        (http/invoke-act runtime payload-a (atom {}) nil)
+        (http/invoke-act runtime payload-b (atom {}) nil))
+      (let [response (#'ferment.http/act-replay-response runtime "t-replay-cmp-a" "t-replay-cmp-b")
+            comparison (get-in response [:body :comparison])]
+        (is (= 200 (:status response)))
+        (is (= true (get-in response [:body :ok?])))
+        (is (= "t-replay-cmp-a" (get-in response [:body :trace/id])))
+        (is (= "t-replay-cmp-b" (get-in response [:body :against/trace-id])))
+        (is (= true (:same-execution-path? comparison)))
+        (is (= true (get-in comparison [:policy/config :same?])))
+        (is (= :text/respond
+               (get-in comparison [:left :execution-path :intent])))
+        (is (= :text/respond
+               (get-in comparison [:right :execution-path :intent]))))
+      (let [missing (#'ferment.http/act-replay-response runtime "t-replay-cmp-a" "trace-404")]
+        (is (= 404 (:status missing)))
+        (is (= :replay/not-found (get-in missing [:body :error :type])))
+        (is (= "trace-404"
+               (get-in missing [:body :error :details :against/trace-id])))))))
+
+(deftest replay-comparison-includes-policy-config-diff
+  (testing "Policy/config diff report is included when replay snapshots differ."
+    (let [left-entry {:policy {:snapshot-id "aaa111"
+                               :snapshot {:intent :text/respond
+                                          :routing {:policy/profile :balanced}
+                                          :protocol {:result/types [:value]}}}
+                      :response {:outcome :ok}
+                      :diagnostics {:execution-path {:intent :text/respond}
+                                    :telemetry {:delta {:act {:requests 1.0}}}}
+                      :timing {:elapsed-ms 10.0}}
+          right-entry {:policy {:snapshot-id "bbb222"
+                                :snapshot {:intent :text/respond
+                                           :routing {:policy/profile :high-quality}
+                                           :protocol {:result/types [:value :stream]}}}
+                       :response {:outcome :ok}
+                       :diagnostics {:execution-path {:intent :text/respond}
+                                     :telemetry {:delta {:act {:requests 1.0}}}}
+                       :timing {:elapsed-ms 11.0}}
+          comparison (#'ferment.http/replay-comparison
+                      "trace-left" left-entry "trace-right" right-entry)]
+      (is (= false (get-in comparison [:policy/config :same?])))
+      (is (= {:from "aaa111" :to "bbb222"} (:policy/snapshot-id comparison)))
+      (is (= {:from :balanced :to :high-quality}
+             (get-in comparison [:policy/config :diff :routing :policy/profile])))
+      (is (= {:from [:value] :to [:value :stream]}
+             (get-in comparison [:policy/config :diff :protocol :result/types]))))))
+
+(deftest replay-rerun-response-reruns-recorded-request-and-compares-path
+  (testing "Replay rerun helper executes frozen payload under new trace id and returns comparison against source trace."
+    (let [runtime {:protocol {}
+                   :resolver {}
+                   :replay {:enabled? true
+                            :ttl-ms 60000
+                            :max-size 16
+                            :state (atom {:entries {}
+                                          :order []})}}
+          telemetry (atom {})
+          payload {:proto 1
+                   :trace {:id "t-replay-rerun-src"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "RERUN-SRC"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver opts]
+                      {:result {:type :value
+                                :out {:text (str "ok-" (get-in opts [:input :prompt]))}}})]
+        (http/invoke-act runtime payload telemetry nil)
+        (let [rerun (#'ferment.http/replay-rerun-response runtime telemetry "t-replay-rerun-src" {} nil)
+              rerun-id (get-in rerun [:body :rerun/trace-id])]
+          (is (= 200 (:status rerun)))
+          (is (= true (get-in rerun [:body :ok?])))
+          (is (= "t-replay-rerun-src" (get-in rerun [:body :source/trace-id])))
+          (is (string? rerun-id))
+          (is (not= "t-replay-rerun-src" rerun-id))
+          (is (= true (get-in rerun [:body :comparison :same-execution-path?])))
+          (is (= 200 (get-in rerun [:body :rerun/response :status]))))))))
+
 (deftest queue-job-status-response-returns-canonical-payload
   (testing "Queue job status endpoint response returns canonical payload for existing and missing jobs."
     (let [service (queue/init-service {:enabled? true
@@ -874,13 +1030,14 @@
                                      :problem/solve
                                      {:response "ACID to zestaw gwarancji dla transakcji."}
                                      :text/respond
-                                     (case (swap! text-respond-calls inc)
-                                       ;; voice-primary -> hard fail (list expansion)
-                                       1 {:response "- atomowość\n- spójność\n- izolacja\n- trwałość"}
-                                       ;; voice-final attempt #1 -> hard fail (truncated ending)
-                                       2 {:response "ACID to zestaw gwarancji dla transakcji"}
-                                       ;; voice-final retry #2 -> pass
-                                       {:response "- atomowość.\n- spójność.\n- izolacja.\n- trwałość."})
+                                     (let [attempt (swap! text-respond-calls inc)]
+                                       (cond
+                                         ;; voice-primary -> hard fail (list expansion)
+                                         (= attempt 1) {:response "- atomowość\n- spójność\n- izolacja\n- trwałość"}
+                                         ;; voice-final attempt #1 -> hard fail (truncated ending)
+                                         (= attempt 2) {:response "ACID to zestaw gwarancji dla transakcji"}
+                                         ;; voice-final retry #2 -> pass
+                                         :else {:response "- atomowość.\n- spójność.\n- izolacja.\n- trwałość."}))
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
       (is (= 200 (:status response)))

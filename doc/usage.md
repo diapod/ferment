@@ -453,7 +453,68 @@ Contract:
 - final user output is sanitized (no `<think>` / tool markers),
 - raw model artifacts stay only in transcript diagnostics.
 
-## 12) Repeatable live benchmark pack
+## 12) Deterministic replay package and diff
+
+Enable replay storage in HTTP config (`resources/config/common/prod/http.edn`):
+
+```edn
+:replay {:enabled? true
+         :ttl-ms 86400000
+         :max-size 512
+         :redact-keys [:password :secret :token :authorization]}
+```
+
+Read replay package for a trace id:
+
+```bash
+curl -s "http://127.0.0.1:12002/v1/act/replay/<trace-id>" | jq
+```
+
+Compare two replays (post-mortem diff):
+
+```bash
+curl -s "http://127.0.0.1:12002/v1/act/replay/<trace-a>?against=<trace-b>" | jq '.comparison'
+```
+
+Operator shortcut:
+
+```bash
+bin/replay-diff <trace-a> <trace-b>
+```
+
+Raw JSON mode:
+
+```bash
+bin/replay-diff <trace-a> <trace-b> --raw
+```
+
+Save full JSON response to file:
+
+```bash
+bin/replay-diff <trace-a> <trace-b> --save target/replay-diff.json
+```
+
+Deterministic rerun from stored replay payload:
+
+```bash
+curl -s -X POST "http://127.0.0.1:12002/v1/act/replay/<trace-id>/rerun" \
+  -H 'Content-Type: application/json' \
+  -d '{}' | jq
+```
+
+Replay package includes:
+- frozen request payload (`payload/prepared/resolved`),
+- routing decision snapshot (`candidates`, `selected-cap/id`, rejected candidates),
+- policy snapshot (`policy/snapshot-id` + payload),
+- deep diagnostics (`execution-path`, telemetry `before/after/delta`),
+- final response envelope and timing.
+
+Replay comparison output includes automated policy/config diff report:
+- `comparison.policy/config.same?`
+- `comparison.policy/config.diff` (recursive `from/to` for changed fields)
+- `comparison.policy/snapshot-id` when snapshot ids diverge.
+
+## 13) Repeatable live benchmark pack
 
 Run canonical benchmark suite against a running node:
 
@@ -520,3 +581,64 @@ Per-case result payload (`results.json`) also includes normalized workflow timin
 - `route_decider_latency_ms` (same value as explicit alias for readability),
 - `route_phase_latency_ms` (full meta-routing phase in HTTP bridge),
 so ad-hoc jq analysis does not depend on hyphenated JSON keys.
+
+## 14) Async `/v1/act` queue flow (operator mode)
+
+Use this flow when request execution should be accepted quickly and completed out-of-band.
+
+Submit async job:
+
+```bash
+curl -s http://127.0.0.1:12002/v1/act \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "proto": 1,
+    "trace": {"id": "async-1"},
+    "response/type": "accepted",
+    "task": {"intent": "text/respond"},
+    "queue": {"class": "interactive", "deadline-ms": 20000},
+    "input": {"prompt": "Explain ACID briefly and give one example."}
+  }' | jq
+```
+
+Expected response: `202` with canonical accepted payload (`job/id`, `job/status=queued`, timestamps, queue class).
+
+Poll job status:
+
+```bash
+JOB_ID="job/123"
+curl -s "http://127.0.0.1:12002/v1/act/jobs/${JOB_ID}" | jq
+```
+
+Cancel job:
+
+```bash
+JOB_ID="job/123"
+curl -s -X POST "http://127.0.0.1:12002/v1/act/jobs/${JOB_ID}/cancel" \
+  -H 'Content-Type: application/json' \
+  -d '{"cancel/reason":"operator"}' | jq
+```
+
+Queue observability:
+
+```bash
+curl -s http://127.0.0.1:12002/diag/telemetry | jq '.telemetry.queue'
+```
+
+Key counters:
+- `jobs/submitted`
+- `jobs/started`
+- `jobs/completed`
+- `jobs/failed`
+- `jobs/canceled`
+- `jobs/expired`
+
+Queue config source of truth:
+- base defaults: `resources/config/common/prod/runtime.edn` (`:ferment.runtime/default :queue`)
+- dev overlay: `resources/config/common/dev/runtime.edn`
+- test-live overlay: `resources/config/common/test-live/runtime.edn`
+
+Important knobs:
+- `enabled?`, `max-size`, `workers`, `priority-order`
+- `default-timeout-ms`, `default-deadline-ms`, `max-deadline-ms`
+- `retry.max-attempts`, `retry.base-backoff-ms`, `retry.jitter-ms`

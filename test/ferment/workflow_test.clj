@@ -352,6 +352,73 @@
           (is (= reason
                  (get-in decision [:rejected-candidates 0 :reason]))))))))
 
+(deftest resolve-capability-decision-applies-gateway-strategy-ranking
+  (testing "Gateway strategy can reorder valid candidates using model health and cost signals."
+    (let [health* (atom {:ferment.model/voice {:calls 12
+                                               :errors 7
+                                               :latency/ema-ms 800.0
+                                               :quality/ema 0.45}
+                         :ferment.model/solver {:calls 12
+                                                :errors 1
+                                                :latency/ema-ms 1400.0
+                                                :quality/ema 0.92}})
+          resolver {:routing {:gateway {:strategy :quality-first}
+                              :intent->cap {:text/respond :llm/voice}}
+                    :gateway/model-health health*
+                    :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                             :cap/intents #{:text/respond}
+                                             :cap/can-produce #{:value}
+                                             :cap/effects-allowed #{:none}
+                                             :cap/cost {:latency-ms 1200}
+                                             :dispatch/model-key :ferment.model/voice}
+                                 :llm/solver-text {:cap/id :llm/solver-text
+                                                   :cap/intents #{:text/respond}
+                                                   :cap/can-produce #{:value}
+                                                   :cap/effects-allowed #{:none}
+                                                   :cap/cost {:latency-ms 1700}
+                                                   :dispatch/model-key :ferment.model/solver}}}
+          decision (workflow/resolve-capability-decision resolver
+                                                         {:intent :text/respond
+                                                          :dispatch {:candidates [:llm/voice
+                                                                                  :llm/solver-text]}})]
+      (is (= :llm/solver-text (:cap/id decision)))
+      (is (= [:llm/solver-text :llm/voice] (:candidates decision)))
+      (is (empty? (:rejected-candidates decision))))))
+
+(deftest resolve-capability-decision-quarantines-open-circuit-candidate
+  (testing "Gateway breaker filters out candidates in open-circuit state when alternatives exist."
+    (let [future-ms (+ (System/currentTimeMillis) 60000)
+          health* (atom {:ferment.model/voice {:calls 15
+                                               :errors 12
+                                               :latency/ema-ms 600.0
+                                               :quality/ema 0.30
+                                               :breaker/open-until-ms future-ms}})
+          resolver {:routing {:gateway {:strategy :latency-first
+                                        :circuit-breaker {:enabled? true
+                                                          :min-samples 5
+                                                          :error-rate-open 0.6
+                                                          :cooldown-ms 30000}}
+                              :intent->cap {:text/respond :llm/voice}}
+                    :gateway/model-health health*
+                    :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                             :cap/intents #{:text/respond}
+                                             :cap/can-produce #{:value}
+                                             :cap/effects-allowed #{:none}
+                                             :dispatch/model-key :ferment.model/voice}
+                                 :llm/solver-text {:cap/id :llm/solver-text
+                                                   :cap/intents #{:text/respond}
+                                                   :cap/can-produce #{:value}
+                                                   :cap/effects-allowed #{:none}
+                                                   :dispatch/model-key :ferment.model/solver}}}
+          decision (workflow/resolve-capability-decision resolver
+                                                         {:intent :text/respond
+                                                          :dispatch {:candidates [:llm/voice
+                                                                                  :llm/solver-text]}})]
+      (is (= :llm/solver-text (:cap/id decision)))
+      (is (= [:llm/solver-text] (:candidates decision)))
+      (is (= :gateway/circuit-open
+             (get-in decision [:rejected-candidates 0 :reason]))))))
+
 (deftest execute-plan-filters-candidates-by-requires-out-schema
   (testing "CallNode :requires/:out-schema is a hard routing contract for candidate capabilities."
     (let [calls (atom [])
@@ -779,3 +846,53 @@
       (is (= {:path "x.txt"
               :wrote? true}
              (:emitted run))))))
+
+(deftest execute-plan-updates-gateway-model-health
+  (testing "Successful and failed call attempts update per-model health registry."
+    (let [health* (atom {})
+          calls   (atom 0)
+          resolver {:routing {:gateway {:strategy :latency-first
+                                        :ema-alpha 0.5
+                                        :circuit-breaker {:enabled? true
+                                                          :min-samples 2
+                                                          :error-rate-open 0.5
+                                                          :cooldown-ms 2000}}}
+                    :gateway/model-health health*
+                    :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                             :cap/intents #{:text/respond}
+                                             :cap/can-produce #{:value}
+                                             :cap/effects-allowed #{:none}
+                                             :dispatch/model-key :ferment.model/voice}
+                                 :llm/solver-text {:cap/id :llm/solver-text
+                                                   :cap/intents #{:text/respond}
+                                                   :cap/can-produce #{:value}
+                                                   :cap/effects-allowed #{:none}
+                                                   :dispatch/model-key :ferment.model/solver}}}
+          run (workflow/execute-plan
+               {:plan {:nodes [{:op :call
+                                :intent :text/respond
+                                :dispatch {:candidates [:llm/voice :llm/solver-text]
+                                           :retry {:fallback-max 1}
+                                           :switch-on #{:eval/low-score}}
+                                :done {:should #{:tests-pass}
+                                       :score-min 1.0}
+                                :as :answer}
+                               {:op :emit
+                                :input {:slot/id [:answer :out]}}]}
+                :resolver resolver
+                :invoke-call (fn [call-node _env]
+                               (swap! calls inc)
+                               {:invoke/meta {:model-key (if (= :llm/voice (:cap/id call-node))
+                                                           :ferment.model/voice
+                                                           :ferment.model/solver)}
+                                :result {:type :value
+                                         :out {:text (name (:cap/id call-node))}}})
+                :check-fns {:tests-pass (fn [call-node _env _result]
+                                          (= :llm/solver-text (:cap/id call-node)))} })]
+      (is (:ok? run))
+      (is (= 2 @calls))
+      (is (pos? (get-in @health* [:ferment.model/voice :calls] 0)))
+      (is (pos? (get-in @health* [:ferment.model/voice :errors] 0)))
+      (is (pos? (get-in @health* [:ferment.model/solver :calls] 0)))
+      (is (number? (get-in @health* [:ferment.model/solver :latency/ema-ms])))
+      (is (number? (get-in @health* [:ferment.model/solver :quality/ema]))))))

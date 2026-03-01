@@ -1,7 +1,7 @@
 {
 
  :ferment.router/default
- {:routing  #ref :ferment.caps/routing
+  {:routing  #ref :ferment.caps/routing
   :intent->policy-profile
   {:route/decide      :balanced
    :context/summarize :low-latency

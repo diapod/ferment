@@ -331,6 +331,158 @@
         {:ok? true
          :cap/id cap-id}))))
 
+(def ^:private gateway-strategies
+  #{:latency-first :quality-first :cost-first})
+
+(defn- gateway-config
+  [resolver]
+  (let [cfg (or (when (map? (:gateway resolver))
+                  (:gateway resolver))
+                (when (map? (get-in resolver [:routing :gateway]))
+                  (get-in resolver [:routing :gateway])))]
+    (if (map? cfg) cfg {})))
+
+(defn- gateway-strategy
+  [resolver intent]
+  (let [cfg (gateway-config resolver)
+        by-intent (if (map? (:intent->strategy cfg))
+                    (:intent->strategy cfg)
+                    {})
+        strategy (or (keywordish (get by-intent intent))
+                     (keywordish (:strategy cfg)))]
+    (when (contains? gateway-strategies strategy)
+      strategy)))
+
+(defn- gateway-health-registry
+  [resolver]
+  (let [registry (:gateway/model-health resolver)]
+    (when (instance? clojure.lang.IAtom registry)
+      registry)))
+
+(defn- gateway-cap-model-key
+  [resolver cap-id]
+  (or (some-> (get-in resolver [:caps/by-id cap-id]) :dispatch/model-key keywordish)
+      (some-> (get-in resolver [:routing :cap->model-key cap-id]) keywordish)
+      cap-id))
+
+(defn- gateway-cap-latency-ms
+  [resolver cap-id]
+  (let [v (or (get-in resolver [:caps/by-id cap-id :cap/cost :latency-ms])
+              (get-in resolver [:caps/by-id cap-id :cap/limits :timeout-ms]))]
+    (if (number? v)
+      (double v)
+      10000.0)))
+
+(defn- gateway-cap-cost
+  [resolver cap-id]
+  (let [cost (or (get-in resolver [:caps/by-id cap-id :cap/cost :usd])
+                 (get-in resolver [:caps/by-id cap-id :cap/cost :tokens])
+                 (get-in resolver [:caps/by-id cap-id :cap/cost :latency-ms]))]
+    (if (number? cost)
+      (double cost)
+      10000.0)))
+
+(defn- gateway-breaker-config
+  [resolver]
+  (let [cfg (gateway-config resolver)
+        raw (if (map? (:circuit-breaker cfg))
+              (:circuit-breaker cfg)
+              {})
+        enabled? (boolean (:enabled? raw))
+        min-samples (let [v (:min-samples raw)]
+                      (if (and (integer? v) (pos? (long v)))
+                        (int v)
+                        5))
+        open-rate (let [v (:error-rate-open raw)]
+                    (if (number? v)
+                      (min 1.0 (max 0.0 (double v)))
+                      0.6))
+        cooldown-ms (let [v (:cooldown-ms raw)]
+                      (if (and (integer? v) (pos? (long v)))
+                        (int v)
+                        30000))]
+    {:enabled? enabled?
+     :min-samples min-samples
+     :error-rate-open open-rate
+     :cooldown-ms cooldown-ms}))
+
+(defn- gateway-breaker-open?
+  [stats now-ms]
+  (let [open-until (let [v (:breaker/open-until-ms stats)]
+                     (if (integer? v) (long v) 0))]
+    (> open-until (long now-ms))))
+
+(defn- gateway-candidate-score
+  [strategy idx latency-ms error-rate quality-score cost]
+  (case strategy
+    :quality-first [(- 1.0 quality-score) error-rate latency-ms idx]
+    :cost-first [cost latency-ms error-rate idx]
+    :latency-first [latency-ms error-rate idx]
+    [idx]))
+
+(defn- gateway-order-candidates
+  [resolver node candidates]
+  (let [strategy (gateway-strategy resolver (:intent node))
+        health* (gateway-health-registry resolver)
+        now-ms (System/currentTimeMillis)
+        breaker-cfg (gateway-breaker-config resolver)
+        breaker-enabled? (true? (:enabled? breaker-cfg))]
+    (if-not (and (keyword? strategy) (seq candidates))
+      [candidates []]
+      (let [ranked (map-indexed
+                    (fn [idx cap-id]
+                      (let [model-k (gateway-cap-model-key resolver cap-id)
+                            stats   (if (instance? clojure.lang.IAtom health*)
+                                      (get @health* model-k)
+                                      nil)
+                            calls   (if (integer? (:calls stats)) (long (:calls stats)) 0)
+                            errors  (if (integer? (:errors stats)) (long (:errors stats)) 0)
+                            error-rate (if (pos? calls)
+                                         (/ (double errors) (double calls))
+                                         0.0)
+                            latency-ms (if (number? (:latency/ema-ms stats))
+                                         (double (:latency/ema-ms stats))
+                                         (gateway-cap-latency-ms resolver cap-id))
+                            quality-score (if (number? (:quality/ema stats))
+                                            (double (:quality/ema stats))
+                                            0.5)
+                            cost (gateway-cap-cost resolver cap-id)
+                            breaker-open? (and breaker-enabled?
+                                               (>= calls (long (:min-samples breaker-cfg)))
+                                               (gateway-breaker-open? stats now-ms))]
+                        {:idx idx
+                         :cap/id cap-id
+                         :model-key model-k
+                         :calls calls
+                         :error-rate error-rate
+                         :latency-ms latency-ms
+                         :quality-score quality-score
+                         :cost cost
+                         :breaker/open? breaker-open?}))
+                    candidates)
+            active (vec (remove :breaker/open? ranked))
+            use-active? (and breaker-enabled? (seq active))
+            selected (if use-active? active (vec ranked))
+            ordered (->> selected
+                         (sort-by (fn [{:keys [idx latency-ms error-rate quality-score cost]}]
+                                    (gateway-candidate-score strategy
+                                                             idx
+                                                             latency-ms
+                                                             error-rate
+                                                             quality-score
+                                                             cost)))
+                         (mapv :cap/id))
+            rejected (if use-active?
+                       (->> ranked
+                            (filter :breaker/open?)
+                            (mapv (fn [entry]
+                                    (let [cap-id (:cap/id entry)]
+                                      {:cap/id cap-id
+                                       :reason :gateway/circuit-open
+                                       :model-key (:model-key entry)}))))
+                       [])]
+        [ordered rejected]))))
+
 (defn- resolve-candidates
   [resolver node]
   (let [protocol (if (map? (:protocol resolver)) (:protocol resolver) {})
@@ -353,11 +505,13 @@
              vec)]
     (if (map? (:caps/by-id resolver))
       (let [verdicts (mapv #(candidate-verdict resolver node %) candidates)
-            accepted (->> verdicts (filter :ok?) (mapv :cap/id))
-            rejected (->> verdicts
-                          (remove :ok?)
-                          (mapv #(dissoc % :ok?)))]
-        (with-meta accepted {:routing/rejected rejected}))
+            accepted0 (->> verdicts (filter :ok?) (mapv :cap/id))
+            rejected0 (->> verdicts
+                           (remove :ok?)
+                           (mapv #(dissoc % :ok?)))
+            [accepted1 gateway-rejected] (gateway-order-candidates resolver node accepted0)
+            rejected (into (vec rejected0) (vec gateway-rejected))]
+        (with-meta accepted1 {:routing/rejected rejected}))
       candidates)))
 
 (defn resolve-capability-decision
@@ -468,6 +622,12 @@
     v
     default))
 
+(defn- nonneg-double
+  [v default]
+  (if (number? v)
+    (max 0.0 (double v))
+    (double default)))
+
 (defn- positive-int-or-nil
   [v]
   (let [n (cond
@@ -476,6 +636,92 @@
             :else nil)]
     (when (and (int? n) (pos? n))
       n)))
+
+(defn- gateway-ema-alpha
+  [resolver]
+  (let [alpha (get-in (gateway-config resolver) [:ema-alpha])]
+    (if (number? alpha)
+      (min 1.0 (max 0.0 (double alpha)))
+      0.2)))
+
+(defn- gateway-result-model-key
+  [resolver call-node result]
+  (or (some-> result :invoke/meta :model-key keywordish)
+      (gateway-cap-model-key resolver (:cap/id call-node))
+      (:cap/id call-node)))
+
+(defn- gateway-quality-score
+  [failed? done-eval]
+  (if (and (map? done-eval)
+           (number? (:score done-eval)))
+    (double (:score done-eval))
+    (if failed? 0.0 1.0)))
+
+(defn- update-model-health
+  [entry failed? latency-ms quality-score now-ms resolver]
+  (let [entry0      (if (map? entry) entry {})
+        alpha       (gateway-ema-alpha resolver)
+        calls       (inc (long (or (:calls entry0) 0)))
+        errors      (+ (long (or (:errors entry0) 0))
+                       (if failed? 1 0))
+        latency-ema (let [sample (nonneg-double latency-ms 0.0)
+                          prev   (if (number? (:latency/ema-ms entry0))
+                                   (double (:latency/ema-ms entry0))
+                                   sample)]
+                      (+ (* alpha sample)
+                         (* (- 1.0 alpha) prev)))
+        quality-ema (let [sample (nonneg-double quality-score 0.0)
+                          prev   (if (number? (:quality/ema entry0))
+                                   (double (:quality/ema entry0))
+                                   sample)]
+                      (+ (* alpha sample)
+                         (* (- 1.0 alpha) prev)))
+        err-rate    (if (pos? calls)
+                      (/ (double errors) (double calls))
+                      0.0)
+        breaker-cfg (gateway-breaker-config resolver)
+        breaker-enabled? (true? (:enabled? breaker-cfg))
+        min-samples (long (:min-samples breaker-cfg))
+        open-rate   (double (:error-rate-open breaker-cfg))
+        cooldown-ms (long (:cooldown-ms breaker-cfg))
+        should-open? (and breaker-enabled?
+                          (>= calls min-samples)
+                          (>= err-rate open-rate))
+        open-until' (if should-open?
+                      (+ (long now-ms) cooldown-ms)
+                      (let [current (long (or (:breaker/open-until-ms entry0) 0))]
+                        (if (> current (long now-ms))
+                          current
+                          0)))]
+    (cond-> (assoc entry0
+                   :calls calls
+                   :errors errors
+                   :error-rate err-rate
+                   :latency/ema-ms latency-ema
+                   :quality/ema quality-ema
+                   :updated-at-ms (long now-ms))
+      (> open-until' 0) (assoc :breaker/open-until-ms open-until')
+      (and should-open?
+           (<= (long (or (:breaker/open-until-ms entry0) 0)) (long now-ms)))
+      (update :breaker/open-count (fnil inc 0)))))
+
+(defn- record-model-health!
+  [resolver call-node result failure-type latency-ms done-eval]
+  (let [health* (gateway-health-registry resolver)
+        model-k (gateway-result-model-key resolver call-node result)]
+    (when (and (instance? clojure.lang.IAtom health*)
+               (keyword? model-k))
+      (let [failed? (keyword? failure-type)
+            quality-score (gateway-quality-score failed? done-eval)
+            now-ms (System/currentTimeMillis)]
+        (swap! health* update model-k
+               (fn [entry]
+                 (update-model-health entry
+                                      failed?
+                                      latency-ms
+                                      quality-score
+                                      now-ms
+                                      resolver)))))))
 
 (defn- ensure-call-attempt-budget!
   [ctx]
@@ -789,6 +1035,12 @@
                  :done/eval done-eval
                  :failure/type failure-type
                  :failure/recover? recover?}]
+    (record-model-health! (:resolver ctx)
+                          candidate-node
+                          result
+                          failure-type
+                          latency-ms
+                          done-eval)
     (record-call-artifacts! ctx
                             candidate-node
                             result

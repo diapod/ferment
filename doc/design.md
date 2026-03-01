@@ -278,6 +278,16 @@ If no middleware is configured, runtime falls back to canonical default modules.
 - telemetry events (start/stop/error),
 - local response cache (optional).
 
+### Stage E - Teacher distillation mode (future)
+- introduce `teacher` mode for specialization-oriented data generation and distillation workflows,
+- keep the workflow explicitly layered and contract-driven (at least 4 layers):
+  1. generation spec (EDN), for example:
+     `{:specialization ... :constitution ... :n ... :seed ... :mutation-policy ...}`
+  2. generator stage: produce `(prompt -> answer)` records through teacher capability,
+  3. critic/filter stage: evaluate constitution compliance and reject/repair records (the same teacher may act as judge),
+  4. artifacts + evaluation stage: persist JSONL dataset, produce metrics report, run regression suite, and enforce promotion gate.
+- design intent: train/tune smaller models via prompt-response supervision derived from teacher outputs and constitution checks.
+
 ## 10. Consistency with `doc/stratification.md` (no conflicts)
 
 No semantic conflicts detected; documents are complementary.

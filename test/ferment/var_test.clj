@@ -419,6 +419,82 @@
         (finally
           (fhttp/stop-http :ferment.http/default server-state))))))
 
+(deftest http-v1-act-replay-endpoint-returns-recorded-package
+  (testing "Endpoint /v1/act/replay/{trace-id} returns recorded replay package with redaction."
+    (let [port (free-port)
+          runtime {:protocol {:intents {:problem/solve {:in-schema :req/problem}}
+                              :result/types [:value]}
+                   :router {:routing {:intent->cap {:problem/solve :llm/solver}}}
+                   :resolver {}}
+          server-state (fhttp/init-http
+                        :ferment.http/default
+                        {:host "127.0.0.1"
+                         :port port
+                         :runtime runtime
+                         :auth (:auth runtime)
+                         :replay {:enabled? true
+                                  :ttl-ms 60000
+                                  :max-size 16
+                                  :redact-keys [:token]}
+                         :models {}})
+          act-url (str "http://127.0.0.1:" port "/v1/act")
+          replay-url (str "http://127.0.0.1:" port "/v1/act/replay/http-replay-1")
+          replay-rerun-url (str "http://127.0.0.1:" port "/v1/act/replay/http-replay-1/rerun")
+          replay-compare-url (str "http://127.0.0.1:" port "/v1/act/replay/http-replay-1?against=http-replay-2")
+          replay-missing-url (str "http://127.0.0.1:" port "/v1/act/replay/http-replay-404")]
+      (try
+        (with-redefs [core/call-capability
+                      (fn [_rt _resolver opts]
+                        {:proto 1
+                         :trace (:trace opts)
+                         :result {:type :value
+                                  :out {:text "E2E-REPLAY-OK"}}})]
+          (let [act-resp (http-post-json
+                          act-url
+                          {:proto 1
+                           :trace {:id "http-replay-1"}
+                           :task {:intent "problem/solve"}
+                           :input {:prompt "diag replay"
+                                   :token "very-secret"}})
+                act-resp-2 (http-post-json
+                            act-url
+                            {:proto 1
+                             :trace {:id "http-replay-2"}
+                             :task {:intent "problem/solve"}
+                             :input {:prompt "diag replay 2"
+                                     :token "very-secret-2"}})
+                replay-resp (http-get replay-url)
+                replay-body (json/parse-string (:body replay-resp) true)
+                rerun-resp (http-post-json replay-rerun-url {})
+                rerun-body (json/parse-string (:body rerun-resp) true)
+                compare-resp (http-get replay-compare-url)
+                compare-body (json/parse-string (:body compare-resp) true)
+                missing-resp (http-get replay-missing-url)
+                missing-body (json/parse-string (:body missing-resp) true)]
+            (is (= 200 (:status act-resp)))
+            (is (= 200 (:status act-resp-2)))
+            (is (= 200 (:status replay-resp)))
+            (is (= true (:ok? replay-body)))
+            (is (= "http-replay-1" (:trace/id replay-body)))
+            (is (= "[REDACTED]"
+                   (get-in replay-body [:replay :request :payload :input :token])))
+            (is (= "E2E-REPLAY-OK"
+                   (get-in replay-body [:replay :response :body :result :out :text])))
+            (is (= 200 (:status rerun-resp)))
+            (is (= true (:ok? rerun-body)))
+            (is (= "http-replay-1" (:source/trace-id rerun-body)))
+            (is (string? (:rerun/trace-id rerun-body)))
+            (is (= true (get-in rerun-body [:comparison :same-execution-path?])))
+            (is (= 200 (:status compare-resp)))
+            (is (= true (:ok? compare-body)))
+            (is (= "http-replay-2" (:against/trace-id compare-body)))
+            (is (= true (get-in compare-body [:comparison :same-execution-path?])))
+            (is (= true (get-in compare-body [:comparison :policy/config :same?])))
+            (is (= 404 (:status missing-resp)))
+            (is (= "replay/not-found" (get-in missing-body [:error :type])))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
 (deftest http-basic-auth-forwards-session-id-into-auth-flow
   (testing "authorize-request forwards session id (payload/header) and session service into auth-user/authenticate-password."
     (let [runtime {:session {:open! (fn [sid _opts] {:session/id sid})}

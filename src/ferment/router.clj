@@ -23,10 +23,26 @@
     :retry
     :fallback
     :checks
+    :gateway
     :policy})
 
 (def ^:private retry-keys
   #{:same-cap-max :fallback-max})
+
+(def ^:private gateway-strategies
+  #{:latency-first :quality-first :cost-first})
+
+(def ^:private gateway-keys
+  #{:strategy
+    :intent->strategy
+    :ema-alpha
+    :circuit-breaker})
+
+(def ^:private gateway-breaker-keys
+  #{:enabled?
+    :min-samples
+    :error-rate-open
+    :cooldown-ms})
 
 (def ^:private routing-default-keys
   #{:meta? :strict? :force? :on-error :policy/profile})
@@ -144,6 +160,74 @@
                            :expected :non-negative-int
                            :value v})))))))
 
+(defn- validate-gateway-breaker!
+  [breaker path]
+  (ensure-keyword-map! breaker path)
+  (ensure-only-keys! breaker gateway-breaker-keys path)
+  (when (contains? breaker :enabled?)
+    (when-not (boolean? (:enabled? breaker))
+      (fail-router! "Gateway breaker :enabled? must be a boolean."
+                    {:path (conj path :enabled?)
+                     :expected :boolean
+                     :value (:enabled? breaker)})))
+  (when (contains? breaker :min-samples)
+    (let [n (:min-samples breaker)]
+      (when-not (and (integer? n) (pos? n))
+        (fail-router! "Gateway breaker :min-samples must be a positive integer."
+                      {:path (conj path :min-samples)
+                       :expected :positive-int
+                       :value n}))))
+  (when (contains? breaker :error-rate-open)
+    (let [v (:error-rate-open breaker)]
+      (when-not (and (number? v)
+                     (<= 0.0 (double v))
+                     (<= (double v) 1.0))
+        (fail-router! "Gateway breaker :error-rate-open must be in range [0.0, 1.0]."
+                      {:path (conj path :error-rate-open)
+                       :expected :rate
+                       :value v}))))
+  (when (contains? breaker :cooldown-ms)
+    (let [n (:cooldown-ms breaker)]
+      (when-not (and (integer? n) (pos? n))
+        (fail-router! "Gateway breaker :cooldown-ms must be a positive integer."
+                      {:path (conj path :cooldown-ms)
+                       :expected :positive-int
+                       :value n}))))
+  breaker)
+
+(defn- validate-gateway-config!
+  [gateway path]
+  (ensure-keyword-map! gateway path)
+  (ensure-only-keys! gateway gateway-keys path)
+  (when (contains? gateway :strategy)
+    (let [strategy (:strategy gateway)]
+      (when-not (contains? gateway-strategies strategy)
+        (fail-router! "Gateway :strategy must be one of :latency-first/:quality-first/:cost-first."
+                      {:path (conj path :strategy)
+                       :expected gateway-strategies
+                       :value strategy}))))
+  (when (contains? gateway :intent->strategy)
+    (ensure-keyword-map! (:intent->strategy gateway) (conj path :intent->strategy))
+    (doseq [[intent strategy] (:intent->strategy gateway)]
+      (when-not (contains? gateway-strategies strategy)
+        (fail-router! "Gateway :intent->strategy values must be known strategies."
+                      {:path (conj path :intent->strategy intent)
+                       :expected gateway-strategies
+                       :value strategy}))))
+  (when (contains? gateway :ema-alpha)
+    (let [v (:ema-alpha gateway)]
+      (when-not (and (number? v)
+                     (<= 0.0 (double v))
+                     (<= (double v) 1.0))
+        (fail-router! "Gateway :ema-alpha must be in range [0.0, 1.0]."
+                      {:path (conj path :ema-alpha)
+                       :expected :rate
+                       :value v}))))
+  (when (contains? gateway :circuit-breaker)
+    (validate-gateway-breaker! (:circuit-breaker gateway)
+                               (conj path :circuit-breaker)))
+  gateway)
+
 (defn validate-router-config!
   "Validates router configuration shape and throws `ex-info` when invalid."
   [config]
@@ -184,6 +268,8 @@
           (validate-keyword-coll! (:fallback routing) [:routing :fallback]))
         (when (contains? routing :checks)
           (validate-keyword-coll! (:checks routing) [:routing :checks]))
+        (when (contains? routing :gateway)
+          (validate-gateway-config! (:gateway routing) [:routing :gateway]))
         (when (contains? routing :policy)
           (when-not (keyword? (:policy routing))
             (fail-router! "Router config :routing/:policy must be a keyword."
