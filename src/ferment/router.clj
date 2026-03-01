@@ -10,7 +10,7 @@
             [ferment.system :as system]))
 
 (def ^:private router-top-keys
-  #{:routing :profiles :policy :defaults})
+  #{:routing :profiles :policy :defaults :intent->policy-profile :policy-profiles})
 
 (def ^:private routing-keys
   #{:intent->cap
@@ -29,7 +29,7 @@
   #{:same-cap-max :fallback-max})
 
 (def ^:private routing-default-keys
-  #{:meta? :strict? :force? :on-error})
+  #{:meta? :strict? :force? :on-error :policy/profile})
 
 (def ^:private routing-on-error-modes
   #{:fail-open :fail-closed})
@@ -115,7 +115,34 @@
                       {:path (conj path :on-error)
                        :expected routing-on-error-modes
                        :value mode}))))
+  (when (contains? defaults :policy/profile)
+    (when-not (keyword? (:policy/profile defaults))
+      (fail-router! "Router defaults :policy/profile must be a keyword."
+                    {:path (conj path :policy/profile)
+                     :expected :keyword
+                     :value (:policy/profile defaults)})))
   defaults)
+
+(defn- validate-policy-profiles!
+  [profiles path]
+  (ensure-keyword-map! profiles path)
+  (doseq [[profile profile-cfg] profiles]
+    (let [profile-path (conj path profile)]
+      (ensure-map! profile-cfg profile-path)
+      (when (contains? profile-cfg :default)
+        (ensure-map! (:default profile-cfg) (conj profile-path :default)))
+      (when (contains? profile-cfg :intents)
+        (ensure-keyword-map! (:intents profile-cfg) (conj profile-path :intents))
+        (doseq [[intent intent-cfg] (:intents profile-cfg)]
+          (ensure-map! intent-cfg (conj profile-path :intents intent))))
+      (when (contains? profile-cfg :limits)
+        (ensure-keyword-map! (:limits profile-cfg) (conj profile-path :limits))
+        (doseq [[k v] (:limits profile-cfg)]
+          (when-not (and (integer? v) (<= 0 v))
+            (fail-router! "Router policy profile limits must be non-negative integers."
+                          {:path (conj profile-path :limits k)
+                           :expected :non-negative-int
+                           :value v})))))))
 
 (defn validate-router-config!
   "Validates router configuration shape and throws `ex-info` when invalid."
@@ -183,6 +210,12 @@
                             {:path [:profiles profile]
                              :expected :map
                              :value profile-cfg}))))))
+    (when (contains? cfg :intent->policy-profile)
+      (validate-keyword->keyword-map! (:intent->policy-profile cfg)
+                                      [:intent->policy-profile]))
+    (when (contains? cfg :policy-profiles)
+      (validate-policy-profiles! (:policy-profiles cfg)
+                                 [:policy-profiles]))
     (when (contains? cfg :policy)
       (when-not (keyword? (:policy cfg))
         (fail-router! "Router top-level :policy must be a keyword."

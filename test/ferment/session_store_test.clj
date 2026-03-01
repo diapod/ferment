@@ -49,13 +49,28 @@
                       {:query query})))))
 
 (defn- fake-db-execute!
-  [rows* _connectable query & _opts]
+  [rows* vars* _connectable query & _opts]
   (let [sql (first query)]
-    (if (str/includes? sql "ORDER BY `updated_at` DESC")
+    (cond
+      (str/includes? sql "ORDER BY `updated_at` DESC")
       (->> (vals @rows*)
            (sort-by :updated_at)
            reverse
            vec)
+
+      (str/includes? sql "SELECT `id`")
+      (let [sid (second query)]
+        (->> (get @vars* sid {})
+             keys
+             (map (fn [k]
+                    {:id (if (keyword? k)
+                           (if-let [ns' (namespace k)]
+                             (str ns' "/" (name k))
+                             (name k))
+                           (str k))}))
+             vec))
+
+      :else
       (throw (ex-info "Unexpected SQL in fake execute!."
                       {:query query})))))
 
@@ -103,7 +118,7 @@
       (with-redefs [jdbc/transact (fn [connectable f _opts]
                                     (f connectable))
                     jdbc/execute-one! (partial fake-db-execute-one! rows*)
-                    jdbc/execute! (partial fake-db-execute! rows*)
+                    jdbc/execute! (partial fake-db-execute! rows* vars*)
                     udb/make-setting-getter (fn [_table _entity-col]
                                               (fake-setting-getter vars*))
                     udb/make-setting-setter (fn [_table _entity-col]
@@ -147,7 +162,7 @@
       (with-redefs [jdbc/transact (fn [connectable f _opts]
                                     (f connectable))
                     jdbc/execute-one! (partial fake-db-execute-one! rows*)
-                    jdbc/execute! (partial fake-db-execute! rows*)
+                    jdbc/execute! (partial fake-db-execute! rows* vars*)
                     udb/make-setting-getter (fn [_table _entity-col]
                                               (fake-setting-getter vars*))
                     udb/make-setting-setter (fn [_table _entity-col]
@@ -404,3 +419,30 @@
       (is (= {:target [:context :summary]
               :coerce :trimmed-string}
              (get bindings :session/context-summary))))))
+
+(deftest session-vars-contract-exposes-memory-policy
+  (testing "Session vars contract normalizes memory auto-write and compaction policy."
+    (let [store (session-store/init-store
+                 :ferment.session.store/default
+                 {:backend :memory
+                  :session-vars/contract
+                  {:memory/policy
+                   {:enabled? true
+                    :write/default? true
+                    :write/by-intent {"text/respond" true
+                                      :code/patch false}
+                    :write/key "context/summary"
+                    :write/max-chars "1000"
+                    :compaction/trigger-chars 900
+                    :compaction/target-chars 700
+                    :compaction/mode "truncate"}}})
+          policy (session-store/memory-policy store)]
+      (is (true? (:enabled? policy)))
+      (is (true? (:write/default? policy)))
+      (is (= true (get-in policy [:write/by-intent :text/respond])))
+      (is (= false (get-in policy [:write/by-intent :code/patch])))
+      (is (= :context/summary (:write/key policy)))
+      (is (= 1000 (:write/max-chars policy)))
+      (is (= 900 (:compaction/trigger-chars policy)))
+      (is (= 700 (:compaction/target-chars policy)))
+      (is (= :truncate (:compaction/mode policy))))))

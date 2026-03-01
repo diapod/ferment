@@ -1,0 +1,7 @@
+{
+  "proto": 1,
+  "trace": {"id": "bench-c1-text-plain"},
+  "session/id": "session/bench-c1",
+  "task": {"intent": "text/respond"},
+  "input": {"prompt": "Explain ACID briefly and give one example."}
+}

@@ -1,7 +1,8 @@
 {
  :ferment.router/default
- {:defaults {:meta? true
+ {:defaults {:meta? false
              :strict? false
              :force? false
-             :on-error :fail-open}}
+             :on-error :fail-open
+             :policy/profile :low-latency}}
 }

@@ -1,0 +1,8 @@
+{
+  "proto": 1,
+  "trace": {"id": "bench-c5-context-turn2"},
+  "session/id": "session/bench-c4-context",
+  "task": {"intent": "text/respond"},
+  "routing": {"meta?": false},
+  "input": {"prompt": "What database do I prefer? Answer in one sentence."}
+}

@@ -138,7 +138,15 @@
    :class/default            :session.vars/default
    :class/by-namespace       {}
    :class/policy             {}
-   :request/default-bindings {}})
+   :request/default-bindings {}
+   :memory/policy            {:enabled? false
+                              :write/default? false
+                              :write/by-intent {}
+                              :write/key :context/summary
+                              :write/max-chars 1200
+                              :compaction/trigger-chars 1200
+                              :compaction/target-chars 900
+                              :compaction/mode :truncate}})
 
 (def ^:private session-var-value-key :session.var/value)
 (def ^:private session-var-meta-key  :session.var/meta)
@@ -302,6 +310,45 @@
                m)
     {}))
 
+(defn- normalize-memory-policy
+  [m defaults]
+  (let [src (if (map? m) m {})
+        enabled? (if (contains? src :enabled?)
+                   (truthy? (:enabled? src))
+                   (:enabled? defaults))
+        write-default? (if (contains? src :write/default?)
+                         (truthy? (:write/default? src))
+                         (:write/default? defaults))
+        write-by-intent (if (map? (:write/by-intent src))
+                          (reduce-kv (fn [acc k v]
+                                       (if-some [intent (keywordish k)]
+                                         (assoc acc intent (truthy? v))
+                                         acc))
+                                     {}
+                                     (:write/by-intent src))
+                          (:write/by-intent defaults))
+        write-key (or (keywordish (:write/key src))
+                      (:write/key defaults))
+        write-max-chars (or (positive-int (:write/max-chars src) nil)
+                            (:write/max-chars defaults))
+        trigger-chars (or (positive-int (:compaction/trigger-chars src) nil)
+                          (:compaction/trigger-chars defaults))
+        target-default (min trigger-chars write-max-chars)
+        target-chars (or (positive-int (:compaction/target-chars src) nil)
+                         (:compaction/target-chars defaults)
+                         target-default)
+        target-chars' (min trigger-chars target-chars)
+        mode (or (keywordish (:compaction/mode src))
+                 (:compaction/mode defaults))]
+    {:enabled? enabled?
+     :write/default? write-default?
+     :write/by-intent write-by-intent
+     :write/key write-key
+     :write/max-chars write-max-chars
+     :compaction/trigger-chars trigger-chars
+     :compaction/target-chars target-chars'
+     :compaction/mode mode}))
+
 (defn- normalize-vars-policy-entry
   [entry]
   (let [entry' (if (map? entry) entry {})
@@ -408,6 +455,9 @@
                                                         :request/default-bindings
                                                         (:request/default-bindings defaults)
                                                         normalize-request-default-bindings)
+        memory-policy (normalize-memory-policy
+                       (:memory/policy src)
+                       (:memory/policy defaults))
         default-ttl-ms' (when (some? default-ttl-ms)
                           (if (pos? max-ttl-ms)
                             (min default-ttl-ms max-ttl-ms)
@@ -427,7 +477,8 @@
      :class/default class-default
      :class/by-namespace class-by-namespace
      :class/policy class-policy
-     :request/default-bindings request-default-bindings}))
+     :request/default-bindings request-default-bindings
+     :memory/policy memory-policy}))
 
 (defn- parse-var-key
   [k]
@@ -690,8 +741,33 @@
   [store sid]
   (let [sid' (normalize-session-id sid)]
     (if (db-store? store)
-      (let [result ((:var-getter store) (:db store) sid')]
-        (if (map? result) result {}))
+      (let [id-rows (jdbc/execute! (:db store)
+                                   [(get-in store [:sql-vars :list-ids]) sid']
+                                   db-row-opts)
+            ids (->> id-rows
+                     (keep (fn [row]
+                             (some-> (:id row)
+                                     str
+                                     str/trim
+                                     not-empty
+                                     parse-var-key)))
+                     distinct
+                     vec)
+            getter (:var-getter store)
+            result (when (and (fn? getter)
+                              (seq ids))
+                     (apply getter (:db store) sid' ids))
+            normalized (cond
+                         (and (= 1 (count ids))
+                              (some? result))
+                         {(first ids) result}
+
+                         (map? result)
+                         result
+
+                         :else
+                         nil)]
+        (or normalized {}))
       (or (get-in (get-session store sid') [:session/facts]) {}))))
 
 (defn- normalize-raw-vars-map
@@ -788,6 +864,13 @@
         " `meta` = VALUES(`meta`),"
         " `turns` = VALUES(`turns`),"
         " `facts` = VALUES(`facts`)")})
+
+(defn- build-db-vars-sql
+  [vars-table]
+  {:list-ids
+   (str "SELECT `id`"
+        " FROM `" vars-table "`"
+        " WHERE `session_id` = ?")})
 
 (defn- session->db-values
   [session]
@@ -899,13 +982,15 @@
                                   {:backend backend
                                    :store-key _k
                                    :config cfg})))
-                (assoc cfg
-                       :db datasource
-                       :var-getter (udb/make-setting-getter (:vars-table cfg) :session_id)
-                       :var-setter (udb/make-setting-setter (:vars-table cfg) :session_id)
-                       :var-deleter (udb/make-setting-deleter (:vars-table cfg) :session_id)
-                       :sql (build-db-sql (:sessions-table cfg))
-                       :started-at (now-iso)))
+                (let [vars-table-k (keyword (:vars-table cfg))]
+                  (assoc cfg
+                         :db datasource
+                         :var-getter (udb/make-setting-getter vars-table-k :session_id)
+                         :var-setter (udb/make-setting-setter vars-table-k :session_id)
+                         :var-deleter (udb/make-setting-deleter vars-table-k :session_id)
+                         :sql (build-db-sql (:sessions-table cfg))
+                         :sql-vars (build-db-vars-sql (:vars-table cfg))
+                         :started-at (now-iso))))
       (throw (ex-info "Unsupported session store backend."
                       {:backend backend
                        :supported #{:memory :db}})))))
@@ -926,6 +1011,15 @@
     (if (map? bindings)
       bindings
       {})))
+
+(defn memory-policy
+  "Returns normalized memory auto-write/compaction policy for session vars."
+  [store]
+  (let [contract (or (:session-vars/contract store) default-session-vars-contract)
+        policy (:memory/policy contract)]
+    (if (map? policy)
+      policy
+      (:memory/policy default-session-vars-contract))))
 
 (defn store-state
   [store]

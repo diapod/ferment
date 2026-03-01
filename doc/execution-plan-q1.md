@@ -19,13 +19,13 @@ Window: remaining Q1 2026 delivery cycle.
 ## Milestone A (P1): Async Queue + SLA Controls
 
 ### Implementation
-- [ ] Add async mode for `/v1/act` with job lifecycle:
+- [x] Add async mode for `/v1/act` with job lifecycle:
   - `accepted -> running -> completed|failed|canceled`
-- [ ] Add endpoints:
+- [x] Add endpoints:
   - `POST /v1/act` (`response/type=accepted` -> job id)
   - `GET /v1/act/jobs/:id`
   - `POST /v1/act/jobs/:id/cancel`
-- [ ] Add scheduler controls:
+- [x] Add scheduler controls:
   - deadline/timeout per job
   - priority classes (`interactive`, `batch`)
   - queue limits + backpressure policy
@@ -39,10 +39,10 @@ Window: remaining Q1 2026 delivery cycle.
   - max deadline, cancelability, queue class
 
 ### Tests
-- [ ] HTTP integration: submit -> poll -> complete flow
-- [ ] Cancellation test: running job transitions to `canceled`
-- [ ] Backpressure test: queue full returns deterministic overload response
-- [ ] Retry with jitter test: transient failure recovers within policy bounds
+- [x] HTTP integration: submit -> poll -> complete flow
+- [x] Cancellation test: running job transitions to `canceled`
+- [x] Backpressure test: queue full returns deterministic overload response
+- [x] Retry with jitter test: transient failure recovers within policy bounds
 
 ### Milestone A Detailed Task Breakdown (File-Level)
 
@@ -103,7 +103,7 @@ Window: remaining Q1 2026 delivery cycle.
     - `queue/class`, `cancelable?`, `deadline-ms` (where needed).
 
 #### A6. Tests (integration + concurrency)
-- [ ] `test/ferment/http_test.clj`
+- [x] `test/ferment/http_test.clj`
   - accepted submit -> poll -> completed
   - cancel pending/running job
   - queue full behavior and status code mapping
@@ -112,8 +112,8 @@ Window: remaining Q1 2026 delivery cycle.
   - worker loop lifecycle and timeout handling
   - retry with jitter bounded by config
   - no invalid state transitions under race.
-- [ ] `test/ferment/telemetry_test.clj` (new or existing)
-  - queue counters and latency buckets update deterministically.
+- [x] telemetry coverage (existing suites)
+  - queue counters/snapshot validated through `/diag/telemetry` assertions in `test/ferment/http_test.clj`.
 
 #### A7. Operational playbook
 - [ ] `doc/usage.md`

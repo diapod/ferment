@@ -63,6 +63,11 @@ Plans declare:
 - `:dispatch` (candidates and policies),
 not "use model X directly".
 
+Canonical cross-model handoff (`solver -> voice`) is explicit data:
+- required `:handoff/text`,
+- optional `:handoff/facts`, `:handoff/assumptions`, `:handoff/lang`,
+- validated on workflow input boundary (`:req/handoff`) and sanitized from internal markers.
+
 ## 5. System Layers
 
 ### 5.1. Domain Layer (pure)
@@ -98,7 +103,7 @@ Requirement: thin composition layer for all others.
 
 Current building blocks:
 - `ferment.core` - contract-driven capability calls (`invoke-with-contract`, `call-capability`), canonical domain entrypoints (`classify-intent`, `build-plan`), meta/solver/voice routing, and plan execution,
-- `ferment.workflow` - IR evaluator (`:let`, `:call`, `:emit`, recursive `:plan`) with retry/fallback/checks,
+- `ferment.workflow` - IR evaluator (`:let`, `:call`, `:emit`, recursive `:plan`) with retry/fallback/checks, per-intent policy profiles, and hard limits for call attempts/fallback hops,
 - `ferment.router`, `ferment.resolver`, `ferment.contracts`, `ferment.protocol` - routing, capability registry, and request/response validation,
 - `ferment.model` - model runtime (processes, HTTP invoke, session workers, freeze/thaw/TTL),
 - `ferment.http` - HTTP bridge (`/v1/act`, `/v1/session`, `/v1/admin`, `/health`, `/routes`, `/diag/telemetry`),
@@ -113,12 +118,14 @@ Target buds:
 - `ferment.adapters.*` - model providers and tools,
 - `ferment.memory` - session state, context, cache,
 - `ferment.telemetry` - structured logs, metrics, trace-id.
-  - current `/diag/telemetry` snapshot includes `:act`, `:workflow`, and canonical KPI in `:kpi` (`parse-rate`, `retry-rate`, `fallback-rate`, `judge-pass-rate`, `failure-taxonomy`).
+  - current `/diag/telemetry` snapshot includes `:act`, `:workflow`, `:orchestration`, and canonical KPI in `:kpi` (`parse-rate`, `retry-rate`, `fallback-rate`, `must-failed-rate`, `judge-pass-rate`, `failure-taxonomy`).
+  - orchestration KPI include `participants/diversity`, `route/decision-quality-trend`, and `context/hit-utility`.
 - protocol prompt packages (`resources/config/common/prod/protocol.edn`) are stratified:
   - `:prompts/:default` (global core),
   - `:prompts/:roles` (router/solver/voice/coder/judge),
   - `:prompts/:intents` (intent semantic refinements).
   Runtime composes prompts from these layers; `:intents/*/:system` is the canonical full override.
+- benchmark packs for tuning gates live in `resources/bench/act*.json` case directories (`act`, `act-low-latency`, `act-sla`), with runner `bin/benchmark-live` and artifact schema in `target/benchmarks/<timestamp>/` (single run) or `target/benchmarks/<timestamp>/run-*/` plus aggregate `summary.*` (multi-run via `--runs N`).
 
 ### 6.1. Implementation Status (2026-02-22)
 

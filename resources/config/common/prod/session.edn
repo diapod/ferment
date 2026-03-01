@@ -72,16 +72,31 @@
                               :coerce :keyword-or-string}
     :session/system-prompt   {:target [:input :system]
                               :coerce :trimmed-string}
-    :session/context-summary {:target [:context :summary]
-                              :coerce :trimmed-string}}
+    :context/summary        {:target [:context :summary]
+                             :coerce :trimmed-string}}
+   :memory/policy
+   {:enabled? true
+    :write/default? false
+    :write/by-intent {:text/respond true
+                      :problem/solve true
+                      :context/summarize true}
+    :write/key :context/summary
+    :write/max-chars 1200
+    :compaction/trigger-chars 1200
+    :compaction/target-chars 900
+    :compaction/mode :truncate}
    :policy/default
    {:read-namespaces   #{"session" "context"}
     :write-namespaces  #{"session" "context" "user" "agent" "runtime" "request"}
     :delete-namespaces #{"session" "context" "user" "agent" "runtime" "request"}}
    :policy/by-intent
    {:route/decide  {:read-namespaces #{"session" "context" "request"}}
-    :text/respond  {:read-namespaces #{"session" "context"}}
-    :problem/solve {:read-namespaces #{"session" "context"}}
+    :context/summarize {:read-namespaces #{"session" "context"}
+                        :write-namespaces #{"context"}}
+    :text/respond  {:read-namespaces #{"session" "context"}
+                    :write-namespaces #{"context"}}
+    :problem/solve {:read-namespaces #{"session" "context"}
+                    :write-namespaces #{"context"}}
     :code/generate {:read-namespaces #{"session" "context"}}
     :code/patch    {:read-namespaces #{"session" "context"}}
     :code/explain  {:read-namespaces #{"session" "context"}}

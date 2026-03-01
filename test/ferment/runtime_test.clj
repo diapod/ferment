@@ -163,3 +163,26 @@
           (is (= :queue/timeout (get-in job [:error :type]))))
         (finally
           (runtime/stop-runtime :ferment.runtime/default state))))))
+
+(deftest invoke-queued-request-emits-near-miss-diagnostics
+  (testing "Queued invoke path returns deterministic rejected-candidate reason for capability near-miss."
+    (let [runtime-state {:protocol {:policy/default {:fallback []}}
+                         :resolver {:caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                             :cap/intents #{:text/respond}
+                                                             :cap/can-produce #{:value}
+                                                             :cap/effects-allowed #{:none}
+                                                             :io/in-schema :req/text
+                                                             :io/out-schema :res/text}}}
+                         :router {:routing {:intent->cap {:text/respond :llm/voice}}}}
+          request {:proto 1
+                   :trace {:id "runtime-near-miss-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice
+                          :requires {:result/type :plan}}
+                   :input {:prompt "hej"}}
+          result (#'ferment.runtime/invoke-queued-request runtime-state request)]
+      (is (false? (:ok? result)))
+      (is (= false (:retryable? result)))
+      (is (= :unsupported/intent (get-in result [:error :type])))
+      (is (= :result-type/not-supported
+             (get-in result [:error :details :rejected-candidates 0 :reason]))))))

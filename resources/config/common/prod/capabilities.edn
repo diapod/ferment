@@ -2,121 +2,122 @@
 
  ;; Capabilities as separate top-level keys (flattened registry branch)
  :ferment.caps.registry/llm-voice
- {:cap/id        :llm/voice
-  :cap/kind      :llm
-  :cap/version   "2026.02"
-  :cap/cost      {:latency-ms 1200}
-  :cap/limits    {:timeout-ms 15000}
-  :cap/tags      #{:voice :polish}
-  :cap/intents   #{:text/respond}
-  :cap/can-produce #{:value}
+ {:cap/id              :llm/voice
+  :cap/kind            :llm
+  :cap/version         "2026.02"
+  :cap/cost            {:latency-ms 1200}
+  :cap/limits          {:timeout-ms 15000}
+  :cap/tags            #{:voice :polish}
+  :cap/intents         #{:text/respond}
+  :cap/can-produce     #{:value}
   :cap/effects-allowed #{:none}
-  :dispatch/role :voice
-  :dispatch/model-key :ferment.model/voice
-  :io/in-schema  :req/text
-  :io/out-schema :res/text
-  :dispatch/tag  :voice}
+  :dispatch/role       :voice
+  :dispatch/model-key  :ferment.model/voice
+  :io/in-schema        :req/text
+  :io/out-schema       :res/text
+  :dispatch/tag        :voice}
 
  :ferment.caps.registry/llm-code
- {:cap/id        :llm/code
-  :cap/kind      :llm
-  :cap/version   "2026.02"
-  :cap/cost      {:latency-ms 1800}
-  :cap/limits    {:timeout-ms 30000}
-  :cap/tags      #{:code :clojure}
-  :cap/intents   #{:code/generate :code/patch :code/explain :code/review}
-  :cap/can-produce #{:value :plan}
+ {:cap/id              :llm/code
+  :cap/kind            :llm
+  :cap/version         "2026.02"
+  :cap/cost            {:latency-ms 1800}
+  :cap/limits          {:timeout-ms 30000}
+  :cap/tags            #{:code :clojure}
+  :cap/intents         #{:code/generate :code/patch :code/explain :code/review}
+  :cap/can-produce     #{:value :plan}
   :cap/effects-allowed #{:none}
-  :dispatch/role :coder
-  :dispatch/model-key :ferment.model/coding
-  :io/in-schema  :req/code
-  :io/out-schema :res/patch+tests
-  :dispatch/tag  :code}
+  :dispatch/role       :coder
+  :dispatch/model-key  :ferment.model/coding
+  :io/in-schema        :req/code
+  :io/out-schema       :res/patch+tests
+  :dispatch/tag        :code}
 
  :ferment.caps.registry/llm-solver
- {:cap/id        :llm/solver
-  :cap/kind      :llm
-  :cap/version   "2026.02"
-  :cap/cost      {:latency-ms 1500}
-  :cap/limits    {:timeout-ms 20000}
-  :cap/tags      #{:solver :general}
-  :cap/intents   #{:problem/solve}
-  :cap/can-produce #{:value :plan}
+ {:cap/id              :llm/solver
+  :cap/kind            :llm
+  :cap/version         "2026.02"
+  :cap/cost            {:latency-ms 1500}
+  :cap/limits          {:timeout-ms 20000}
+  :cap/tags            #{:solver :general}
+  :cap/intents         #{:problem/solve}
+  :cap/can-produce     #{:value :plan}
   :cap/effects-allowed #{:none}
-  :dispatch/role :solver
-  :dispatch/model-key :ferment.model/solver
-  :io/in-schema  :req/problem
-  :io/out-schema :res/problem
-  :dispatch/tag  :solver}
+  :dispatch/role       :solver
+  :dispatch/model-key  :ferment.model/solver
+  :io/in-schema        :req/problem
+  :io/out-schema       :res/problem
+  :dispatch/tag        :solver}
 
  :ferment.caps.registry/llm-solver-text
- {:cap/id        :llm/solver-text
-  :cap/kind      :llm
-  :cap/version   "2026.02"
-  :cap/cost      {:latency-ms 1500}
-  :cap/limits    {:timeout-ms 20000}
-  :cap/tags      #{:solver :fallback :text}
-  :cap/intents   #{:text/respond}
-  :cap/can-produce #{:value}
+ {:cap/id              :llm/solver-text
+  :cap/kind            :llm
+  :cap/version         "2026.02"
+  :cap/cost            {:latency-ms 1500}
+  :cap/limits          {:timeout-ms 20000}
+  :cap/tags            #{:solver :fallback :text}
+  :cap/intents         #{:text/respond}
+  :cap/can-produce     #{:value}
   :cap/effects-allowed #{:none}
-  :dispatch/role :solver
-  :dispatch/model-key :ferment.model/solver
-  :io/in-schema  :req/text
-  :io/out-schema :res/text
-  :dispatch/tag  :solver-text}
+  :dispatch/role       :solver
+  :dispatch/model-key  :ferment.model/solver
+  :io/in-schema        :req/text
+  :io/out-schema       :res/text
+  :dispatch/tag        :solver-text}
 
  :ferment.caps.registry/llm-meta
- {:cap/id        :llm/meta
-  :cap/kind      :llm
-  :cap/version   "2026.02"
-  :cap/cost      {:latency-ms 900}
-  :cap/limits    {:timeout-ms 12000}
-  :cap/tags      #{:router :meta}
-  :cap/intents   #{:route/decide :context/summarize}
-  :cap/can-produce #{:value :plan}
+ {:cap/id              :llm/meta
+  :cap/kind            :llm
+  :cap/version         "2026.02"
+  :cap/cost            {:latency-ms 900}
+  :cap/limits          {:timeout-ms 12000}
+  :cap/tags            #{:router :meta}
+  :cap/intents         #{:route/decide :context/summarize}
+  :cap/can-produce     #{:value :plan}
   :cap/effects-allowed #{:none}
-  :dispatch/role :router
-  :dispatch/model-key :ferment.model/meta
-  :io/in-schema  :req/meta
-  :io/out-schema :res/meta
-  :dispatch/tag  :meta}
+  :dispatch/role       :router
+  :dispatch/model-key  :ferment.model/meta
+  :io/in-schema        :req/meta
+  :io/out-schema       :res/meta
+  :dispatch/tag        :meta}
 
  :ferment.caps.registry/llm-judge
- {:cap/id        :llm/judge
-  :cap/kind      :llm
-  :cap/version   "2026.02"
-  :cap/cost      {:latency-ms 900}
-  :cap/limits    {:timeout-ms 12000}
-  :cap/tags      #{:judge :quality}
-  :cap/intents   #{:eval/grade}
-  :cap/can-produce #{:value}
+ {:cap/id              :llm/judge
+  :cap/kind            :llm
+  :cap/version         "2026.02"
+  :cap/cost            {:latency-ms 900}
+  :cap/limits          {:timeout-ms 12000}
+  :cap/tags            #{:judge :quality}
+  :cap/intents         #{:eval/grade}
+  :cap/can-produce     #{:value}
   :cap/effects-allowed #{:none}
-  :dispatch/role :router
-  :dispatch/model-key :ferment.model/meta
-  :io/in-schema  :req/eval
-  :io/out-schema :res/eval
-  :dispatch/tag  :judge}
+  :dispatch/role       :router
+  :dispatch/model-key  :ferment.model/meta
+  :io/in-schema        :req/eval
+  :io/out-schema       :res/eval
+  :dispatch/tag        :judge}
 
  :ferment.caps.registry/llm-mock
- {:cap/id        :llm/mock
-  :cap/kind      :mock
-  :cap/version   "2026.02"
-  :cap/cost      {:latency-ms 1}
-  :cap/limits    {:timeout-ms 1000}
-  :cap/tags      #{:mock :test}
-  :cap/intents   #{:route/decide :context/summarize :text/respond
-                   :problem/solve
-                   :code/generate :code/patch :code/explain :code/review
-                   :eval/grade}
-  :cap/can-produce #{:value :plan}
+ {:cap/id              :llm/mock
+  :cap/kind            :mock
+  :cap/version         "2026.02"
+  :cap/cost            {:latency-ms 1}
+  :cap/limits          {:timeout-ms 1000}
+  :cap/tags            #{:mock :test}
+  :cap/intents         #{:route/decide :context/summarize :text/respond
+                         :problem/solve
+                         :code/generate :code/patch :code/explain :code/review
+                         :eval/grade}
+  :cap/can-produce     #{:value :plan}
   :cap/effects-allowed #{:none}
-  :dispatch/role :router
-  :dispatch/model-key :ferment.model/meta
-  :io/in-schema  :req/any
-  :io/out-schema :res/any
-  :dispatch/tag  :mock}
+  :dispatch/role       :router
+  :dispatch/model-key  :ferment.model/meta
+  :io/in-schema        :req/any
+  :io/out-schema       :res/any
+  :dispatch/tag        :mock}
 
  ;; Optional aggregate list for consumers preferring a single entrypoint.
+
  :ferment.caps/registry
  [#ref :ferment.caps.registry/llm-voice
   #ref :ferment.caps.registry/llm-code
@@ -128,15 +129,15 @@
 
  ;; Declarative intent routing
  :ferment.caps/routing
- {:intent->cap {:route/decide      :llm/meta
-                :context/summarize :llm/meta
-                :text/respond      :llm/voice
-                :problem/solve     :llm/solver
-                :code/generate     :llm/code
-                :code/patch        :llm/code
-                :code/explain      :llm/code
-                :code/review       :llm/code
-                :eval/grade        :llm/judge}
+ {:intent->cap               {:route/decide      :llm/meta
+                              :context/summarize :llm/meta
+                              :text/respond      :llm/voice
+                              :problem/solve     :llm/solver
+                              :code/generate     :llm/code
+                              :code/patch        :llm/code
+                              :code/explain      :llm/code
+                              :code/review       :llm/code
+                              :eval/grade        :llm/judge}
   :intent->default-model-key {:route/decide      :ferment.model/meta
                               :context/summarize :ferment.model/meta
                               :eval/grade        :ferment.model/meta
@@ -146,34 +147,35 @@
                               :code/patch        :ferment.model/coding
                               :code/explain      :ferment.model/coding
                               :code/review       :ferment.model/coding}
-  :cap->role   {:llm/code        :coder
-                :llm/solver      :solver
-                :llm/solver-text :solver
-                :llm/meta        :router
-                :llm/judge       :router
-                :llm/voice       :voice
-                :llm/mock        :router}
-  :intent->default-role {:route/decide      :router
-                         :context/summarize :router
-                         :eval/grade        :router
-                         :problem/solve     :solver
-                         :text/respond      :voice
-                         :code/generate     :coder
-                         :code/patch        :coder
-                         :code/explain      :coder
-                         :code/review       :coder}
-  :switch-on #{:schema/invalid
-               :format/drift
-               :eval/low-score
-               :eval/must-failed}
-  :retry {:same-cap-max 1
-          :fallback-max 0}
-  :policy      :quality-aware}
+  :cap->role                 {:llm/code        :coder
+                              :llm/solver      :solver
+                              :llm/solver-text :solver
+                              :llm/meta        :router
+                              :llm/judge       :router
+                              :llm/voice       :voice
+                              :llm/mock        :router}
+  :intent->default-role      {:route/decide      :router
+                              :context/summarize :router
+                              :eval/grade        :router
+                              :problem/solve     :solver
+                              :text/respond      :voice
+                              :code/generate     :coder
+                              :code/patch        :coder
+                              :code/explain      :coder
+                              :code/review       :coder}
+  :switch-on                 #{:schema/invalid
+                               :format/drift
+                               :eval/low-score
+                               :eval/must-failed}
+  :retry                     {:same-cap-max 1
+                              :fallback-max 0}
+  :policy                    :quality-aware}
 
  ;; Runtime/profile policy knobs
+
  :ferment.caps/profiles
  {:default {:llm/mode :live}
   :test    {:llm/mode :mock}
   :mini    {:llm/mode :live}}
 
-}
+ }

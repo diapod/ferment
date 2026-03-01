@@ -1,7 +1,7 @@
 # Production Backlog (Agent Orchestrator)
 
 Status: new production track for orchestration maturity.
-Existing tuning backlog is preserved unchanged in `doc/backlog.md`.
+Existing tuning backlog is preserved in `doc/backlog.md` and the #2-#9 tuning package is marked delivered (sync: 2026-02-28).
 Completed historical work remains in `doc/backlogs-done.md`.
 Execution for top priorities is tracked in `doc/execution-plan-q1.md`.
 
@@ -11,6 +11,12 @@ Execution for top priorities is tracked in `doc/execution-plan-q1.md`.
    - Add job lifecycle for `/v1/act`: `accepted -> running -> completed/failed/canceled`.
    - Add deadline, cancellation, backpressure, and priority handling.
    - Add retry policy with jitter/backoff at orchestrator level (outside model retries).
+   - Delivery status (synced):
+     - [x] async lifecycle + endpoints (`/v1/act` accepted, job status, job cancel),
+     - [x] in-memory queue workers with deadline/timeout, cancel, priority, backpressure,
+     - [x] orchestrator retry with jitter/backoff for transient queue execution failures,
+     - [x] queue telemetry counters and HTTP/runtime regression tests,
+     - [ ] explicit profile-level queue config overlays (`runtime.edn`) + operator usage section for async flow.
    - Done when:
      - long requests can run async and be polled/retrieved deterministically,
      - queue saturation does not block the whole node,

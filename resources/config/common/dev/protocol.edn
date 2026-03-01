@@ -5,6 +5,14 @@
                            :cap/id :llm/judge}}
   :policy/intents {:route/decide {:retry {:max-attempts 4
                                           :same-cap-max 3
-                                          :fallback-max 0}}}}
+                                          :fallback-max 0}
+                                  :checks/hard [:schema-valid]
+                                  :checks/soft []}
+                   :text/respond {:done {:score-min 0.82}
+                                  :checks/hard [:schema-valid :no-truncated-ending]
+                                  :checks/soft [:no-hallucinated-apis :no-list-expansion]}
+                   :problem/solve {:done {:score-min 0.82}
+                                   :checks/hard [:schema-valid :no-truncated-ending]
+                                   :checks/soft [:no-hallucinated-apis]}}}
 
 }

@@ -1,0 +1,7 @@
+{
+  "proto": 1,
+  "trace": {"id": "bench-sla-c2-text-alt"},
+  "session/id": "session/bench-sla-c2",
+  "task": {"intent": "text/respond"},
+  "input": {"prompt": "Explain CAP theorem in two short sentences."}
+}

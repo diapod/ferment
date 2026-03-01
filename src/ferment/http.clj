@@ -15,10 +15,10 @@
             [ferment.contracts :as contracts]
             [ferment.core :as core]
             [ferment.memory :as memory]
-            [ferment.middleware.act.execute :as act-middleware-execute]
-            [ferment.middleware.act.finalize :as act-middleware-finalize]
-            [ferment.middleware.act.prepare :as act-middleware-prepare]
-            [ferment.middleware.act.route :as act-middleware-route]
+            [ferment.http.act.middleware.execute :as act-middleware-execute]
+            [ferment.http.act.middleware.finalize :as act-middleware-finalize]
+            [ferment.http.act.middleware.prepare :as act-middleware-prepare]
+            [ferment.http.act.middleware.route :as act-middleware-route]
             [ferment.middleware.remote-ip :as remote-ip]
             [ferment.oplog :as oplog]
             [ferment.queue :as queue]
@@ -321,7 +321,11 @@
                             :route/decide-final    0
                             :route/fail-open       0
                             :route/fail-closed     0
-                            :route/strict          0}
+                            :route/strict          0
+                            :cap/resolve-attempt   0
+                            :cap/resolve-hit       0
+                            :cap/resolve-miss      0
+                            :cap/reject-reasons    {}}
               :latency-ms  {:count 0
                             :sum   0.0
                             :max   0.0}}
@@ -334,7 +338,13 @@
               :quality/judge-used  0
               :quality/judge-pass  0
               :quality/judge-fail  0
-              :quality/must-failed 0}})
+              :quality/must-failed 0}
+   :orchestration {:participants/requests 0
+                   :participants/total 0
+                   :participants/max 0
+                   :context/default-lookups 0
+                   :context/default-hits 0
+                   :context/default-misses 0}})
 
 (defn- workflow-telemetry-from-error
   [body]
@@ -350,6 +360,21 @@
         (and (sequential? must-failed) (seq must-failed))
         (assoc :quality/must-failed 1))
       {})))
+
+(defn- orchestration-telemetry-from-response
+  [body]
+  (let [participants (if (sequential? (:models/used body))
+                       (->> (:models/used body)
+                            (filter map?)
+                            distinct
+                            vec)
+                       [])
+        n (count participants)]
+    (cond-> {}
+      (pos? n)
+      (assoc :participants/requests 1
+             :participants/total n
+             :participants/max n))))
 
 (defn- telemetry-error-type
   [body]
@@ -473,6 +498,46 @@
                         :invalidations cache-invalidations}
      :failure-taxonomy (failure-taxonomy act-errors wf-errors)}))
 
+(defn- telemetry-orchestration
+  [state]
+  (let [orchestration (if (map? (:orchestration state)) (:orchestration state) {})
+        routing (if (map? (get-in state [:act :routing]))
+                  (get-in state [:act :routing])
+                  {})
+        participants-requests (counter-value (:participants/requests orchestration))
+        participants-total (counter-value (:participants/total orchestration))
+        participants-max (counter-value (:participants/max orchestration))
+        context-lookups (counter-value (:context/default-lookups orchestration))
+        context-hits (counter-value (:context/default-hits orchestration))
+        context-misses (counter-value (:context/default-misses orchestration))
+        route-total (counter-value (:route/decide-hit routing))
+        continue' (counter-value (:route/decide-continue routing))
+        final' (counter-value (:route/decide-final routing))
+        fail-open' (counter-value (:route/fail-open routing))
+        fail-closed' (counter-value (:route/fail-closed routing))
+        strict' (counter-value (:route/strict routing))]
+    {:participants/diversity {:value (safe-rate participants-total participants-requests)
+                              :participants/total participants-total
+                              :participants/requests participants-requests
+                              :participants/max participants-max}
+     :route/decision-quality-trend
+     {:value (safe-rate (+ continue' final') route-total)
+      :route/decide-hit route-total
+      :route/decide-continue continue'
+      :route/decide-final final'
+      :route/fail-open fail-open'
+      :route/fail-closed fail-closed'
+      :route/strict strict'
+      :continue-rate (safe-rate continue' route-total)
+      :final-rate (safe-rate final' route-total)
+      :fail-open-rate (safe-rate fail-open' route-total)
+      :fail-closed-rate (safe-rate fail-closed' route-total)
+      :strict-rate (safe-rate strict' route-total)}
+     :context/hit-utility {:value (safe-rate context-hits context-lookups)
+                           :lookups context-lookups
+                           :hits context-hits
+                           :misses context-misses}}))
+
 (defn- record-act-telemetry!
   ([telemetry response latency-ms]
    (record-act-telemetry! telemetry response latency-ms nil nil))
@@ -485,7 +550,8 @@
            ok?    (< (int status) 400)
            err-k  (telemetry-error-type body)
            wf-telemetry (get-in body [:result :plan/run :telemetry])
-           wf-error-telemetry (workflow-telemetry-from-error body)]
+           wf-error-telemetry (workflow-telemetry-from-error body)
+           orchestration-telemetry (orchestration-telemetry-from-response body)]
        (swap! telemetry
               (fn [state]
                 (-> (telemetry/merge-counters (default-telemetry) state)
@@ -504,7 +570,9 @@
                     (cond-> (map? routing-telemetry)
                       (update-in [:act :routing] telemetry/merge-counters routing-telemetry))
                     (cond-> (map? cache-telemetry)
-                      (update-in [:act :cache] telemetry/merge-counters cache-telemetry)))))))))
+                      (update-in [:act :cache] telemetry/merge-counters cache-telemetry))
+                    (cond-> (map? orchestration-telemetry)
+                      (update :orchestration telemetry/merge-counters orchestration-telemetry)))))))))
 
 (defn- record-cache-telemetry!
   [telemetry cache-telemetry]
@@ -529,18 +597,31 @@
         state' (assoc-in state [:act :latency-ms :avg] avg)]
     (assoc state'
            :kpi (telemetry-kpi state')
+           :orchestration (telemetry-orchestration state')
            :lifecycle (telemetry/lifecycle-snapshot)
            :queue (telemetry/queue-snapshot))))
 
-(defn- resolve-cap-id
+(defn- request-explicit-cap-id
+  [request]
+  (or (keywordish (:cap/id request))
+      (keywordish (get-in request [:task :cap/id]))))
+
+(defn- resolve-capability-decision
   [resolver request]
-  (or (:cap/id request)
-      (get-in request [:task :cap/id])
-      (workflow/resolve-capability
-       resolver
-       {:intent  (get-in request [:task :intent])
-        :requires (get-in request [:task :requires])
-        :effects (:effects request)})))
+  (let [intent       (some-> (get-in request [:task :intent]) keywordish)
+        explicit-cap (request-explicit-cap-id request)
+        routed-cap   (some-> resolver :routing :intent->cap (get intent) keywordish)
+        node         (cond-> {:intent intent
+                              :requires (get-in request [:task :requires])
+                              :effects (:effects request)}
+                       (or (keyword? explicit-cap) (keyword? routed-cap))
+                       (assoc :dispatch {:candidates (cond-> []
+                                                       (keyword? explicit-cap) (conj explicit-cap)
+                                                       (keyword? routed-cap) (conj routed-cap))}))
+        decision0    (workflow/resolve-capability-decision resolver node)]
+    (cond-> decision0
+      (keyword? explicit-cap) (assoc :requested-cap/id explicit-cap)
+      (keyword? routed-cap) (assoc :routed-cap/id routed-cap))))
 
 (defn- effective-resolver
   [runtime]
@@ -550,7 +631,10 @@
     (cond-> resolver
       (map? routing)                   (assoc :routing routing)
       (contains? router-cfg :profiles) (assoc :profiles (:profiles router-cfg))
-      (contains? router-cfg :policy)   (assoc :policy (:policy router-cfg)))))
+      (contains? router-cfg :policy)   (assoc :policy (:policy router-cfg))
+      (contains? router-cfg :policy-profiles) (assoc :policy/profiles (:policy-profiles router-cfg))
+      (contains? router-cfg :intent->policy-profile) (assoc :intent->policy-profile (:intent->policy-profile router-cfg))
+      (contains? router-cfg :policy/profile) (assoc :policy/profile (:policy/profile router-cfg)))))
 
 (defn- positive-int
   [v]
@@ -776,6 +860,71 @@
   [request]
   (true? (get-in request [:routing :debug/transcript?])))
 
+(declare request-routing-config)
+(declare effective-routing-config)
+
+(defn- resolve-routing-policy-profile
+  [runtime resolver request intent]
+  (let [router-cfg (if (map? (:router runtime)) (:router runtime) {})
+        routing-cfg (effective-routing-config runtime request)
+        request-cfg (request-routing-config request)
+        intent->profile (if (map? (:intent->policy-profile router-cfg))
+                          (:intent->policy-profile router-cfg)
+                          {})
+        routed-profile (when (keyword? intent)
+                         (some-> (get intent->profile intent) keywordish))]
+    (or (some-> request-cfg :policy/profile keywordish)
+        (some-> request-cfg :policy-profile keywordish)
+        (some-> routing-cfg :policy/profile keywordish)
+        (some-> routing-cfg :policy-profile keywordish)
+        routed-profile
+        (some-> resolver :policy/profile keywordish)
+        :balanced)))
+
+(defn- resolve-routing-policy-profiles
+  [runtime resolver]
+  (let [router-cfg (if (map? (:router runtime)) (:router runtime) {})
+        profiles (or (when (map? (:policy-profiles router-cfg))
+                       (:policy-profiles router-cfg))
+                     (when (map? (:policy/profiles resolver))
+                       (:policy/profiles resolver))
+                     (when (map? (:policy-profiles resolver))
+                       (:policy-profiles resolver)))]
+    (if (map? profiles) profiles {})))
+
+(defn- resolve-workflow-limit
+  [policy-cfg k]
+  (let [raw (or (get-in policy-cfg [:limits k])
+                (get policy-cfg k))
+        n (parse-positive-int raw -1)]
+    (when (pos-int? n)
+      n)))
+
+(def ^:private context-summary-system-max-chars
+  600)
+
+(def ^:private context-summary-system-prefix
+  "Context summary from previous turns. Reuse only if relevant and do not contradict current user prompt:\n")
+
+(defn- context-summary->system
+  [summary]
+  (let [s (some-> summary trim-s)]
+    (when (some? s)
+      (str context-summary-system-prefix
+           (if (> (count s) context-summary-system-max-chars)
+             (subs s 0 context-summary-system-max-chars)
+             s)))))
+
+(defn- enrich-input-with-context-summary
+  [input context]
+  (let [input' (if (map? input) input {})
+        summary (when (map? context) (:summary context))
+        system-fragment (context-summary->system summary)]
+    (if (or (nil? system-fragment)
+            (some? (trim-s (:system input'))))
+      input'
+      (assoc input' :system system-fragment))))
+
 (defn- act-request->invoke-opts
   [runtime resolver request cap-id]
   (let [intent        (get-in request [:task :intent])
@@ -787,6 +936,16 @@
         base-context  (if (map? (:context request)) (:context request) {})
         context'      (cond-> base-context
                         (map? auth-user) (assoc :auth/user auth-user))
+        policy-profile (resolve-routing-policy-profile runtime resolver request intent)
+        policy-profiles (resolve-routing-policy-profiles runtime resolver)
+        policy-cfg   (if (and (keyword? policy-profile)
+                              (map? policy-profiles))
+                       (get policy-profiles policy-profile)
+                       nil)
+        max-call-attempts (when (map? policy-cfg)
+                            (resolve-workflow-limit policy-cfg :call-tree/max-calls))
+        max-fallback-hops (when (map? policy-cfg)
+                            (resolve-workflow-limit policy-cfg :call-tree/max-fallback-hops))
         session-meta  (when (map? auth-user)
                         (cond-> {:auth/source auth-source-k}
                           (some? (:user/id auth-user))           (assoc :user/id (:user/id auth-user))
@@ -797,7 +956,9 @@
                                   (cap-id->role runtime resolver cap-id intent))
              :intent          intent
              :cap-id          cap-id
-             :input           (:input request)
+             :input           (enrich-input-with-context-summary
+                               (:input request)
+                               context')
              :context         context'
              :constraints     (:constraints request)
              :done            (:done request)
@@ -808,7 +969,8 @@
              :trace           (:trace request)
              :proto           (:proto request)
              :session-id      (:session/id request)
-             :session-version (:session/version request)}
+             :session-version (:session/version request)
+             :policy/profile  policy-profile}
       (some? (:model request))                        (assoc :model (:model request))
       (some? (get-in request [:task :model]))         (assoc :model (get-in request [:task :model]))
       (keyword? (:response/type request))             (assoc :response/type (:response/type request))
@@ -819,6 +981,9 @@
       (some? (:temperature budget))                   (assoc :temperature (:temperature budget))
       (map? auth-user)                                (assoc :auth/user auth-user)
       (map? (:roles runtime))                         (assoc :roles (:roles runtime))
+      (map? policy-profiles)                          (assoc :policy/profiles policy-profiles)
+      (pos-int? max-call-attempts)                    (assoc :workflow/max-calls max-call-attempts)
+      (pos-int? max-fallback-hops)                    (assoc :workflow/max-fallback-hops max-fallback-hops)
       (map? session-meta)                             (assoc :session/meta session-meta)
       (request-debug-plan? request)                   (assoc :debug/plan? true)
       (request-debug-transcript? request)             (assoc :debug/transcript? true))))
@@ -950,6 +1115,20 @@
                 cached (get-in cache' [:entries get-vars-fn])]
             (or cached invoker))))))
 
+(defn- record-context-defaults-telemetry!
+  [runtime lookups hits misses]
+  (let [telemetry (when (map? runtime) (:telemetry runtime))
+        lookups' (counter-value lookups)
+        hits' (counter-value hits)
+        misses' (counter-value misses)]
+    (when (instance? clojure.lang.IAtom telemetry)
+      (swap! telemetry
+             (fn [state]
+               (-> (telemetry/merge-counters (default-telemetry) state)
+                   (update-in [:orchestration :context/default-lookups] (fnil + 0) lookups')
+                   (update-in [:orchestration :context/default-hits] (fnil + 0) hits')
+                   (update-in [:orchestration :context/default-misses] (fnil + 0) misses')))))))
+
 (defn- request-with-session-defaults
   [runtime request]
   (let [service (when (map? runtime) (:session runtime))
@@ -973,8 +1152,14 @@
                    (catch Throwable _
                      nil))]
         (if (map? vars)
-          (apply-session-var-defaults request vars bindings)
-          request))
+          (let [hits (count (filter #(contains? vars %) binding-keys))
+                lookups (count binding-keys)
+                misses (max 0 (- lookups hits))]
+            (record-context-defaults-telemetry! runtime lookups hits misses)
+            (apply-session-var-defaults request vars bindings))
+          (do
+            (record-context-defaults-telemetry! runtime (count binding-keys) 0 (count binding-keys))
+            request)))
       request)))
 
 (def ^:private queue-job-accepted-public-keys
@@ -1307,6 +1492,15 @@
 (def ^:private tool-call-tag-pattern
   #"(?is)<tool_call\b[^>]*>\s*(\{.*?\})\s*</tool_call>")
 
+(def ^:private think-tag-pattern
+  #"(?is)<think\b[^>]*>.*?</think>")
+
+(def ^:private tool-call-block-pattern
+  #"(?is)<tool_call\b[^>]*>.*?</tool_call>")
+
+(def ^:private pseudo-tool-tag-pattern
+  #"(?is)</?\s*(?:tool_calls?|function_call|analysis|observation)\b[^>]*>")
+
 (def ^:private route-tool-call-names
   #{"solve_question" "ask_solver" "route_to_solver"})
 
@@ -1335,6 +1529,66 @@
     (when-some [[_ payload] (re-find tool-call-tag-pattern text)]
       (let [parsed (parse-structured-text payload)]
         (when (map? parsed) parsed)))))
+
+(defn- map-tool-call
+  [parsed]
+  (when (map? parsed)
+    (cond
+      (map? (:tool_call parsed)) (:tool_call parsed)
+      (map? (get parsed "tool_call")) (get parsed "tool_call")
+      (and (sequential? (:tool_calls parsed))
+           (map? (first (:tool_calls parsed))))
+      (first (:tool_calls parsed))
+      (and (sequential? (get parsed "tool_calls"))
+           (map? (first (get parsed "tool_calls"))))
+      (first (get parsed "tool_calls"))
+      :else nil)))
+
+(defn- strip-internal-markers
+  [text]
+  (-> (or text "")
+      (str/replace think-tag-pattern "")
+      (str/replace tool-call-block-pattern "")
+      (str/replace pseudo-tool-tag-pattern "")
+      str/trim))
+
+(defn- sanitize-public-out
+  [out]
+  (cond
+    (map? out)
+    (cond-> out
+      (string? (:text out))
+      (assoc :text (strip-internal-markers (:text out)))
+
+      (string? (:content out))
+      (assoc :content (strip-internal-markers (:content out))))
+
+    (string? out)
+    (strip-internal-markers out)
+
+    :else
+    out))
+
+(defn- sanitize-final-response-body
+  [body]
+  (let [result-type (contracts/result-type-of body)]
+    (cond
+      (and (map? body) (= :value result-type))
+      (update-in body [:result :out] sanitize-public-out)
+
+      (and (map? body) (= :stream result-type))
+      (update-in body [:result :stream]
+                 (fn [events]
+                   (if (sequential? events)
+                     (mapv (fn [event]
+                             (if (and (map? event) (string? (:text event)))
+                               (assoc event :text (strip-internal-markers (:text event)))
+                               event))
+                           events)
+                     events)))
+
+      :else
+      body)))
 
 (defn- route-tool-call-question
   [tool-call]
@@ -1369,15 +1623,16 @@
       (trim-s (:prompt request))))
 
 (def ^:private route-voice-preserve-system
-  "Role: VOICE. Rewrite for tone/style only. Preserve all factual claims, technical details, constraints, and examples from input. Do not summarize away meaning. Keep output compact. If source text appears truncated, complete it naturally in at most two sentences, without adding new facts.")
+  "Role: VOICE. Rewrite for tone/style only. Preserve all factual claims, technical details, constraints, and examples from input handoff. Do not summarize away meaning. Keep output compact. If source text appears truncated, complete it naturally in at most two sentences, without adding new facts.")
 
 (defn- route-solver->voice-plan
   [user-prompt]
   {:nodes [{:op :call
             :intent :text/respond
             :cap/id :llm/voice
-            :constraints {:max-chars 420}
+           :constraints {:max-chars 420}
             :budget {:max-tokens 220}
+            :done {:score-min 0.85}
             :input {:prompt user-prompt}
             :as :voice-primary
             :dispatch {:allow-failure? true
@@ -1391,23 +1646,26 @@
             :cap/id :llm/solver
             :constraints {:max-chars 700}
             :budget {:max-tokens 240}
+            :done {:score-min 0.5}
             :input {:prompt user-prompt}
             :dispatch {:checks/hard [:schema-valid]
                        :checks/soft [:no-hallucinated-apis :no-truncated-ending]}
             :as :solver
             :when {:failed? :voice-primary}}
            {:op :call
-            :intent :text/respond
-            :cap/id :llm/voice
-            :system route-voice-preserve-system
-            :input {:prompt {:slot/id [:solver :out :text]}}
-            :constraints {:max-chars 420}
-            :budget {:max-tokens 160}
+           :intent :text/respond
+           :cap/id :llm/voice
+           :system route-voice-preserve-system
+            :input/schema :req/handoff
+            :requires {:in-schema :req/handoff}
+            :input {:handoff/text {:slot/id [:solver :out :text]}}
+            :constraints {:max-chars 700}
+            :budget {:max-tokens 240}
             :done {:score-min 0.0}
             :dispatch {:checks/hard [:schema-valid :no-truncated-ending]
                        :checks/soft [:no-hallucinated-apis :no-list-expansion]
                        :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
-                       :retry {:same-cap-max 1
+                       :retry {:same-cap-max 2
                                :fallback-max 0}}
             :as :voice-final
             :when {:failed? :voice-primary}}
@@ -1437,7 +1695,8 @@
          (= :llm/voice (:cap/id node2))
          (= :voice-final (:as node2))
          (= :voice-primary (get-in node2 [:when :failed?]))
-         (= [:solver :out :text] (get-in node2 [:input :prompt :slot/id]))
+         (= :req/handoff (keywordish (:input/schema node2)))
+         (= [:solver :out :text] (get-in node2 [:input :handoff/text :slot/id]))
          (= :emit (:op node3))
          (= [:voice-primary :out] (get-in node3 [:input :slot/id]))
          (= :emit (:op node4))
@@ -1454,6 +1713,7 @@
   [text {:keys [request mode]}]
   (let [text'       (trim-s text)
         parsed      (parse-structured-text text')
+        map-tool*    (map-tool-call parsed)
         route-plan* (cond
                       (map? (:plan parsed))
                       (:plan parsed)
@@ -1464,7 +1724,8 @@
                       :else nil)
         route-plan (when (route-solver->voice-plan? route-plan*)
                      route-plan*)
-        tool-call  (extract-tool-call text')
+        tool-call  (or map-tool*
+                       (extract-tool-call text'))
         prompt'    (if (map? tool-call)
                      (route-tool-call-question tool-call)
                      (route-request-prompt request))]
@@ -1524,9 +1785,29 @@
 
 (defn- meta-routing-enabled?
   [runtime request]
-  (let [cfg (effective-routing-config runtime request)]
-    (if (contains? cfg :meta?)
+  (let [request-cfg (request-routing-config request)
+        cfg (effective-routing-config runtime request)
+        strict-request? (or (= :fail-closed (keywordish (:on-error request-cfg)))
+                            (and (contains? request-cfg :strict?)
+                                 (true? (:strict? request-cfg))))
+        force-request? (and (contains? request-cfg :force?)
+                            (true? (:force? request-cfg)))
+        strict-default? (and (not strict-request?)
+                             (not (contains? request-cfg :on-error))
+                             (not (contains? request-cfg :strict?))
+                             (or (= :fail-closed (keywordish (:on-error cfg)))
+                                 (true? (:strict? cfg))))
+        force-default? (and (not force-request?)
+                            (not (contains? request-cfg :force?))
+                            (true? (:force? cfg)))]
+    (cond
+      (or strict-request? force-request? strict-default? force-default?)
+      true
+
+      (contains? cfg :meta?)
       (boolean (:meta? cfg))
+
+      :else
       (= :meta-decider (get-in runtime [:router :policy])))))
 
 (defn- meta-routing-fail-mode
@@ -1638,7 +1919,45 @@
 
 (defn- route-decider-opts
   [runtime resolver request cap-id intent]
-  (let [route-role (router/resolve-role runtime resolver cap-id intent)]
+  (let [route-role (router/resolve-role runtime resolver cap-id intent)
+        policy-profile (resolve-routing-policy-profile runtime resolver request intent)
+        policy-profiles (resolve-routing-policy-profiles runtime resolver)
+        policy-cfg (if (and (keyword? policy-profile)
+                            (map? policy-profiles))
+                     (get policy-profiles policy-profile)
+                     nil)
+        route-decider-max-chars 420
+        route-decider-max-tokens 96
+        route-decider-max-attempts 2
+        route-decider-timeout-ms 12000
+        request-constraints (if (map? (:constraints request)) (:constraints request) {})
+        request-budget (if (map? (:budget request)) (:budget request) {})
+        bounded-max-chars (let [v (parse-positive-int (:max-chars request-constraints) nil)]
+                            (if (integer? v)
+                              (min route-decider-max-chars v)
+                              route-decider-max-chars))
+        bounded-max-tokens (let [v (parse-positive-int (:max-tokens request-budget) nil)]
+                             (if (integer? v)
+                               (min route-decider-max-tokens v)
+                               route-decider-max-tokens))
+        bounded-max-roundtrips (let [v (parse-positive-int (:max-roundtrips request-budget) nil)]
+                                 (if (integer? v)
+                                   (min route-decider-max-attempts v)
+                                   route-decider-max-attempts))
+        bounded-timeout-ms (let [v (parse-positive-int (:timeout-ms request) nil)]
+                             (if (integer? v)
+                               (min route-decider-timeout-ms v)
+                               route-decider-timeout-ms))
+        route-constraints (assoc request-constraints
+                                 :max-chars bounded-max-chars)
+        route-budget (assoc request-budget
+                            :max-tokens bounded-max-tokens
+                            :max-roundtrips bounded-max-roundtrips
+                            :temperature 0.0)
+        max-call-attempts (when (map? policy-cfg)
+                            (resolve-workflow-limit policy-cfg :call-tree/max-calls))
+        max-fallback-hops (when (map? policy-cfg)
+                            (resolve-workflow-limit policy-cfg :call-tree/max-fallback-hops))]
     {:role route-role
      :intent intent
      :cap-id cap-id
@@ -1646,8 +1965,10 @@
              :resolver {:routing (:routing resolver)}}
      :context (merge {:route/for-intent (get-in request [:task :intent])}
                      (if (map? (:context request)) (:context request) {}))
-     :constraints (:constraints request)
-     :budget (:budget request)
+     :constraints route-constraints
+     :budget route-budget
+     :max-attempts route-decider-max-attempts
+     :timeout-ms bounded-timeout-ms
      :request-id (:request/id request)
      :trace (:trace request)
      :proto (:proto request)
@@ -1658,6 +1979,10 @@
      :debug/plan? (request-debug-plan? request)
      :debug/transcript? (request-debug-transcript? request)
      :result-parser route-decide-result-parser
+     :policy/profile policy-profile
+     :policy/profiles policy-profiles
+     :workflow/max-calls max-call-attempts
+     :workflow/max-fallback-hops max-fallback-hops
      :resolver resolver}))
 
 (defn- compact-last-check
@@ -1829,69 +2154,77 @@
              :strict? false
              :attempted? false
              :reason :fail-open})
-          (try
-            (let [route-response (core/call-capability
-                                  runtime
-                                  resolver
-                                  (route-decider-opts runtime resolver request cap-id route-intent))
-                  route-out (contracts/result-out-of route-response)]
-              (if (routing-decision? route-out)
-                {:request (merge-routing-decision runtime request route-out)
-                 :mode :continue
-                 :enabled? true
-                 :strict? strict?
-                 :attempted? true
-                 :reason :continue
-                 :route-response route-response}
-                {:request request
-                 :mode :final
-                 :enabled? true
-                 :strict? strict?
-                 :attempted? true
-                 :reason :final
-                 :response route-response}))
-            (catch clojure.lang.ExceptionInfo e
-              (if strict?
-                {:mode :error
-                 :status 502
-                 :request request
-                 :enabled? true
-                 :strict? true
-                 :attempted? true
-                 :reason :fail-closed
-                 :body (error-envelope request
-                                       :route/decide-failed
-                                       (.getMessage e)
-                                       (route-decider-error-details (ex-data e) route-intent cap-id)
-                                       true)}
-                {:request request
-                 :mode :none
-                 :enabled? true
-                 :strict? false
-                 :attempted? true
-                 :reason :fail-open}))
-            (catch Throwable t
-              (if strict?
-                {:mode :error
-                 :status 502
-                 :request request
-                 :enabled? true
-                 :strict? true
-                 :attempted? true
-                 :reason :fail-closed
-                 :body (error-envelope request
-                                       :route/decide-failed
-                                       (.getMessage t)
-                                       {:route/intent route-intent
-                                        :route/cap-id cap-id
-                                        :class (str (class t))}
-                                       true)}
-                {:request request
-                 :mode :none
-                 :enabled? true
-                 :strict? false
-                 :attempted? true
-                 :reason :fail-open}))))))))
+          (let [started-at (now-nanos)]
+            (try
+              (let [route-response (core/call-capability
+                                    runtime
+                                    resolver
+                                    (route-decider-opts runtime resolver request cap-id route-intent))
+                    route-out (contracts/result-out-of route-response)
+                    decider-latency-ms (nanos->millis started-at)]
+                (if (routing-decision? route-out)
+                  {:request (merge-routing-decision runtime request route-out)
+                   :mode :continue
+                   :enabled? true
+                   :strict? strict?
+                   :attempted? true
+                   :reason :continue
+                   :route-response route-response
+                   :decider-latency-ms decider-latency-ms}
+                  {:request request
+                   :mode :final
+                   :enabled? true
+                   :strict? strict?
+                   :attempted? true
+                   :reason :final
+                   :response route-response
+                   :decider-latency-ms decider-latency-ms}))
+              (catch clojure.lang.ExceptionInfo e
+                (if strict?
+                  {:mode :error
+                   :status 502
+                   :request request
+                   :enabled? true
+                   :strict? true
+                   :attempted? true
+                   :reason :fail-closed
+                   :decider-latency-ms (nanos->millis started-at)
+                   :body (error-envelope request
+                                         :route/decide-failed
+                                         (.getMessage e)
+                                         (route-decider-error-details (ex-data e) route-intent cap-id)
+                                         true)}
+                  {:request request
+                   :mode :none
+                   :enabled? true
+                   :strict? false
+                   :attempted? true
+                   :reason :fail-open
+                   :decider-latency-ms (nanos->millis started-at)}))
+              (catch Throwable t
+                (if strict?
+                  {:mode :error
+                   :status 502
+                   :request request
+                   :enabled? true
+                   :strict? true
+                   :attempted? true
+                   :reason :fail-closed
+                   :decider-latency-ms (nanos->millis started-at)
+                   :body (error-envelope request
+                                         :route/decide-failed
+                                         (.getMessage t)
+                                         {:route/intent route-intent
+                                          :route/cap-id cap-id
+                                          :class (str (class t))}
+                                         true)}
+                  {:request request
+                   :mode :none
+                   :enabled? true
+                   :strict? false
+                   :attempted? true
+                   :reason :fail-open
+                   :decider-latency-ms (nanos->millis started-at)})))))))))
 
 (defn- routing-telemetry-counters
   [meta-step]
@@ -1907,6 +2240,42 @@
       (= :fail-open reason) (update :route/fail-open (fnil inc 0))
       (= :fail-closed reason) (update :route/fail-closed (fnil inc 0))
       strict? (update :route/strict (fnil inc 0)))))
+
+(defn- cap-resolution-telemetry-counters
+  [decision]
+  (let [decision' (if (map? decision) decision {})
+        resolved? (keyword? (:cap/id decision'))
+        rejected  (if (sequential? (:rejected-candidates decision'))
+                    (:rejected-candidates decision')
+                    [])]
+    (reduce (fn [acc entry]
+              (let [reason (some-> entry :reason keywordish)]
+                (if (keyword? reason)
+                  (update-in acc [:cap/reject-reasons reason] (fnil inc 0))
+                  acc)))
+            (cond-> {:cap/resolve-attempt 1}
+              resolved? (assoc :cap/resolve-hit 1)
+              (not resolved?) (assoc :cap/resolve-miss 1))
+            rejected)))
+
+(defn- cap-resolution-error-details
+  [request decision]
+  (let [decision'   (if (map? decision) decision {})
+        intent      (some-> request :task :intent keywordish)
+        requested   (some-> decision' :requested-cap/id keywordish)
+        routed-cap  (some-> decision' :routed-cap/id keywordish)
+        candidates  (->> (:candidates decision')
+                         (keep keywordish)
+                         vec)
+        rejected    (->> (:rejected-candidates decision')
+                         (keep compact-rejected-candidate)
+                         vec)]
+    (cond-> {}
+      (keyword? intent) (assoc :intent intent)
+      (keyword? requested) (assoc :requested-cap/id requested)
+      (keyword? routed-cap) (assoc :routed-cap/id routed-cap)
+      (seq candidates) (assoc :candidates candidates)
+      (seq rejected) (assoc :rejected-candidates rejected))))
 
 (defn- invoke-act-prepared-request
   [runtime payload auth]
@@ -1929,9 +2298,21 @@
 (defn- invoke-act-route-phase
   [runtime request accepted-mode? protocol resolver]
   (let [req-check        (contracts/validate-request protocol request)
-        meta-step        (when (and (:ok? req-check)
-                                    (not accepted-mode?))
-                           (maybe-apply-meta-routing runtime resolver request))
+        [meta-step0 route-phase-latency-ms]
+        (if (and (:ok? req-check)
+                 (not accepted-mode?))
+          (let [started-at (now-nanos)
+                step       (maybe-apply-meta-routing runtime resolver request)]
+            [step (nanos->millis started-at)])
+          [nil nil])
+        route-decider-latency-ms (when (map? meta-step0)
+                                   (let [latency (:decider-latency-ms meta-step0)]
+                                     (when (number? latency)
+                                       latency)))
+        meta-step        (cond-> meta-step0
+                           (and (map? meta-step0)
+                                (number? route-phase-latency-ms))
+                           (assoc :latency-ms route-phase-latency-ms))
         route-mode       (or (:mode meta-step) :none)
         request*         (or (:request meta-step) request)
         routed?          (not= request request*)
@@ -1945,6 +2326,9 @@
      :route-mode route-mode
      :request* request*
      :routed? routed?
+     :route-decide-latency-ms route-decider-latency-ms
+     :route-phase-latency-ms route-phase-latency-ms
+     :route-decider-latency-ms route-decider-latency-ms
      :post-route-check post-route-check
      :route-telemetry (routing-telemetry-counters meta-step)}))
 
@@ -2131,7 +2515,8 @@
        :body   (error-envelope request*
                                :unsupported/intent
                                "No capability can handle the requested intent."
-                               {:intent (get-in request* [:task :intent])})}
+                               (cap-resolution-error-details request*
+                                                             (:cap/decision phase)))}
       (if (and cache-hit? (map? (:response cache-lookup)))
         (:response cache-lookup)
         (invoke-act-runtime-response runtime resolver request* cap-id))))))
@@ -2144,15 +2529,23 @@
                 post-route-check
                 route-mode
                 resolver]} phase
-        cap-id (when (and (map? request*)
-                          (:ok? req-check)
-                          (:ok? post-route-check)
-                          (not accepted-mode?)
-                          (not= :error route-mode)
-                          (not= :final route-mode))
-                 (resolve-cap-id resolver request*))
+        cap-decision (when (and (map? request*)
+                                (:ok? req-check)
+                                (:ok? post-route-check)
+                                (not accepted-mode?)
+                                (not= :error route-mode)
+                                (not= :final route-mode))
+                       (resolve-capability-decision resolver request*))
+        cap-id       (some-> cap-decision :cap/id keywordish)
         cache-phase (invoke-act-cache-phase runtime request* accepted-mode? cap-id)
-        phase' (merge phase cache-phase {:cap-id cap-id})
+        routing-telemetry (telemetry/merge-counters
+                           (:route-telemetry phase)
+                           (cap-resolution-telemetry-counters cap-decision))
+        phase' (merge phase
+                      cache-phase
+                      {:cap-id cap-id
+                       :cap/decision cap-decision
+                       :route-telemetry routing-telemetry})
         response (invoke-act-response runtime phase')
         cache-store-telemetry (if (or (:cache/hit? phase')
                                      (not (cacheable-act-request? request*)))
@@ -2164,6 +2557,66 @@
     (assoc phase'
            :response response
            :cache/telemetry cache-telemetry)))
+
+(defn- memory-write-enabled?
+  [policy intent]
+  (let [by-intent (if (map? (:write/by-intent policy))
+                    (:write/by-intent policy)
+                    {})
+        default? (true? (:write/default? policy))]
+    (if (contains? by-intent intent)
+      (true? (get by-intent intent))
+      default?)))
+
+(defn- compact-memory-text
+  [policy text]
+  (let [max-chars (or (positive-int (:write/max-chars policy)) 1200)
+        trigger (or (positive-int (:compaction/trigger-chars policy)) max-chars)
+        target (or (positive-int (:compaction/target-chars policy)) (min trigger max-chars))
+        target' (min target max-chars)
+        mode (keywordish (:compaction/mode policy))
+        text' (or (some-> text str str/trim not-empty) "")]
+    (cond
+      (str/blank? text') nil
+      (and (= :truncate mode)
+           (> (count text') trigger))
+      (subs text' 0 target')
+      (> (count text') max-chars) (subs text' 0 max-chars)
+      :else text')))
+
+(defn- write-act-memory-summary!
+  [runtime request body]
+  (let [service (when (map? runtime) (:session runtime))
+        store (when (map? service) (:store service))
+        sid (or (some-> (:session/id request) trim-s)
+                (some-> (:session-id request) trim-s))
+        intent (some-> request :task :intent keywordish)
+        policy (when (map? store) (memory/session-memory-policy store))
+        enabled? (and (map? policy)
+                      (true? (:enabled? policy))
+                      (keyword? intent)
+                      (memory-write-enabled? policy intent)
+                      sid)
+        text (or (some-> body :result :out :text)
+                 (some-> body :result :out :content))
+        compacted (when enabled?
+                    (compact-memory-text policy text))
+        write-key (or (some-> (:write/key policy) keywordish)
+                      :context/summary)]
+    (when (and enabled?
+               (keyword? write-key)
+               (some? compacted)
+               (fn? (:put-vars! service)))
+      (try
+        (memory/put-vars! service
+                          sid
+                          {write-key compacted
+                           :context/last-intent intent
+                           :context/last-updated-at (str (java.time.Instant/now))}
+                          {:operation :act/memory-auto-write
+                           :intent intent})
+        (catch Throwable _
+          nil)))))
 
 (defn- invoke-act-session-view
   [runtime request*]
@@ -2188,20 +2641,42 @@
 
 (defn- invoke-act-finalize-phase
   [runtime {:keys [response request*] :as phase}]
-  (let [session-view (invoke-act-session-view runtime request*)
-        response'    (if (and (map? (:body response))
-                              (map? session-view))
-                       (update response :body merge session-view)
-                       response)
-        response''   (attach-response-participants response')]
-    (assoc phase :response/final response'')))
+  (let [route-decide-latency-ms (:route-decide-latency-ms phase)
+        route-phase-latency-ms (:route-phase-latency-ms phase)
+        route-decider-latency-ms (:route-decider-latency-ms phase)
+        response0   (if (and (map? response)
+                             (map? (:body response)))
+                      (cond-> response
+                        (number? route-decide-latency-ms)
+                        (assoc-in [:body :routing/route-decide-latency-ms]
+                                  (double route-decide-latency-ms))
+                        (number? route-phase-latency-ms)
+                        (assoc-in [:body :routing/route-phase-latency-ms]
+                                  (double route-phase-latency-ms))
+                        (number? route-decider-latency-ms)
+                        (assoc-in [:body :routing/route-decider-latency-ms]
+                                  (double route-decider-latency-ms)))
+                      response)
+        response'   (attach-response-participants response0)
+        response''  (if (map? (:body response'))
+                      (update response' :body sanitize-final-response-body)
+                      response')
+        _           (when (and (map? (:body response''))
+                               (map? request*))
+                      (write-act-memory-summary! runtime request* (:body response'')))
+        session-view (invoke-act-session-view runtime request*)
+        response''' (if (and (map? (:body response''))
+                             (map? session-view))
+                      (update response'' :body merge session-view)
+                      response'')]
+    (assoc phase :response/final response''')))
 
 (defn- default-act-middleware-modules
   []
-  [(act-middleware-prepare/middleware :act.middleware/prepare nil)
-   (act-middleware-route/middleware :act.middleware/route nil)
-   (act-middleware-execute/middleware :act.middleware/execute nil)
-   (act-middleware-finalize/middleware :act.middleware/finalize nil)])
+  [(act-middleware-prepare/middleware)
+   (act-middleware-route/middleware)
+   (act-middleware-execute/middleware)
+   (act-middleware-finalize/middleware)])
 
 (defn- act-middleware-module?
   [v]
@@ -2264,9 +2739,13 @@
   ([runtime payload telemetry]
    (invoke-act runtime payload telemetry nil))
   ([runtime payload telemetry auth]
-   (let [started-at      (now-nanos)
-         phase3          ((runtime-act-pipeline runtime)
-                          {:runtime runtime
+   (let [runtime*        (cond-> runtime
+                           (and (map? runtime)
+                                (instance? clojure.lang.IAtom telemetry))
+                           (assoc :telemetry telemetry))
+         started-at      (now-nanos)
+         phase3          ((runtime-act-pipeline runtime*)
+                          {:runtime runtime*
                            :payload payload
                            :act/fns {:prepare-request invoke-act-prepared-request
                                      :accepted-mode? response-type-accepted?
@@ -2287,7 +2766,7 @@
          cache-telemetry (:cache/telemetry phase3)
          request*        (:request* phase3)]
      (record-act-telemetry! telemetry response'' elapsed-ms route-telemetry cache-telemetry)
-     (report-act! runtime request* response'' auth elapsed-ms)
+     (report-act! runtime* request* response'' auth elapsed-ms)
      response'')))
 
 (def ^:private session-public-keys

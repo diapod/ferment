@@ -1,0 +1,17 @@
+{
+  "proto": 1,
+  "trace": {
+    "id": "bench-c4-context-turn1-ll"
+  },
+  "session/id": "session/bench-c4-context",
+  "task": {
+    "intent": "text/respond"
+  },
+  "input": {
+    "prompt": "Remember that my preferred database is MariaDB and acknowledge in one sentence."
+  },
+  "routing": {
+    "profile": "low-latency",
+    "meta?": false
+  }
+}

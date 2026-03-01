@@ -86,9 +86,9 @@
 
   :intents {:route/decide      {:in-schema       :req/route
                                 :out-schema      :res/route
-                                :constraints     {:max-chars 900}
-                                :budget          {:max-tokens     256
-                                                  :max-roundtrips 3
+                                :constraints     {:max-chars 420}
+                                :budget          {:max-tokens     96
+                                                  :max-roundtrips 2
                                                   :temperature    0.0}
                                 :result/contract {:type          :plan
                                                   :contract/kind :route/solver->voice}}
@@ -183,6 +183,8 @@
                                :should    #{:no-hallucinated-apis}
                                :score-min 0.80}
                    :checks    [:schema-valid]
+                   :checks/hard [:schema-valid]
+                   :checks/soft [:no-hallucinated-apis]
                    :judge     {:enabled?     false
                                :intent       :eval/grade
                                :cap/id       :llm/judge
@@ -197,7 +199,8 @@
 
   :policy/intents {:route/decide      {:done      {:must      #{:schema-valid}
                                                    :score-min 1.0}
-                                       :checks    [:schema-valid]
+                                       :checks/hard [:schema-valid]
+                                       :checks/soft []
                                        :switch-on #{:schema/invalid
                                                     :format/drift
                                                     :eval/low-score
@@ -210,50 +213,58 @@
                    :context/summarize {:done     {:must      #{:schema-valid}
                                                   :should    #{:no-hallucinated-apis :no-list-expansion}
                                                   :score-min 0.9}
-                                       :checks   [:schema-valid :no-hallucinated-apis]
+                                       :checks/hard [:schema-valid]
+                                       :checks/soft [:no-hallucinated-apis :no-list-expansion]
                                        :fallback [:llm/meta]
                                        :judge    {:enabled? false}}
                    :text/respond      {:done     {:must      #{:schema-valid}
                                                   :should    #{:no-hallucinated-apis :no-list-expansion}
                                                   :score-min 0.85}
-                                       :checks   [:schema-valid :no-hallucinated-apis :no-list-expansion]
+                                       :checks/hard [:schema-valid :no-truncated-ending]
+                                       :checks/soft [:no-hallucinated-apis :no-list-expansion :sufficient-detail]
                                        :fallback [:llm/voice :llm/solver-text]
                                        :judge    {:enabled?     true
                                                   :max-attempts 1}}
                    :problem/solve     {:done     {:must      #{:schema-valid}
                                                   :should    #{:no-hallucinated-apis}
                                                   :score-min 0.8}
-                                       :checks   [:schema-valid :no-hallucinated-apis :no-truncated-ending]
+                                       :checks/hard [:schema-valid :no-truncated-ending]
+                                       :checks/soft [:no-hallucinated-apis]
                                        :fallback [:llm/solver :llm/meta]
                                        :judge    {:enabled? false}}
                    :code/generate     {:done     {:must      #{:schema-valid}
                                                   :should    #{:tests-pass :no-hallucinated-apis}
                                                   :score-min 0.8}
-                                       :checks   [:schema-valid :no-hallucinated-apis]
+                                       :checks/hard [:schema-valid]
+                                       :checks/soft [:tests-pass :no-hallucinated-apis]
                                        :fallback [:llm/code]
                                        :judge    {:enabled? false}}
                    :code/patch        {:done     {:must      #{:schema-valid}
                                                   :should    #{:tests-pass :no-hallucinated-apis}
                                                   :score-min 0.8}
-                                       :checks   [:schema-valid :tests-pass :no-hallucinated-apis]
+                                       :checks/hard [:schema-valid]
+                                       :checks/soft [:tests-pass :no-hallucinated-apis]
                                        :fallback [:llm/code]
                                        :judge    {:enabled?     true
                                                   :max-attempts 1}}
                    :code/explain      {:done     {:must      #{:schema-valid}
                                                   :should    #{:tests-pass :no-hallucinated-apis}
                                                   :score-min 0.8}
-                                       :checks   [:schema-valid :no-hallucinated-apis]
+                                       :checks/hard [:schema-valid]
+                                       :checks/soft [:tests-pass :no-hallucinated-apis]
                                        :fallback [:llm/code]
                                        :judge    {:enabled? false}}
                    :code/review       {:done     {:must      #{:schema-valid}
                                                   :should    #{:tests-pass :no-hallucinated-apis}
                                                   :score-min 0.8}
-                                       :checks   [:schema-valid :no-hallucinated-apis]
+                                       :checks/hard [:schema-valid]
+                                       :checks/soft [:tests-pass :no-hallucinated-apis]
                                        :fallback [:llm/code]
                                        :judge    {:enabled? false}}
                    :eval/grade        {:done     {:must      #{:schema-valid}
                                                   :score-min 1.0}
-                                       :checks   [:schema-valid]
+                                       :checks/hard [:schema-valid]
+                                       :checks/soft []
                                        :fallback [:llm/judge]
                                        :judge    {:enabled? false}}}
 

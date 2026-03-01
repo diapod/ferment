@@ -1,0 +1,502 @@
+#!/bin/sh
+
+set -eu
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Missing required command: curl" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Missing required command: jq" >&2
+  exit 1
+fi
+
+: "${FERMENT_BENCH_URL:=http://127.0.0.1:12002}"
+
+preset="${FERMENT_BENCH_PRESET:-default}"
+case_dir="${FERMENT_BENCH_CASE_DIR:-}"
+runs="${FERMENT_BENCH_RUNS:-1}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --preset|-p)
+      preset="${2:-}"
+      shift 2
+      ;;
+    --case-dir)
+      case_dir="${2:-}"
+      shift 2
+      ;;
+    --runs|-n)
+      runs="${2:-}"
+      shift 2
+      ;;
+    *)
+      echo "Usage: bin/benchmark-live [--preset default|low-latency|sla] [--case-dir PATH] [--runs N]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$runs" in
+  ''|*[!0-9]*)
+    echo "Invalid --runs value (must be a positive integer): $runs" >&2
+    exit 2
+    ;;
+  0)
+    echo "Invalid --runs value (must be >= 1): $runs" >&2
+    exit 2
+    ;;
+esac
+
+if [ -z "$case_dir" ]; then
+  case "$preset" in
+    default)
+      case_dir="resources/bench/act"
+      ;;
+    low-latency)
+      case_dir="resources/bench/act-low-latency"
+      ;;
+    sla)
+      case_dir="resources/bench/act-sla"
+      ;;
+    *)
+      echo "Unsupported preset: $preset" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [ ! -d "$case_dir" ]; then
+  echo "Benchmark case directory not found: $case_dir" >&2
+  exit 1
+fi
+
+write_summary() {
+  results_file="$1"
+  telemetry_before="$2"
+  telemetry_after="$3"
+  summary_json="$4"
+  summary_md="$5"
+
+  jq -n \
+    --slurpfile results "$results_file" \
+    --slurpfile before "$telemetry_before" \
+    --slurpfile after "$telemetry_after" \
+    --arg preset "$preset" \
+    --arg case_dir "$case_dir" \
+    '
+    def p95(a):
+      if (a | length) == 0 then null
+      else (a | sort | .[((((a | length) - 1) * 0.95) | floor)])
+      end;
+    def bool(v): (v == true);
+    def is_strict(req):
+      bool(req.routing["strict?"])
+      or bool(req.routing["force?"])
+      or ((req.routing["on-error"] // "") == "fail-closed");
+    def is_text_respond(row):
+      ((row.request.task.intent // "") == "text/respond");
+    def normalize_text_end(s):
+      ((s // "") | tostring | gsub("[[:space:]]+";" ") | sub(" +$";""));
+    def text_has_complete_ending(s):
+      ((normalize_text_end(s) | length) > 0)
+      and (normalize_text_end(s) | test("[\\.!\\?…:;\\)\\]\\}\"»”’]$"));
+    def is_expected_recovery_case(row):
+      ((row.case_id // "") == "c3_solver_handoff");
+    def row_call_total(row):
+      if ((row.response.result["plan/run"].telemetry["calls/total"] // null) | type) == "number"
+      then (row.response.result["plan/run"].telemetry["calls/total"] // 0)
+      elif ((row.call_timings // []) | length) > 0
+      then ((row.call_timings // []) | length)
+      elif is_text_respond(row)
+      then 1
+      else 0
+      end;
+    def row_must_failed(row):
+      if ((row.response.result["plan/run"].telemetry["quality/must-failed"] // null) | type) == "number"
+      then (row.response.result["plan/run"].telemetry["quality/must-failed"] // 0)
+      else ((row.call_timings // [])
+            | map(select(.failure_type == "eval/must-failed"))
+            | length)
+      end;
+    ($results[0] // []) as $rows
+    | ($rows
+        | map(select(is_text_respond(.) and (.http_code == 200))
+               | .latency_ms)) as $text_latencies
+    | ($rows
+        | map(select(is_text_respond(.) and (.http_code == 200) and (is_strict(.request) | not))
+               | .latency_ms)) as $interactive_text_latencies
+    | ($rows
+        | map(select(is_text_respond(.) and (.http_code == 200) and is_strict(.request))
+               | .latency_ms)) as $strict_text_latencies
+    | ($rows
+        | map(select(.route_decide_latency_ms != null)
+               | .route_decide_latency_ms)) as $route_decide_latencies
+    | ($rows
+        | map(select(.route_phase_latency_ms != null)
+               | .route_phase_latency_ms)) as $route_phase_latencies
+    | ($after[0].telemetry.kpi["must-failed-rate"].value // null) as $must_failed_rate_telemetry
+    | (($rows | map(row_call_total(.)) | add) // 0) as $calls_total
+    | (($rows | map(row_must_failed(.)) | add) // 0) as $must_failed_total
+    | (($rows | map(select(is_expected_recovery_case(.)) | row_call_total(.)) | add) // 0) as $calls_expected_recovery
+    | (($rows | map(select(is_expected_recovery_case(.)) | row_must_failed(.)) | add) // 0) as $must_failed_expected_recovery
+    | ($calls_total - $calls_expected_recovery) as $calls_total_sla
+    | ($must_failed_total - $must_failed_expected_recovery) as $must_failed_total_sla
+    | (if $calls_total > 0 then ($must_failed_total / $calls_total) else null end) as $must_failed_rate_cases
+    | (if $calls_total_sla > 0 then ($must_failed_total_sla / $calls_total_sla) else null end) as $must_failed_rate_sla
+    | ($rows
+        | map(select((.response.error.type? // "") == "route/decide-failed"))) as $route_failed
+    | ($route_failed
+        | map(select(
+            (is_strict(.request))
+            and (.response.error.details["route/intent"] != null)
+            and (.response.error.details["route/cap-id"] != null)))) as $route_failed_valid
+    | ($rows | map(select(.case_id == "c3_solver_handoff")) | .[0]) as $c3
+    | ($rows | map(select(.case_id == "c5_context_turn2")) | .[0]) as $c5
+    | ($rows
+        | map(select(is_text_respond(.) and (.http_code == 200)))
+        | map(select((text_has_complete_ending(.result_text) | not)))
+        | map(.case_id)) as $truncated_text_case_ids
+    | ((($c5.result_text // "") | tostring | ascii_downcase | contains("mariadb"))) as $c5_context_recall_ok
+    | ($preset == "default") as $c3_required
+    | (($c3.solver_participated // false) == true) as $c3_solver_participated
+    | (p95($text_latencies)) as $text_p95_ms
+    | (p95($interactive_text_latencies)) as $interactive_text_p95_ms
+    | (p95($strict_text_latencies)) as $strict_text_p95_ms
+    | (p95($route_decide_latencies)) as $route_decide_p95_ms
+    | (p95($route_phase_latencies)) as $route_phase_p95_ms
+    | {
+        generated_at: (now | todateiso8601),
+        endpoint: "'"$FERMENT_BENCH_URL"'",
+        preset: $preset,
+        case_dir: $case_dir,
+        cases_total: ($rows | length),
+        metrics: {
+          text_respond_p95_ms: $text_p95_ms,
+          text_respond_interactive_p95_ms: $interactive_text_p95_ms,
+          text_respond_strict_p95_ms: $strict_text_p95_ms,
+          route_decide_p95_ms: $route_decide_p95_ms,
+          route_phase_p95_ms: $route_phase_p95_ms,
+          must_failed_rate: $must_failed_rate_telemetry,
+          must_failed_rate_cases: $must_failed_rate_cases,
+          must_failed_rate_sla: $must_failed_rate_sla,
+          must_failed_expected_recovery: $must_failed_expected_recovery,
+          calls_total: $calls_total,
+          calls_total_sla: $calls_total_sla,
+          route_failed_total: ($route_failed | length),
+          route_failed_valid: ($route_failed_valid | length),
+          text_truncated_case_count: ($truncated_text_case_ids | length),
+          text_truncated_case_ids: $truncated_text_case_ids,
+          c3_solver_participated: $c3_solver_participated,
+          c5_context_recall_contains_mariadb: $c5_context_recall_ok
+        },
+        gates: {
+          text_respond_interactive_p95_le_10s: {
+            threshold_ms: 10000,
+            value_ms: $interactive_text_p95_ms,
+            pass: (($interactive_text_p95_ms != null) and ($interactive_text_p95_ms <= 10000))
+          },
+          text_respond_strict_p95_le_40s: {
+            required: false,
+            threshold_ms: 40000,
+            value_ms: $strict_text_p95_ms,
+            pass: (($strict_text_p95_ms == null) or ($strict_text_p95_ms <= 40000))
+          },
+          must_failed_rate_sla_le_0_20: {
+            threshold: 0.20,
+            value: $must_failed_rate_sla,
+            excluded_cases: ["c3_solver_handoff"],
+            pass: (($must_failed_rate_sla != null) and ($must_failed_rate_sla <= 0.20))
+          },
+          must_failed_rate_global_le_0_20_info: {
+            required: false,
+            threshold: 0.20,
+            value: $must_failed_rate_telemetry,
+            pass: (($must_failed_rate_telemetry == null) or ($must_failed_rate_telemetry <= 0.20))
+          },
+          route_fail_closed_strict_only_with_details: {
+            total: ($route_failed | length),
+            valid: ($route_failed_valid | length),
+            pass: (($route_failed | length) == ($route_failed_valid | length))
+          },
+          text_respond_no_truncated_ending: {
+            failed_case_ids: $truncated_text_case_ids,
+            pass: (($truncated_text_case_ids | length) == 0)
+          },
+          c3_solver_handoff_solver_participated: {
+            required: $c3_required,
+            value: $c3_solver_participated,
+            pass: (if $c3_required then $c3_solver_participated else true end)
+          },
+          c4_c5_context_recall_contains_mariadb: {
+            value: $c5_context_recall_ok,
+            pass: $c5_context_recall_ok
+          }
+        },
+        pass: (
+          ((($interactive_text_p95_ms != null) and ($interactive_text_p95_ms <= 10000)))
+          and ((($must_failed_rate_sla != null) and ($must_failed_rate_sla <= 0.20)))
+          and ((($route_failed | length) == ($route_failed_valid | length)))
+          and ((($truncated_text_case_ids | length) == 0))
+          and $c5_context_recall_ok
+          and (if $c3_required then $c3_solver_participated else true end)
+        )
+      }' >"$summary_json"
+
+  jq -r '
+    "# Live Benchmark Summary\n\n"
+    + "- Generated at: " + .generated_at + "\n"
+    + "- Endpoint: " + .endpoint + "\n"
+    + "- Preset: " + .preset + "\n"
+    + "- Case dir: " + .case_dir + "\n"
+    + "- Cases total: " + (.cases_total|tostring) + "\n"
+    + "- Overall pass: " + (if .pass then "YES" else "NO" end) + "\n\n"
+    + "## Metrics\n\n"
+    + "- text/respond p95 [ms] (all text paths): " + ((.metrics.text_respond_p95_ms // "null")|tostring) + "\n"
+    + "- text/respond p95 [ms] (interactive/default path): " + ((.metrics.text_respond_interactive_p95_ms // "null")|tostring) + "\n"
+    + "- text/respond p95 [ms] (strict/orchestration path): " + ((.metrics.text_respond_strict_p95_ms // "null")|tostring) + "\n"
+    + "- route/decide p95 [ms] (decider only): " + ((.metrics.route_decide_p95_ms // "null")|tostring) + "\n"
+    + "- route phase p95 [ms] (full meta routing phase): " + ((.metrics.route_phase_p95_ms // "null")|tostring) + "\n"
+    + "- must-failed-rate (telemetry/global): " + ((.metrics.must_failed_rate // "null")|tostring) + "\n"
+    + "- must-failed-rate (case-derived): " + ((.metrics.must_failed_rate_cases // "null")|tostring) + "\n"
+    + "- must-failed-rate (SLA, excluding expected recovery): " + ((.metrics.must_failed_rate_sla // "null")|tostring) + "\n"
+    + "- must-failed expected recovery count: " + ((.metrics.must_failed_expected_recovery // "null")|tostring) + "\n"
+    + "- route/decide failed (total/valid): "
+      + (.metrics.route_failed_total|tostring) + "/"
+      + (.metrics.route_failed_valid|tostring) + "\n"
+    + "- truncated text cases: " + ((.metrics.text_truncated_case_count // 0)|tostring) + "\n"
+    + "- c3 solver participated: " + ((.metrics.c3_solver_participated // false)|tostring) + "\n\n"
+    + "## Gates\n\n"
+    + "- text/respond interactive p95 <= 10s: " + (if .gates.text_respond_interactive_p95_le_10s.pass then "PASS" else "FAIL" end) + "\n"
+    + "- text/respond strict p95 <= 40s (informational): " + (if .gates.text_respond_strict_p95_le_40s.pass then "PASS" else "FAIL" end) + "\n"
+    + "- must-failed-rate SLA <= 0.20 (excluding expected recovery): " + (if .gates.must_failed_rate_sla_le_0_20.pass then "PASS" else "FAIL" end) + "\n"
+    + "- must-failed-rate global <= 0.20 (informational): " + (if .gates.must_failed_rate_global_le_0_20_info.pass then "PASS" else "FAIL" end) + "\n"
+    + "- route/fail-closed only strict + details: " + (if .gates.route_fail_closed_strict_only_with_details.pass then "PASS" else "FAIL" end) + "\n"
+    + "- no truncated text/respond endings: " + (if .gates.text_respond_no_truncated_ending.pass then "PASS" else "FAIL" end) + "\n"
+    + "- c3 solver handoff observed: " + (if .gates.c3_solver_handoff_solver_participated.pass then "PASS" else "FAIL" end) + "\n"
+    + "- c4->c5 context recall (MariaDB): " + (if .gates.c4_c5_context_recall_contains_mariadb.pass then "PASS" else "FAIL" end) + "\n"
+  ' "$summary_json" >"$summary_md"
+}
+
+run_once() {
+  run_dir="$1"
+  mkdir -p "$run_dir"
+
+  telemetry_before="$run_dir/telemetry-before.json"
+  telemetry_after="$run_dir/telemetry-after.json"
+  results_file="$run_dir/results.json"
+  summary_json="$run_dir/summary.json"
+  summary_md="$run_dir/summary.md"
+
+  if ! curl -sS "$FERMENT_BENCH_URL/diag/telemetry" >"$telemetry_before"; then
+    echo '{"telemetry":{}}' >"$telemetry_before"
+  fi
+
+  printf '[]\n' >"$results_file"
+
+  for case_file in "$case_dir"/*.json; do
+    [ -f "$case_file" ] || continue
+    case_id="$(basename "$case_file" .json)"
+    response_raw="$run_dir/$case_id.response.raw.json"
+    response_json="$run_dir/$case_id.response.json"
+    response_meta="$run_dir/$case_id.meta"
+
+    if meta="$(curl -sS \
+        -o "$response_raw" \
+        -w "%{http_code} %{time_total}" \
+        "$FERMENT_BENCH_URL/v1/act" \
+        -H 'Content-Type: application/json' \
+        -d @"$case_file")"; then
+      :
+    else
+      meta="000 0"
+      echo '{"error":{"type":"benchmark/curl-failed","message":"curl failed"}}' >"$response_raw"
+    fi
+
+    printf '%s\n' "$meta" >"$response_meta"
+    set -- $meta
+    http_code="${1:-0}"
+    time_total="${2:-0}"
+
+    case "$http_code" in
+      ''|*[!0-9]*) http_code_num=0 ;;
+      *) http_code_num="$http_code" ;;
+    esac
+
+    latency_ms="$(jq -n --arg t "$time_total" '((($t|tonumber?) // 0) * 1000)')"
+
+    if jq -e . "$response_raw" >/dev/null 2>&1; then
+      cp "$response_raw" "$response_json"
+    else
+      jq -Rn --rawfile raw "$response_raw" \
+        '{error:{type:"benchmark/non-json-response",raw:$raw}}' >"$response_json"
+    fi
+
+    jq \
+      --arg case_id "$case_id" \
+      --arg case_file "$case_file" \
+      --argjson http_code "$http_code_num" \
+      --argjson latency_ms "$latency_ms" \
+      --slurpfile request "$case_file" \
+      --slurpfile response "$response_json" \
+      '($response[0] // {}) as $resp
+       | ($resp.result["plan/run"].timings // []) as $timings
+       | ($timings
+          | map(select(type=="object")
+                | {op,
+                   as,
+                   intent,
+                   cap_id:(.["cap/id"] // null),
+                   failure_type:(.["failure/type"] // null),
+                   attempt,
+                   candidate_index:(.["candidate-index"] // null),
+                   latency_ms:(.["latency-ms"] // .["latency_ms"] // null),
+                   invoke_meta:(.["invoke/meta"] // null)})) as $timings_norm
+       | ($timings_norm | map(.latency_ms) | map(select(type=="number"))) as $timing_values
+       | ($resp["models/used"] // []) as $models_used
+       | ($resp["routing/route-phase-latency-ms"] // $resp["routing/route-decide-latency-ms"] // null) as $route_phase_latency_ms
+       | ($resp["routing/route-decider-latency-ms"] // $resp["routing/route-decide-latency-ms"] // null) as $route_decider_latency_ms
+       | ($resp.result.out.text // null) as $result_text
+       | . + [{case_id:$case_id,
+               case_file:$case_file,
+               http_code:$http_code,
+               latency_ms:$latency_ms,
+               request:($request[0] // {}),
+               response:$resp,
+               models_used:$models_used,
+               solver_participated:($models_used | any(.["cap/id"] == "llm/solver")),
+               route_decide_latency_ms:$route_decider_latency_ms,
+               route_decider_latency_ms:$route_decider_latency_ms,
+               route_phase_latency_ms:$route_phase_latency_ms,
+               result_text:$result_text,
+               call_timings:$timings_norm,
+               call_latency_ms_total:(if ($timing_values | length) > 0 then ($timing_values | add) else null end),
+               call_latency_ms_max:(if ($timing_values | length) > 0 then ($timing_values | max) else null end)}]' \
+      "$results_file" >"$results_file.tmp"
+    mv "$results_file.tmp" "$results_file"
+  done
+
+  if ! curl -sS "$FERMENT_BENCH_URL/diag/telemetry" >"$telemetry_after"; then
+    echo '{"telemetry":{}}' >"$telemetry_after"
+  fi
+
+  write_summary "$results_file" "$telemetry_before" "$telemetry_after" "$summary_json" "$summary_md"
+}
+
+aggregate_runs() {
+  root_dir="$1"
+  aggregate_json="$root_dir/summary.json"
+  aggregate_md="$root_dir/summary.md"
+
+  jq -s \
+    --arg runs "$runs" \
+    --arg preset "$preset" \
+    --arg endpoint "$FERMENT_BENCH_URL" \
+    --arg case_dir "$case_dir" \
+    '
+    def p50(a):
+      if (a | length) == 0 then null
+      else (a | sort | .[((((a | length) - 1) * 0.50) | floor)])
+      end;
+    def p95(a):
+      if (a | length) == 0 then null
+      else (a | sort | .[((((a | length) - 1) * 0.95) | floor)])
+      end;
+    def nums(path):
+      [ .[] | getpath(path) | select(type=="number") ];
+    . as $runs_data
+    | (nums(["metrics","text_respond_interactive_p95_ms"])) as $interactive_vals
+    | (nums(["metrics","text_respond_strict_p95_ms"])) as $strict_vals
+    | (nums(["metrics","must_failed_rate_sla"])) as $must_sla_vals
+    | (nums(["metrics","must_failed_rate"])) as $must_global_vals
+    | ([ $runs_data[] | (.metrics.text_truncated_case_count // 0) ]) as $truncated_counts
+    | ([ $runs_data[] | (.metrics.text_truncated_case_ids // [])[] ] | unique) as $truncated_case_ids
+    | {
+        generated_at: (now | todateiso8601),
+        endpoint: $endpoint,
+        preset: ($preset + "-multi"),
+        case_dir: $case_dir,
+        runs: ($runs | tonumber),
+        metrics: {
+          text_respond_interactive_p50_ms: p50($interactive_vals),
+          text_respond_interactive_p95_ms: p95($interactive_vals),
+          text_respond_strict_p50_ms: p50($strict_vals),
+          text_respond_strict_p95_ms: p95($strict_vals),
+          must_failed_rate_sla_p50: p50($must_sla_vals),
+          must_failed_rate_sla_p95: p95($must_sla_vals),
+          must_failed_rate_global_p50: p50($must_global_vals),
+          must_failed_rate_global_p95: p95($must_global_vals),
+          text_truncated_total: (($truncated_counts | add) // 0),
+          text_truncated_case_ids: $truncated_case_ids,
+          pass_rate: (if ($runs_data | length) > 0 then (([$runs_data[] | select(.pass==true)] | length) / ($runs_data | length)) else null end)
+        },
+        gates: {
+          all_runs_pass: (all($runs_data[]; .pass == true)),
+          interactive_p95_le_10s_on_aggregate: ((p95($interactive_vals) != null) and (p95($interactive_vals) <= 10000)),
+          must_failed_rate_sla_p95_le_0_20: ((p95($must_sla_vals) != null) and (p95($must_sla_vals) <= 0.20)),
+          text_respond_no_truncated_ending_on_aggregate: (($truncated_case_ids | length) == 0)
+        },
+        pass: (
+          (all($runs_data[]; .pass == true))
+          and ((p95($interactive_vals) != null) and (p95($interactive_vals) <= 10000))
+          and ((p95($must_sla_vals) != null) and (p95($must_sla_vals) <= 0.20))
+          and (($truncated_case_ids | length) == 0)
+        ),
+        runs_data: $runs_data
+      }' "$root_dir"/run-*/summary.json >"$aggregate_json"
+
+  jq -r '
+    "# Live Benchmark Summary (Aggregate)\n\n"
+    + "- Generated at: " + .generated_at + "\n"
+    + "- Endpoint: " + .endpoint + "\n"
+    + "- Preset: " + .preset + "\n"
+    + "- Case dir: " + .case_dir + "\n"
+    + "- Runs: " + (.runs|tostring) + "\n"
+    + "- Overall pass: " + (if .pass then "YES" else "NO" end) + "\n\n"
+    + "## Aggregate Metrics\n\n"
+    + "- interactive p50 [ms]: " + ((.metrics.text_respond_interactive_p50_ms // "null")|tostring) + "\n"
+    + "- interactive p95 [ms]: " + ((.metrics.text_respond_interactive_p95_ms // "null")|tostring) + "\n"
+    + "- strict p50 [ms]: " + ((.metrics.text_respond_strict_p50_ms // "null")|tostring) + "\n"
+    + "- strict p95 [ms]: " + ((.metrics.text_respond_strict_p95_ms // "null")|tostring) + "\n"
+    + "- must-failed SLA p50: " + ((.metrics.must_failed_rate_sla_p50 // "null")|tostring) + "\n"
+    + "- must-failed SLA p95: " + ((.metrics.must_failed_rate_sla_p95 // "null")|tostring) + "\n"
+    + "- truncated text total: " + ((.metrics.text_truncated_total // 0)|tostring) + "\n"
+    + "- pass rate: " + ((.metrics.pass_rate // "null")|tostring) + "\n\n"
+    + "## Aggregate Gates\n\n"
+    + "- all runs pass: " + (if .gates.all_runs_pass then "PASS" else "FAIL" end) + "\n"
+    + "- interactive p95 <= 10s (aggregate): " + (if .gates.interactive_p95_le_10s_on_aggregate then "PASS" else "FAIL" end) + "\n"
+    + "- must-failed SLA p95 <= 0.20 (aggregate): " + (if .gates.must_failed_rate_sla_p95_le_0_20 then "PASS" else "FAIL" end) + "\n"
+    + "- no truncated text/respond endings (aggregate): " + (if .gates.text_respond_no_truncated_ending_on_aggregate then "PASS" else "FAIL" end) + "\n"
+  ' "$aggregate_json" >"$aggregate_md"
+}
+
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+run_root="${FERMENT_BENCH_OUT_DIR:-target/benchmarks/$timestamp}"
+mkdir -p "$run_root"
+
+if [ "$runs" -eq 1 ]; then
+  run_once "$run_root"
+  echo "Benchmark artifacts:"
+  echo "  $run_root/results.json"
+  echo "  $run_root/telemetry-before.json"
+  echo "  $run_root/telemetry-after.json"
+  echo "  $run_root/summary.json"
+  echo "  $run_root/summary.md"
+else
+  i=1
+  while [ "$i" -le "$runs" ]; do
+    subdir="$run_root/run-$(printf '%02d' "$i")"
+    run_once "$subdir"
+    i=$((i + 1))
+  done
+
+  aggregate_runs "$run_root"
+
+  echo "Benchmark artifacts (multi-run):"
+  echo "  $run_root/run-*/results.json"
+  echo "  $run_root/run-*/summary.json"
+  echo "  $run_root/summary.json"
+  echo "  $run_root/summary.md"
+fi

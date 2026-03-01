@@ -5,7 +5,7 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
 
 ## Priorities
 
-1. [ ] Routing intelligence hardening (`meta -> solver -> voice`)
+1. [x] Routing intelligence hardening (`meta -> solver -> voice`)
    - Calibrate routing prompts and constraints for clearer `route/decide` outputs under strict mode.
    - Add deterministic fallback ladder when `route/decide` quality fails.
    - Goal: stable multi-model participation without accidental single-model collapse.
@@ -33,13 +33,14 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
        - validate new router-level tuning keys and invalid combinations fail fast with actionable `ex-data`.
    - Validation run:
      - [x] `bin/test` green,
-     - [ ] strict smoke (`/v1/act` with `routing.meta?=true`, `routing.strict?=true`, `routing.force?=true`) shows either canonical multi-model path or explicit fail-closed diagnostics (no silent fallback).
+     - [x] strict smoke (`/v1/act` with `routing.meta?=true`, `routing.strict?=true`, `routing.force?=true`) shows either canonical multi-model path or explicit fail-closed diagnostics (no silent fallback).
+       - validated with strict-mode regression tests and live smoke probes (`route/fail-closed` diagnostics + canonical `models/used` path).
    - Done when:
      - strict mode keeps `route/fail-closed` intentional and explainable,
      - `models/used` shows expected participants for representative prompts,
      - routing failure reasons are explicit in telemetry and response details.
 
-2. [ ] Capability recognition precision (`intent -> cap/id`)
+2. [x] Capability recognition precision (`intent -> cap/id`)
    - Improve capability selection rules for ambiguous natural-language requests.
    - Add negative tests for near-miss intents (avoid wrong cap selection).
    - Goal: high precision in capability dispatch without overfitting.
@@ -48,7 +49,7 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
      - misroutes are observable in telemetry taxonomy,
      - no legacy alias paths are required for canonical resolution.
 
-3. [ ] Reasoning quality control loop (operational)
+3. [x] Reasoning quality control loop (operational)
    - Tighten per-intent `:done/:checks/judge` profiles for `:route/decide`, `:problem/solve`, `:text/respond`.
    - Separate quality thresholds for structure conformance vs semantic adequacy.
    - Goal: fewer empty/degenerate outputs and fewer low-value retries.
@@ -57,7 +58,7 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
      - `eval/must-failed` is actionable (clear must-rule failures),
      - no `<think>`/tool-leak artifacts in user-facing text.
 
-4. [ ] Tool-call protocol discipline (no leakage to user output)
+4. [x] Tool-call protocol discipline (no leakage to user output)
    - Keep internal tool-calling markers as orchestration internals only.
    - Ensure model outputs are normalized before final emission.
    - Goal: natural conversational responses with strict protocol boundaries.
@@ -66,7 +67,7 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
      - telemetry still captures tool-plan internals for diagnostics,
      - regression probes for leakage are green.
 
-5. [ ] Context memory shaping (session vars as working memory)
+5. [x] Context memory shaping (session vars as working memory)
    - Define default memory write/read patterns per intent class.
    - Add summarization/compaction policy for long sessions (`freeze/thaw` friendly).
    - Goal: consistent contextual continuity with bounded memory growth.
@@ -75,7 +76,7 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
      - memory budget limits are enforced with deterministic eviction/compaction,
      - session-vars behavior is covered by integration tests.
 
-6. [ ] Cross-model context handoff contract
+6. [x] Cross-model context handoff contract
    - Standardize payload handoff from `solver` to `voice` (and future roles) with explicit shape.
    - Preserve key reasoning artifacts without leaking chain-of-thought.
    - Goal: voice layer naturally verbalizes solver outcome instead of echoing raw draft artifacts.
@@ -84,7 +85,7 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
      - voice response quality improves on “explain + example” tasks,
      - no prompt-format bleed between roles.
 
-7. [ ] Adaptive retry/fallback policy tuning per intent
+7. [x] Adaptive retry/fallback policy tuning per intent
    - Tune `same-cap-max`, `fallback-max`, and `switch-on` sets per intent/cap profile.
    - Differentiate policy for low-latency chat vs high-quality solve paths.
    - Goal: better latency/quality tradeoff by intent.
@@ -93,7 +94,7 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
      - telemetry KPIs show improved success-per-attempt ratio,
      - no uncontrolled retry bursts in live profile.
 
-8. [ ] Production telemetry views for orchestration tuning
+8. [x] Production telemetry views for orchestration tuning
    - Add focused views/queries for routing path quality and memory effectiveness.
    - Expose interpretable KPIs: participant diversity, route confidence trend, context hit utility.
    - Goal: tuning decisions driven by metrics, not ad-hoc inspection.
@@ -102,7 +103,7 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
      - baseline vs tuned runs can be compared consistently,
      - documentation includes tuning playbook linked to KPI thresholds.
 
-9. [ ] Live profile benchmark pack (repeatable)
+9. [x] Live profile benchmark pack (repeatable)
    - Maintain a stable smoke/benchmark request set for `text/respond`, strict meta route, solver handoff, context reuse.
    - Track response quality + latency + retries over time.
    - Goal: regression-safe tuning cycle for production-like conditions.
@@ -110,3 +111,48 @@ Current focus: orchestration quality, natural multi-model behavior, robust conte
      - benchmark script produces comparable artifacts per run,
      - pass/fail gates are explicit for routing, schema, and output quality,
      - release checklist references this benchmark pack.
+
+## Execution Plan (#2-#9)
+
+1. #2 Capability recognition precision
+   - [x] Unify capability resolution in HTTP/runtime paths via `workflow/resolve-capability-decision` (explicit `:cap/id` is validated against intent/contracts, not blindly trusted).
+   - [x] Add capability-resolution telemetry taxonomy (`:cap/resolve-*`, `:cap/reject-reasons`) and expose rejected-candidate diagnostics on `unsupported/intent`.
+   - [x] Add golden intent/cap matrix + near-miss regression suite (expanded cases: explicit-cap mismatch, schema mismatch, effect mismatch).
+
+2. #3 Reasoning quality control loop (operational)
+   - [x] Split and calibrate structural-vs-semantic quality thresholds per intent (`:route/decide`, `:problem/solve`, `:text/respond`).
+   - [x] Add smoke assertions for retry-rate/fallback-rate reduction and actionable `eval/must-failed` payloads.
+
+3. #4 Tool-call protocol discipline
+   - [x] Harden final-output normalization to guarantee no tool markers in `/v1/act` user output.
+   - [x] Keep internal tool-call artifacts visible only in diagnostics/transcript modes.
+
+4. #5 Context memory shaping
+   - [x] Define per-intent memory write/read defaults and bounded compaction policy for long sessions.
+   - [x] Add integration tests for deterministic memory budget enforcement.
+
+5. #6 Cross-model context handoff contract
+   - [x] Introduce explicit, schema-validated handoff payload (`solver -> voice`) with no chain-of-thought leakage.
+   - [x] Tune voice prompts/checks to preserve solver detail while only changing style/tone.
+
+6. #7 Adaptive retry/fallback policy tuning per intent
+   - [x] Separate low-latency vs high-quality retry/fallback profiles in config.
+   - [x] Add guardrails against uncontrolled retry bursts in live profile.
+
+7. #8 Production telemetry views
+   - [x] Extend `/diag/telemetry` with orchestration-tuning KPIs (participant diversity, route confidence trend, context utility).
+   - [x] Publish KPI threshold playbook in docs.
+
+8. #9 Live benchmark pack
+   - [x] Keep a stable benchmark set and artifact schema for quality/latency/retry comparisons.
+   - [x] Add release gate checklist wired to benchmark pass/fail criteria.
+
+## Validation Snapshot (2026-02-28)
+
+- [x] `bin/test --focus ferment.workflow-test`
+- [x] `bin/test --focus ferment.http-test`
+- [x] `bin/test --focus ferment.runtime-test`
+- [x] `bin/test --focus ferment.session-store-test`
+- [x] `bin/test --focus ferment.var-test`
+- [x] `bin/test`
+- [x] benchmark runner and canonical benchmark pack added (`bin/benchmark-live`, `resources/bench/act/*.json`)

@@ -77,11 +77,17 @@ curl -s http://127.0.0.1:12002/diag/telemetry
 - `parse-rate`
 - `retry-rate`
 - `fallback-rate`
+- `must-failed-rate`
 - `judge-pass-rate`
 - `cache-hit-rate`
 - `failure-taxonomy` (`by-type` + `by-domain`)
 
 Lifecycle observability is available under `telemetry.lifecycle` (`total`, `errors`, per-component transitions, recent events window).
+
+Orchestration tuning KPI is available under `telemetry.orchestration`:
+- `participants/diversity`
+- `route/decision-quality-trend`
+- `context/hit-utility`
 
 Optional `/v1/act` response cache is configured in `resources/config/common/prod/http.edn` under `:response-cache`:
 - `:enabled?` (default `false`)
@@ -404,3 +410,113 @@ bin/test-live
 Current convention:
 - `test` is optimized for predictable local test runs.
 - `test-live` is for live-model behavior checks under controlled setup (shared small runtime for `meta`/`solver`/`coding` + separate small `voice` runtime).
+
+## 10) Routing policy profiles (`low-latency`, `balanced`, `high-quality`)
+
+`/v1/act` accepts routing profile selection through `routing.profile`.
+
+```bash
+curl -s http://127.0.0.1:12002/v1/act \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "proto": 1,
+    "trace": {"id": "latency-1"},
+    "task": {"intent": "text/respond"},
+    "routing": {"profile": "low-latency"},
+    "input": {"prompt": "Explain ACID briefly and give one example."}
+  }'
+```
+
+Profile intent:
+- `low-latency`: minimal retries/fallback.
+- `balanced`: default runtime behavior.
+- `high-quality`: higher retry/fallback budget and stricter quality recovery.
+
+## 11) Debug transcript and timings for multi-model flows
+
+Enable routing transcript diagnostics for `/v1/act`:
+
+```bash
+curl -s http://127.0.0.1:12002/v1/act \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "proto": 1,
+    "trace": {"id": "debug-transcript-1"},
+    "session/id": "session/debug-transcript-1",
+    "task": {"intent": "text/respond"},
+    "routing": {"meta?": true, "strict?": true, "force?": true, "debug/transcript?": true},
+    "input": {"prompt": "Explain ACID briefly and give one example."}
+  }' | jq '.result["plan/run"] | {participants, timings, transcript}'
+```
+
+Contract:
+- final user output is sanitized (no `<think>` / tool markers),
+- raw model artifacts stay only in transcript diagnostics.
+
+## 12) Repeatable live benchmark pack
+
+Run canonical benchmark suite against a running node:
+
+```bash
+bin/benchmark-live
+```
+
+Run low-latency preset (case pack with `routing.profile=low-latency`):
+
+```bash
+bin/benchmark-live --preset low-latency
+```
+
+Run SLA preset (interactive/user-facing path, no forced meta-strict cases):
+
+```bash
+bin/benchmark-live --preset sla
+```
+
+Run N repeated executions with aggregate report (p50/p95 across runs):
+
+```bash
+bin/benchmark-live --preset sla --runs 5
+```
+
+Optional endpoint override:
+
+```bash
+FERMENT_BENCH_URL=http://127.0.0.1:12002 bin/benchmark-live
+```
+
+Optional explicit case directory override:
+
+```bash
+bin/benchmark-live --case-dir resources/bench/act-low-latency
+```
+
+Artifacts:
+- single run (`--runs 1`, default) writes to `target/benchmarks/<timestamp>/`:
+  - `results.json`
+  - `telemetry-before.json`
+  - `telemetry-after.json`
+  - `summary.json`
+  - `summary.md`
+- multi run (`--runs N`) writes to `target/benchmarks/<timestamp>/`:
+  - per run: `run-01/`, `run-02/`, ... each with single-run artifacts
+  - aggregate: top-level `summary.json` and `summary.md` with cross-run p50/p95, pass-rate, and aggregate `no truncated ending` gate
+
+Built-in gates:
+- `text/respond interactive/default p95 <= 10s` (hard gate)
+- `text/respond strict/orchestration p95 <= 40s` (informational split gate)
+- `must-failed-rate SLA <= 0.20` (excludes expected recovery case `c3_solver_handoff`)
+- `must-failed-rate global <= 0.20` (informational, from telemetry snapshot)
+- `route/fail-closed` only for strict requests and with routing details.
+- `text/respond` outputs must not end in truncated sentence fragments (hard gate).
+- `c3_solver_handoff` must include solver participation (`models/used` contains `llm/solver`) in `default` preset.
+- `c4->c5 context recall` must keep `MariaDB` in follow-up answer (`c5_context_turn2`; benchmark case has `routing.meta? = false` to isolate memory behavior from meta-decider).
+
+Per-case result payload (`results.json`) also includes normalized workflow timing fields:
+- `call_timings` (with `latency_ms`),
+- `call_latency_ms_total`,
+- `call_latency_ms_max`,
+- `route_decide_latency_ms` (latency of decider invocation itself),
+- `route_decider_latency_ms` (same value as explicit alias for readability),
+- `route_phase_latency_ms` (full meta-routing phase in HTTP bridge),
+so ad-hoc jq analysis does not depend on hyphenated JSON keys.

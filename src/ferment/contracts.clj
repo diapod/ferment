@@ -68,6 +68,11 @@
   [v]
   (boolean (trim-s v)))
 
+(defn- strict-nonblank-string?
+  [v]
+  (and (string? v)
+       (nonblank-string? v)))
+
 (defn- instant-string?
   [v]
   (try
@@ -103,6 +108,28 @@
   [v]
   (and (map? v)
        (contains-nonblank-string? v [:prompt :text :content])))
+
+(def ^:private internal-marker-pattern
+  #"(?is)<\s*/?\s*(?:think|tool_call|tool_calls|function_call)\b")
+
+(defn- nonblank-string-coll?
+  [v]
+  (and (or (vector? v)
+           (and (sequential? v) (not (map? v))))
+       (every? strict-nonblank-string? v)))
+
+(defn- req-handoff?
+  [v]
+  (and (map? v)
+       (strict-nonblank-string? (:handoff/text v))
+       (not (re-find internal-marker-pattern (str (:handoff/text v))))
+       (or (not (contains? v :handoff/facts))
+           (nonblank-string-coll? (:handoff/facts v)))
+       (or (not (contains? v :handoff/assumptions))
+           (nonblank-string-coll? (:handoff/assumptions v)))
+       (or (not (contains? v :handoff/lang))
+           (or (keyword? (:handoff/lang v))
+               (strict-nonblank-string? (:handoff/lang v))))))
 
 (defn- req-problem?
   [v]
@@ -348,6 +375,7 @@
 (s/def :req/route req-route?)
 (s/def :req/context req-context?)
 (s/def :req/text req-text?)
+(s/def :req/handoff req-handoff?)
 (s/def :req/problem req-problem?)
 (s/def :req/code req-code?)
 (s/def :req/eval req-eval?)
@@ -482,6 +510,7 @@
    :req/route           :req/route
    :req/context         :req/context
    :req/text            :req/text
+   :req/handoff         :req/handoff
    :req/problem         :req/problem
    :req/code            :req/code
    :req/eval            :req/eval
@@ -931,7 +960,12 @@
         node2 (when (vector? nodes) (nth nodes 2 nil))
         node3 (when (vector? nodes) (nth nodes 3 nil))
         node4 (when (vector? nodes) (nth nodes 4 nil))
-        voice-final-prompt-slot (get-in node2 [:input :prompt :slot/id])
+        voice-final-input (when (map? node2) (:input node2))
+        voice-final-input-schema (keywordish (get node2 :input/schema))
+        handoff-text-slot (get-in voice-final-input [:handoff/text :slot/id])
+        handoff-facts-slot (get-in voice-final-input [:handoff/facts :slot/id])
+        handoff-assumptions-slot (get-in voice-final-input [:handoff/assumptions :slot/id])
+        handoff-lang-slot (get-in voice-final-input [:handoff/lang :slot/id])
         emit-primary-slot (get-in node3 [:input :slot/id])
         emit-final-slot (get-in node4 [:input :slot/id])]
     (cond
@@ -1001,9 +1035,38 @@
         {:ok? false
          :reason :route/plan-voice-final-when-not-voice-primary-failed}
 
-        (not= [:solver :out :text] voice-final-prompt-slot)
+        (not= :req/handoff voice-final-input-schema)
         {:ok? false
-         :reason :route/plan-voice-final-prompt-not-solver-slot}
+         :reason :route/plan-voice-final-input-schema-not-handoff}
+
+        (and (map? (:requires node2))
+             (not= :req/handoff
+                   (keywordish (get-in node2 [:requires :in-schema]))))
+        {:ok? false
+         :reason :route/plan-voice-final-requires-in-schema-not-handoff}
+
+        (not (map? voice-final-input))
+        {:ok? false
+         :reason :route/plan-voice-final-input-not-map}
+
+        (not= [:solver :out :text] handoff-text-slot)
+        {:ok? false
+         :reason :route/plan-voice-final-handoff-text-not-solver-slot}
+
+        (and (contains? voice-final-input :handoff/facts)
+             (not= [:solver :out :facts] handoff-facts-slot))
+        {:ok? false
+         :reason :route/plan-voice-final-handoff-facts-not-solver-slot}
+
+        (and (contains? voice-final-input :handoff/assumptions)
+             (not= [:solver :out :assumptions] handoff-assumptions-slot))
+        {:ok? false
+         :reason :route/plan-voice-final-handoff-assumptions-not-solver-slot}
+
+        (and (contains? voice-final-input :handoff/lang)
+             (not= [:solver :out :lang] handoff-lang-slot))
+        {:ok? false
+         :reason :route/plan-voice-final-handoff-lang-not-solver-slot}
 
         (not= :emit (:op node3))
         {:ok? false

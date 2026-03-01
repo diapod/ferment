@@ -277,6 +277,81 @@
       (is (= [:llm/meta] @calls))
       (is (= {:text "meta"} (:emitted run))))))
 
+(deftest resolve-capability-decision-golden-intent-cap-matrix
+  (testing "Golden matrix: resolver chooses canonical cap/id per intent."
+    (let [resolver {:routing {:intent->cap {:route/decide :llm/meta
+                                            :context/summarize :llm/meta
+                                            :text/respond :llm/voice
+                                            :problem/solve :llm/solver
+                                            :code/generate :llm/code
+                                            :code/patch :llm/code
+                                            :code/explain :llm/code
+                                            :code/review :llm/code
+                                            :eval/grade :llm/judge}}
+                    :caps/by-id {:llm/meta {:cap/id :llm/meta
+                                            :cap/intents #{:route/decide :context/summarize}
+                                            :cap/can-produce #{:value :plan}
+                                            :cap/effects-allowed #{:none}}
+                                 :llm/voice {:cap/id :llm/voice
+                                             :cap/intents #{:text/respond}
+                                             :cap/can-produce #{:value}
+                                             :cap/effects-allowed #{:none}}
+                                 :llm/solver {:cap/id :llm/solver
+                                              :cap/intents #{:problem/solve}
+                                              :cap/can-produce #{:value :plan}
+                                              :cap/effects-allowed #{:none}}
+                                 :llm/code {:cap/id :llm/code
+                                            :cap/intents #{:code/generate :code/patch :code/explain :code/review}
+                                            :cap/can-produce #{:value :plan}
+                                            :cap/effects-allowed #{:none}}
+                                 :llm/judge {:cap/id :llm/judge
+                                             :cap/intents #{:eval/grade}
+                                             :cap/can-produce #{:value}
+                                             :cap/effects-allowed #{:none}}}}
+          cases [[:route/decide :llm/meta]
+                 [:context/summarize :llm/meta]
+                 [:text/respond :llm/voice]
+                 [:problem/solve :llm/solver]
+                 [:code/generate :llm/code]
+                 [:code/patch :llm/code]
+                 [:code/explain :llm/code]
+                 [:code/review :llm/code]
+                 [:eval/grade :llm/judge]]]
+      (doseq [[intent expected] cases]
+        (let [decision (workflow/resolve-capability-decision resolver {:intent intent})]
+          (is (= expected (:cap/id decision)))
+          (is (empty? (:rejected-candidates decision))))))))
+
+(deftest resolve-capability-decision-near-miss-reasons
+  (testing "Near-miss suite reports deterministic rejection reasons for schema/effects/result-type mismatches."
+    (let [resolver {:routing {:intent->cap {:text/respond :llm/voice}}
+                    :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                             :cap/intents #{:text/respond}
+                                             :cap/can-produce #{:value}
+                                             :cap/effects-allowed #{:none}
+                                             :io/in-schema :req/text
+                                             :io/out-schema :res/text}}}
+          cases [{:name :schema-mismatch
+                  :node {:intent :text/respond
+                         :dispatch {:candidates [:llm/voice]}
+                         :requires {:out-schema :res/problem}}
+                  :reason :requires/schema-mismatch}
+                 {:name :effects-not-allowed
+                  :node {:intent :text/respond
+                         :dispatch {:candidates [:llm/voice]}
+                         :effects {:allowed #{:fs/write}}}
+                  :reason :effects/not-allowed}
+                 {:name :result-type-not-supported
+                  :node {:intent :text/respond
+                         :dispatch {:candidates [:llm/voice]}
+                         :requires {:result/type :plan}}
+                  :reason :result-type/not-supported}]]
+      (doseq [{:keys [name node reason]} cases]
+        (let [decision (workflow/resolve-capability-decision resolver node)]
+          (is (nil? (:cap/id decision)) (str "expected nil cap for " name))
+          (is (= reason
+                 (get-in decision [:rejected-candidates 0 :reason]))))))))
+
 (deftest execute-plan-filters-candidates-by-requires-out-schema
   (testing "CallNode :requires/:out-schema is a hard routing contract for candidate capabilities."
     (let [calls (atom [])
@@ -310,6 +385,47 @@
       (is (= [:llm/voice] @calls))
       (is (= {:text "voice"} (:emitted run))))))
 
+(deftest execute-plan-fails-when-handoff-text-missing
+  (testing "Voice handoff input contract requires :handoff/text and fails with controlled schema error."
+    (let [calls (atom [])
+          err (try
+                (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :dispatch {:candidates [:llm/voice]
+                                             :allow-failure? true}
+                                  :as :voice-primary}
+                                 {:op :call
+                                  :intent :problem/solve
+                                  :dispatch {:candidates [:llm/solver]}
+                                  :as :solver
+                                  :when {:failed? :voice-primary}}
+                                 {:op :call
+                                  :intent :text/respond
+                                  :dispatch {:candidates [:llm/voice]}
+                                  :input/schema :req/handoff
+                                  :input {:handoff/text {:slot/id [:solver :out :text]}}
+                                  :as :voice-final
+                                  :when {:failed? :voice-primary}}
+                                 {:op :emit
+                                  :when {:failed? :voice-primary}
+                                  :input {:slot/id [:voice-final :out]}}]}
+                  :resolver {}
+                  :invoke-call (fn [call-node _env]
+                                 (swap! calls conj (:as call-node))
+                                 (case (:as call-node)
+                                   :voice-primary {:error {:type :eval/low-score}}
+                                   :solver {:result {:type :value
+                                                     :out {}}}
+                                   :voice-final {:result {:type :value
+                                                          :out {:text "should-not-run"}}}))})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :input/schema-invalid (:error err)))
+      (is (= :req/handoff (:schema err)))
+      (is (= [:voice-primary :solver] @calls)))))
+
 (deftest execute-plan-uses-policy-registry-for-retry-and-fallback
   (testing "Per-intent policy registry drives retry/switch-on/fallback even without node dispatch overrides."
     (let [calls (atom [])
@@ -338,6 +454,89 @@
       (is (:ok? run))
       (is (= [:llm/voice-a :llm/voice-a :llm/voice-b] @calls))
       (is (= {:text "ok"} (:emitted run))))))
+
+(deftest execute-plan-uses-policy-profile-overrides-per-intent
+  (testing "Resolver policy profile overrides retry/fallback/switch-on for selected intent."
+    (let [calls (atom [])
+          run   (workflow/execute-plan
+                 {:plan {:nodes [{:op :call
+                                  :intent :text/respond
+                                  :as :answer}
+                                 {:op :emit
+                                  :input {:slot/id [:answer :out]}}]}
+                  :resolver {:routing {:intent->cap {:text/respond :llm/voice-a}}
+                             :policy/profile :high-quality
+                             :policy/profiles {:high-quality {:default {:retry {:same-cap-max 1
+                                                                                 :fallback-max 1}
+                                                                        :switch-on #{:eval/low-score}
+                                                                        :fallback [:llm/voice-b]
+                                                                        :done {:must #{:schema-valid}
+                                                                               :score-min 1.0}
+                                                                        :checks/hard [:schema-valid]}}}
+                             :protocol {:policy/default {:retry {:same-cap-max 0
+                                                                 :fallback-max 0}
+                                                         :switch-on #{:schema/invalid}
+                                                         :fallback []}
+                                        :policy/intents {:text/respond {:done {:must #{:schema-valid}
+                                                                               :score-min 1.0}
+                                                                        :checks [:schema-valid]}}
+                                        :result/types [:value]}}
+                  :invoke-call
+                  (fn [call-node _env]
+                    (swap! calls conj (:cap/id call-node))
+                    (if (= :llm/voice-b (:cap/id call-node))
+                      {:result {:type :value
+                                :out {:text "ok"}}}
+                      {:error {:type :eval/low-score}}))})]
+      (is (:ok? run))
+      (is (= [:llm/voice-a :llm/voice-a :llm/voice-b] @calls))
+      (is (= {:text "ok"} (:emitted run))))))
+
+(deftest execute-plan-enforces-call-tree-attempt-limit
+  (testing "Workflow aborts with deterministic failure type when call attempt limit is exceeded."
+    (let [calls (atom [])
+          err   (try
+                  (workflow/execute-plan
+                   {:plan {:nodes [{:op :call
+                                    :intent :text/respond
+                                    :dispatch {:candidates [:llm/voice-a :llm/voice-b]
+                                               :retry {:same-cap-max 2
+                                                       :fallback-max 1}
+                                               :switch-on #{:eval/low-score}}
+                                    :as :answer}]}
+                    :resolver {}
+                    :max-call-attempts 2
+                    :invoke-call (fn [call-node _env]
+                                   (swap! calls conj (:cap/id call-node))
+                                   {:error {:type :eval/low-score}})})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e
+                    (ex-data e)))]
+      (is (= :policy/call-tree-limit (get-in err [:outcome :failure/type])))
+      (is (= 2 (count @calls))))))
+
+(deftest execute-plan-enforces-fallback-hop-limit
+  (testing "Workflow aborts when fallback-hop budget is exhausted in one request."
+    (let [calls (atom [])
+          err   (try
+                  (workflow/execute-plan
+                   {:plan {:nodes [{:op :call
+                                    :intent :text/respond
+                                    :dispatch {:candidates [:llm/voice-a :llm/voice-b :llm/voice-c]
+                                               :retry {:same-cap-max 0
+                                                       :fallback-max 2}
+                                               :switch-on #{:eval/low-score}}
+                                    :as :answer}]}
+                    :resolver {}
+                    :max-fallback-hops 1
+                    :invoke-call (fn [call-node _env]
+                                   (swap! calls conj (:cap/id call-node))
+                                   {:error {:type :eval/low-score}})})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e
+                    (ex-data e)))]
+      (is (= :policy/fallback-limit (get-in err [:outcome :failure/type])))
+      (is (= [:llm/voice-a :llm/voice-b] @calls)))))
 
 (deftest execute-plan-rejects-capability-when-effects-not-allowed
   (testing "Routing rejects capability when node requires effects outside `:cap/effects-allowed`."

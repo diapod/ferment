@@ -1,0 +1,8 @@
+{
+  "proto": 1,
+  "trace": {"id": "bench-c4-context-turn1"},
+  "session/id": "session/bench-c4-context",
+  "task": {"intent": "text/respond"},
+  "routing": {"meta?": false},
+  "input": {"prompt": "Remember that my preferred database is MariaDB and acknowledge in one sentence."}
+}

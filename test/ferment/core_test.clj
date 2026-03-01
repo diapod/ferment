@@ -354,6 +354,24 @@
         (is (= "abcdefghij" text))
         (is (= 10 (count text)))))))
 
+(deftest invoke-capability-text-respond-truncation-cuts-to-sentence-boundary
+  (testing "text/respond truncation prefers the last completed sentence in max-chars window."
+    (with-redefs [core/ollama-generate!
+                  (fn [_]
+                    {:response "First sentence. Second sentence without end"})]
+      (let [result (core/invoke-capability!
+                    nil
+                    {:role :voice
+                     :intent :text/respond
+                     :cap-id :llm/voice
+                     :model "voice-model"
+                     :input {:prompt "hej"}
+                     :constraints {:max-chars 26}
+                     :max-attempts 1})
+            text (get-in result [:result :out :text])]
+        (is (= "First sentence." text))
+        (is (< (count text) 26))))))
+
 (deftest invoke-capability-uses-intent-system-prompt-from-protocol
   (testing "invoke-capability! injects intent-level system prompt when request does not provide one."
     (let [seen (atom nil)

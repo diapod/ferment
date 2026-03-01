@@ -6,7 +6,8 @@
 
     ferment.workflow
 
-  (:require [clojure.walk :as walk]
+  (:require [clojure.string :as str]
+            [clojure.walk :as walk]
             [ferment.contracts :as contracts]
             [ferment.roles :as roles]
             [ferment.telemetry :as telemetry]))
@@ -14,6 +15,8 @@
 (def ^:private default-retry-policy
   {:same-cap-max 0
    :fallback-max 0})
+
+(declare merge-done-overrides)
 
 (defn- now-nanos
   []
@@ -31,6 +34,17 @@
     (keyword? v) #{v}
     :else #{}))
 
+(defn- keywordish
+  [v]
+  (cond
+    (keyword? v) v
+    (string? v) (let [s (some-> v str str/trim not-empty)]
+                  (when s
+                    (if (str/starts-with? s ":")
+                      (keyword (subs s 1))
+                      (keyword s))))
+    :else nil))
+
 (defn- call-requires
   [node]
   (let [requires0 (if (map? (:requires node))
@@ -46,12 +60,92 @@
         requires2 (contracts/normalize-requires requires1)]
     (if (map? requires2) requires2 {})))
 
+(defn- routing-requires
+  [node]
+  (let [requires (call-requires node)]
+    (if (keyword? (keywordish (:input/schema node)))
+      (dissoc requires :in-schema)
+      requires)))
+
 (defn- normalize-call-node
   [node]
   (let [requires (call-requires node)]
     (if (seq requires)
       (assoc node :requires requires)
       node)))
+
+(defn- policy-profiles-map
+  [resolver]
+  (let [profiles (or (when (map? (:policy/profiles resolver))
+                       (:policy/profiles resolver))
+                     (when (map? (get-in resolver [:routing :policy-profiles]))
+                       (get-in resolver [:routing :policy-profiles])))]
+    (if (map? profiles) profiles {})))
+
+(defn- policy-profile-key
+  [resolver]
+  (or (keywordish (:policy/profile resolver))
+      (keywordish (get-in resolver [:routing :policy/profile]))
+      :balanced))
+
+(defn- merge-policy-overrides
+  [base override]
+  (let [base' (if (map? base) base {})
+        over' (if (map? override) override {})
+        done' (merge-done-overrides (:done base') (:done over'))
+        checks' (into (keyword-set (:checks base'))
+                      (keyword-set (:checks over')))
+        switch-on' (into (keyword-set (:switch-on base'))
+                         (keyword-set (:switch-on over')))
+        fallback' (vec (distinct (concat (or (:fallback base') [])
+                                         (or (:fallback over') []))))
+        retry' (merge (if (map? (:retry base')) (:retry base') {})
+                      (if (map? (:retry over')) (:retry over') {}))
+        judge' (merge (if (map? (:judge base')) (:judge base') {})
+                      (if (map? (:judge over')) (:judge over') {}))]
+    (cond-> {}
+      (seq done') (assoc :done done')
+      (seq checks') (assoc :checks checks')
+      (seq switch-on') (assoc :switch-on switch-on')
+      (seq fallback') (assoc :fallback fallback')
+      (seq retry') (assoc :retry retry')
+      (seq judge') (assoc :judge judge'))))
+
+(defn- profile-intent-policy
+  [resolver intent]
+  (let [profiles (policy-profiles-map resolver)
+        profile-k (policy-profile-key resolver)
+        profile-cfg (if (map? (get profiles profile-k))
+                      (get profiles profile-k)
+                      {})
+        default' (if (map? (:default profile-cfg))
+                   (:default profile-cfg)
+                   {})
+        intent' (if (map? (get-in profile-cfg [:intents intent]))
+                  (get-in profile-cfg [:intents intent])
+                  {})]
+    (merge-policy-overrides default' intent')))
+
+(defn- effective-intent-policy
+  [resolver protocol intent]
+  (merge-policy-overrides
+   (contracts/intent-policy protocol intent)
+   (profile-intent-policy resolver intent)))
+
+(defn- validate-call-input!
+  [ctx call-node]
+  (let [schema-k (some-> (:input/schema call-node) keywordish)]
+    (when (keyword? schema-k)
+      (let [check (contracts/validate-schema (:protocol ctx)
+                                             schema-k
+                                             (:input call-node))]
+        (when-not (:ok? check)
+          (throw (ex-info "Call node input failed schema contract."
+                          {:error :input/schema-invalid
+                           :failure/type :input/schema-invalid
+                           :schema schema-k
+                           :details (select-keys check [:reason :schema :explain])
+                           :node call-node})))))))
 
 (defn- requested-result-type
   [node]
@@ -184,7 +278,7 @@
     {:ok? true
      :cap/id cap-id}
     (let [cap         (get-in resolver [:caps/by-id cap-id])
-          requires    (call-requires node)
+          requires    (routing-requires node)
           intent      (:intent node)
           result-type (requested-result-type node)
           req-effects (requested-effects node)]
@@ -240,7 +334,7 @@
 (defn- resolve-candidates
   [resolver node]
   (let [protocol (if (map? (:protocol resolver)) (:protocol resolver) {})
-        policy (contracts/intent-policy protocol (:intent node))
+        policy (effective-intent-policy resolver protocol (:intent node))
         explicit (:cap/id node)
         listed   (vec (or (get-in node [:dispatch :candidates]) []))
         routed   (some-> (get-in resolver [:routing :intent->cap (:intent node)]) vector)
@@ -266,6 +360,20 @@
         (with-meta accepted {:routing/rejected rejected}))
       candidates)))
 
+(defn resolve-capability-decision
+  "Resolves capability candidates for a call node and returns diagnostics map.
+
+  Returned map keys:
+  - `:cap/id`                selected capability id (or nil)
+  - `:candidates`            accepted candidates in deterministic order
+  - `:rejected-candidates`   rejected candidates with reasons"
+  [resolver node]
+  (let [candidates0 (resolve-candidates resolver node)
+        rejected    (-> candidates0 meta :routing/rejected)]
+    {:cap/id (first candidates0)
+     :candidates (vec candidates0)
+     :rejected-candidates (if (sequential? rejected) (vec rejected) [])}))
+
 (defn resolve-capability
   "Resolves capability id for a call node.
 
@@ -274,7 +382,7 @@
   2. first candidate from node `:dispatch`
   3. resolver routing by `:intent`"
   [resolver node]
-  (first (resolve-candidates resolver node)))
+  (:cap/id (resolve-capability-decision resolver node)))
 
 (defn call-failed?
   "Best-effort failure check for values stored in plan environment."
@@ -360,10 +468,48 @@
     v
     default))
 
+(defn- positive-int-or-nil
+  [v]
+  (let [n (cond
+            (int? v) v
+            (integer? v) (int v)
+            :else nil)]
+    (when (and (int? n) (pos? n))
+      n)))
+
+(defn- ensure-call-attempt-budget!
+  [ctx]
+  (let [attempts* (:call-attempts* ctx)
+        max-attempts (positive-int-or-nil (:max-call-attempts ctx))]
+    (when (and (instance? clojure.lang.Atom attempts*)
+               (int? max-attempts))
+      (let [n (swap! attempts* inc)]
+        (when (> n max-attempts)
+          (throw (ex-info "Call tree exceeded configured attempt limit."
+                          {:error :policy/call-tree-limit
+                           :failure/type :policy/call-tree-limit
+                           :attempts n
+                           :max-attempts max-attempts})))))))
+
+(defn- ensure-fallback-hop-budget!
+  [ctx]
+  (let [max-hops (positive-int-or-nil (:max-fallback-hops ctx))
+        telemetry* (:telemetry* ctx)
+        current-hops (if (instance? clojure.lang.Atom telemetry*)
+                       (long (or (:calls/fallback-hops @telemetry*) 0))
+                       0)]
+    (when (and (int? max-hops)
+               (>= current-hops max-hops))
+      (throw (ex-info "Call tree exceeded configured fallback-hop limit."
+                      {:error :policy/fallback-limit
+                       :failure/type :policy/fallback-limit
+                       :fallback-hops current-hops
+                       :max-fallback-hops max-hops})))))
+
 (defn- resolve-retry-policy
   [resolver node]
   (let [protocol      (if (map? (:protocol resolver)) (:protocol resolver) {})
-        policy-retry  (get-in (contracts/intent-policy protocol (:intent node))
+        policy-retry  (get-in (effective-intent-policy resolver protocol (:intent node))
                               [:retry])
         routing-retry (get-in resolver [:routing :retry])
         node-retry    (get-in node [:dispatch :retry])]
@@ -381,7 +527,7 @@
 (defn- resolve-switch-on
   [resolver node]
   (let [protocol (if (map? (:protocol resolver)) (:protocol resolver) {})
-        policy  (set (or (get-in (contracts/intent-policy protocol (:intent node))
+        policy  (set (or (get-in (effective-intent-policy resolver protocol (:intent node))
                                  [:switch-on])
                          #{}))
         routing (set (or (get-in resolver [:routing :switch-on]) #{}))
@@ -449,32 +595,34 @@
                            (keyword-set (:should over')))))))
 
 (defn- effective-done
-  [protocol call-node]
+  [resolver protocol call-node]
   (let [intent         (:intent call-node)
-        policy         (contracts/intent-policy protocol intent)
+        policy         (effective-intent-policy resolver protocol intent)
         dispatch-map   (if (map? (:dispatch call-node)) (:dispatch call-node) {})
         policy-done    (if (map? (:done policy)) (:done policy) {})
         node-done      (if (map? (:done call-node)) (:done call-node) {})
         merged-done    (merge-done-overrides policy-done node-done)
-        policy-checks  (keyword-set (:checks policy))
+        policy-hard-checks (into (keyword-set (:checks policy))
+                                 (keyword-set (:checks/hard policy)))
+        policy-soft-checks (keyword-set (:checks/soft policy))
         legacy-hard-checks (keyword-set (:checks dispatch-map))
         explicit-hard? (contains? dispatch-map :checks/hard)
         dispatch-hard-checks (keyword-set (:checks/hard dispatch-map))
         dispatch-soft-checks (keyword-set (:checks/soft dispatch-map))
         hard-checks (if explicit-hard?
                       dispatch-hard-checks
-                      (into policy-checks legacy-hard-checks))
+                      (into policy-hard-checks legacy-hard-checks))
         must-keys      (into (keyword-set (:must merged-done))
                              hard-checks)
         should-keys    (into (keyword-set (:should merged-done))
-                             dispatch-soft-checks)]
+                             (into policy-soft-checks dispatch-soft-checks))]
     (cond-> merged-done
       true (assoc :must must-keys
                   :should should-keys))))
 
 (defn- evaluate-done
-  [protocol call-node env result check-fns judge-fn]
-  (let [done         (effective-done protocol call-node)
+  [resolver protocol call-node env result check-fns judge-fn]
+  (let [done         (effective-done resolver protocol call-node)
         must-keys    (set (or (:must done) #{}))
         should-keys  (set (or (:should done) #{}))
         score-min    (done-score-min (:score-min done))
@@ -598,7 +746,8 @@
 
 (defn- evaluate-call-attempt
   [ctx env switch-on candidate-node cap-id attempt candidate-idx]
-  (let [call-start (now-nanos)
+  (let [_ (ensure-call-attempt-budget! ctx)
+        call-start (now-nanos)
         result (let [invoke-call (:invoke-call ctx)]
                  (invoke-call candidate-node env))
         latency-ms (nanos->millis call-start)
@@ -614,7 +763,8 @@
                         {:result {:type :value
                                   :out (:emitted run*)}}
                         result)
-        done-eval (evaluate-done (:protocol ctx)
+        done-eval (evaluate-done (:resolver ctx)
+                                 (:protocol ctx)
                                  candidate-node
                                  env
                                  verify-result
@@ -682,6 +832,7 @@
            :failure/recover? false})
       (let [cap-id (nth candidates candidate-idx)
             _ (when (pos? candidate-idx)
+                (ensure-fallback-hop-budget! ctx)
                 (telemetry-inc! (:telemetry* ctx) :calls/fallback-hops))
             candidate-node (assoc base-node :cap/id cap-id)
             candidate-outcome (attempt-candidate ctx
@@ -711,6 +862,7 @@
                          (update :input contracts/materialize-plan env)
                          normalize-call-node)
         resolver     (:resolver ctx)
+        _            (validate-call-input! ctx base-node)
         _            (enforce-effects-authorization! resolver base-node env)
         retry-policy (resolve-retry-policy resolver base-node)
         switch-on    (resolve-switch-on resolver base-node)
@@ -726,12 +878,29 @@
                        :resolver resolver
                        :rejected-candidates rejected})))
     (let [same-cap-attempts (inc (:same-cap-max retry-policy))
-          call-outcome (resolve-call-outcome ctx
-                                             env
-                                             base-node
-                                             switch-on
-                                             candidates
-                                             same-cap-attempts)]
+          call-outcome (try
+                         (resolve-call-outcome ctx
+                                               env
+                                               base-node
+                                               switch-on
+                                               candidates
+                                               same-cap-attempts)
+                         (catch clojure.lang.ExceptionInfo e
+                           (let [data (or (ex-data e) {})
+                                 failure-type (or (:failure/type data)
+                                                  (:error data)
+                                                  :policy/call-tree-limit)]
+                             {:ok? false
+                              :cap/id (first candidates)
+                              :failure/type failure-type
+                              :failure/recover? false
+                              :details data}))
+                         (catch Throwable t
+                           {:ok? false
+                            :cap/id (first candidates)
+                            :failure/type :policy/call-tree-limit
+                            :failure/recover? false
+                            :details {:message (.getMessage t)}}))]
       (if (:ok? call-outcome)
         (do
           (telemetry-inc! telemetry* :calls/succeeded)
@@ -748,13 +917,14 @@
                     (assoc env (:as node) (:slot-val call-outcome))
                     env)
              :emitted emitted}
-            (throw (ex-info "Call node failed quality/dispatch policy"
-                            {:node node
-                             :outcome call-outcome
-                             :switch-on switch-on
-                             :retry-policy retry-policy
-                             :candidates candidates
-                             :rejected-candidates rejected}))))))))
+              (throw (ex-info "Call node failed quality/dispatch policy"
+                              {:node node
+                               :outcome call-outcome
+                               :switch-on switch-on
+                               :retry-policy retry-policy
+                               :candidates candidates
+                               :rejected-candidates rejected
+                               :details (:details call-outcome)}))))))))
 
 (defn- run-tool-node
   [ctx node env emitted]
@@ -809,7 +979,8 @@
                                               (string? raw-result) {:text raw-result}
                                               (nil? raw-result) {}
                                               :else {:value raw-result})}})
-                    done-eval (evaluate-done (:protocol ctx)
+                    done-eval (evaluate-done (:resolver ctx)
+                                             (:protocol ctx)
                                              base-node
                                              env
                                              result
@@ -910,6 +1081,8 @@
   - `:resolver`   routing map
   - `:invoke-call` fn of `[call-node env] -> canonical result envelope`
   - `:invoke-tool` fn of `[tool-node env] -> canonical result envelope`
+  - `:max-call-attempts` optional hard limit for total call attempts in one run
+  - `:max-fallback-hops` optional hard limit for fallback hops in one run
   - `:debug/transcript?` include per-call transcript in run output
   - `:env`        optional initial environment map
 
@@ -922,6 +1095,11 @@
         telemetry* (telemetry-atom telemetry)
         protocol   (or (:protocol resolver) {})
         debug-transcript? (true? (:debug/transcript? opts))
+        max-call-attempts (positive-int-or-nil (:max-call-attempts opts))
+        max-fallback-hops (positive-int-or-nil (:max-fallback-hops opts))
+        call-attempts* (if (instance? clojure.lang.Atom (:call-attempts opts))
+                         (:call-attempts opts)
+                         (atom 0))
         timings*   (if (instance? clojure.lang.Atom (:timings opts))
                      (:timings opts)
                      (atom []))
@@ -936,6 +1114,9 @@
              :judge-fn judge-fn
              :protocol protocol
              :telemetry* telemetry*
+             :call-attempts* call-attempts*
+             :max-call-attempts max-call-attempts
+             :max-fallback-hops max-fallback-hops
              :timings* timings*
              :transcript* transcript*
              :debug-transcript? debug-transcript?}]

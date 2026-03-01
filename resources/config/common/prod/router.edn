@@ -2,22 +2,90 @@
 
  :ferment.router/default
  {:routing  #ref :ferment.caps/routing
+  :intent->policy-profile
+  {:route/decide      :balanced
+   :context/summarize :low-latency
+   :text/respond      :low-latency
+   :problem/solve     :high-quality
+   :code/generate     :high-quality
+   :code/patch        :high-quality
+   :code/explain      :balanced
+   :code/review       :high-quality
+   :eval/grade        :balanced}
+  :policy-profiles
+  {:low-latency
+   {:default {:retry {:same-cap-max 0
+                      :fallback-max 0}
+              :switch-on #{:schema/invalid :format/drift}
+              :done {:score-min 0.70}}
+    :intents {:route/decide {:retry {:same-cap-max 1
+                                     :fallback-max 0}
+                             :done {:score-min 1.0}}
+              :text/respond {:retry {:same-cap-max 0
+                                     :fallback-max 0}
+                             :done {:score-min 0.70}}
+              :problem/solve {:retry {:same-cap-max 0
+                                      :fallback-max 0}
+                              :done {:score-min 0.75}}}
+    :limits {:call-tree/max-calls 3
+             :call-tree/max-fallback-hops 1}}
+
+   :balanced
+   {:default {:retry {:same-cap-max 1
+                      :fallback-max 1}
+              :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
+              :done {:score-min 0.80}}
+    :intents {:route/decide {:retry {:same-cap-max 2
+                                     :fallback-max 0}
+                             :done {:score-min 1.0}}
+              :text/respond {:retry {:same-cap-max 1
+                                     :fallback-max 1}
+                             :done {:score-min 0.85}}
+              :problem/solve {:retry {:same-cap-max 1
+                                      :fallback-max 1}
+                              :done {:score-min 0.85}}}
+    :limits {:call-tree/max-calls 6
+             :call-tree/max-fallback-hops 2}}
+
+   :high-quality
+   {:default {:retry {:same-cap-max 2
+                      :fallback-max 2}
+              :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
+              :done {:score-min 0.90}}
+    :intents {:route/decide {:retry {:same-cap-max 3
+                                     :fallback-max 0}
+                             :done {:score-min 1.0}}
+              :text/respond {:retry {:same-cap-max 2
+                                     :fallback-max 2}
+                             :done {:score-min 0.88}}
+              :problem/solve {:retry {:same-cap-max 2
+                                      :fallback-max 2}
+                              :done {:score-min 0.90}}
+              :code/patch {:retry {:same-cap-max 2
+                                   :fallback-max 2}
+                           :done {:score-min 0.90}}}
+    :limits {:call-tree/max-calls 10
+             :call-tree/max-fallback-hops 4}}}
   :profiles {:default      {:meta? true
                             :strict? false
                             :force? false
-                            :on-error :fail-open}
+                            :on-error :fail-open
+                            :policy/profile :balanced}
              :low-latency  {:meta? false
                             :strict? false
                             :force? false
-                            :on-error :fail-open}
+                            :on-error :fail-open
+                            :policy/profile :low-latency}
              :strict-meta  {:meta? true
                             :strict? true
                             :force? true
-                            :on-error :fail-closed}}
-  :defaults {:meta? true
+                            :on-error :fail-closed
+                            :policy/profile :high-quality}}
+  :defaults {:meta? false
              :strict? false
              :force? false
-             :on-error :fail-open}
+             :on-error :fail-open
+             :policy/profile :low-latency}
   :policy   :meta-decider}
 
 }

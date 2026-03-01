@@ -4,7 +4,7 @@
       :author "Paweł Wilk"
       :added  "1.0.0"}
 
-    ferment.middleware.act.finalize
+    ferment.http.act.middleware.finalize
 
   (:require [ferment.system :as system]))
 
@@ -27,9 +27,9 @@
 
 (defn middleware
   ([]
-   (middleware :act.middleware/finalize nil))
+   (middleware nil nil))
   ([k _config]
-   (let [name (module-name k :act.middleware/finalize)]
+   (let [name (module-name k ::finalize)]
      {:name name
       :compile (fn [_runtime _opts]
                  (fn [next]

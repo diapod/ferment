@@ -135,15 +135,24 @@
     (:resolver runtime)
     {}))
 
-(defn- resolve-cap-id
+(defn- request-explicit-cap-id
+  [request]
+  (or (some-> (:cap/id request) keywordish)
+      (some-> (get-in request [:task :cap/id]) keywordish)))
+
+(defn- resolve-capability-decision
   [resolver request]
-  (or (:cap/id request)
-      (get-in request [:task :cap/id])
-      (workflow/resolve-capability
-       resolver
-       {:intent (get-in request [:task :intent])
-        :requires (get-in request [:task :requires])
-        :effects (:effects request)})))
+  (let [intent       (some-> (get-in request [:task :intent]) keywordish)
+        explicit-cap (request-explicit-cap-id request)
+        routed-cap   (some-> resolver :routing :intent->cap (get intent) keywordish)
+        node         (cond-> {:intent intent
+                              :requires (get-in request [:task :requires])
+                              :effects (:effects request)}
+                       (or (keyword? explicit-cap) (keyword? routed-cap))
+                       (assoc :dispatch {:candidates (cond-> []
+                                                       (keyword? explicit-cap) (conj explicit-cap)
+                                                       (keyword? routed-cap) (conj routed-cap))}))]
+    (workflow/resolve-capability-decision resolver node)))
 
 (defn- request->invoke-opts
   [runtime resolver request cap-id]
@@ -212,13 +221,34 @@
                :details (select-keys req-check [:reason :intent])}}
 
       :else
-      (let [cap-id (resolve-cap-id resolver request)]
+      (let [cap-decision (resolve-capability-decision resolver request)
+            cap-id       (some-> cap-decision :cap/id keywordish)
+            rejected-candidates (if (sequential? (:rejected-candidates cap-decision))
+                                  (->> (:rejected-candidates cap-decision)
+                                       (keep (fn [entry]
+                                               (when (map? entry)
+                                                 (cond-> {}
+                                                   (keyword? (:cap/id entry)) (assoc :cap/id (:cap/id entry))
+                                                   (keyword? (:reason entry)) (assoc :reason (:reason entry))
+                                                   (keyword? (:intent entry)) (assoc :intent (:intent entry))
+                                                   (keyword? (:result/type entry)) (assoc :result/type (:result/type entry))))))
+                                       vec)
+                                  [])
+            unsupported-details (cond-> {:intent (some-> request :task :intent keywordish)}
+                                  (keyword? (:requested-cap/id cap-decision))
+                                  (assoc :requested-cap/id (:requested-cap/id cap-decision))
+                                  (keyword? (:routed-cap/id cap-decision))
+                                  (assoc :routed-cap/id (:routed-cap/id cap-decision))
+                                  (sequential? (:candidates cap-decision))
+                                  (assoc :candidates (vec (keep keywordish (:candidates cap-decision))))
+                                  (seq rejected-candidates)
+                                  (assoc :rejected-candidates rejected-candidates))]
         (if-not (keyword? cap-id)
           {:ok? false
            :retryable? false
            :error {:type :unsupported/intent
                    :message "No capability can handle the queued intent."
-                   :details {:intent (get-in request [:task :intent])}}}
+                   :details unsupported-details}}
           (try
             {:ok? true
              :result (core/call-capability runtime resolver (request->invoke-opts runtime resolver request cap-id))}

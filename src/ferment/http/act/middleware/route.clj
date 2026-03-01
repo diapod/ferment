@@ -4,7 +4,7 @@
       :author "Paweł Wilk"
       :added  "1.0.0"}
 
-    ferment.middleware.act.route
+    ferment.http.act.middleware.route
 
   (:require [ferment.system :as system]))
 
@@ -27,9 +27,9 @@
 
 (defn middleware
   ([]
-   (middleware :act.middleware/route nil))
+   (middleware nil nil))
   ([k _config]
-   (let [name (module-name k :act.middleware/route)]
+   (let [name (module-name k ::route)]
      {:name name
       :compile (fn [_runtime _opts]
                  (fn [next]

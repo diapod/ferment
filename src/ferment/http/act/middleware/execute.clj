@@ -4,7 +4,7 @@
       :author "Paweł Wilk"
       :added  "1.0.0"}
 
-    ferment.middleware.act.execute
+    ferment.http.act.middleware.execute
 
   (:require [ferment.system :as system]))
 
@@ -27,9 +27,9 @@
 
 (defn middleware
   ([]
-   (middleware :act.middleware/execute nil))
+   (middleware nil nil))
   ([k _config]
-   (let [name (module-name k :act.middleware/execute)]
+   (let [name (module-name k ::execute)]
      {:name name
       :compile (fn [_runtime _opts]
                  (fn [next]

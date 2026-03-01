@@ -234,6 +234,21 @@ operation ended with an exception stored in `ferment.app/exception`).")
 (declare restart-app)
 (declare resume-app)
 
+(defn- exception-log-data
+  [ex]
+  (let [data (ex-data ex)]
+    (if-not (map? data)
+      data
+      (let [picked (cond-> {}
+                     (contains? data :error) (assoc :error (:error data))
+                     (contains? data :path) (assoc :path (:path data))
+                     (contains? data :unknown) (assoc :unknown (:unknown data))
+                     (contains? data :allowed) (assoc :allowed (:allowed data))
+                     (contains? data :required) (assoc :required (:required data))
+                     (contains? data :expected) (assoc :expected (:expected data))
+                     (contains? data :value) (assoc :value (:value data)))]
+        (if (seq picked) picked data)))))
+
 (defn state-from-exception
   "Takes an exception object and updates the global application state to reflect
   failure.
@@ -248,7 +263,12 @@ operation ended with an exception stored in `ferment.app/exception`).")
   (locking lock
     (var/reset exception ex)
     (var/reset state (:system (ex-data ex)))
-    (log/err "Exception during " (normalize-name phase) ": " (ex-message ex) ": " (ex-cause ex))
+    (let [phase-name (normalize-name phase)
+          cause-msg  (some-> ex ex-cause ex-message)
+          details    (exception-log-data ex)]
+      (log/err "Exception during " phase-name ": " (ex-message ex)
+               (when (some-str cause-msg) (str " cause: " cause-msg))
+               (when (some? details) (str " ex-data: " (pr-str details)))))
     (var/reset phase :failed)))
 
 (defn configure-app

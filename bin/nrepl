@@ -1,5 +1,5 @@
 #!/bin/sh
 
-echo "[bankster] Starting development environment, please wait..."
+echo "[ferment] Starting development environment, please wait..."
 
 clojure -M:dev:dev-nrepl:dev-rebel

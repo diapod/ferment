@@ -97,6 +97,121 @@
       ;; resolver :caps/by-id dispatch role has precedence
       (is (= :router (:role @seen))))))
 
+(deftest invoke-act-capability-resolution-falls-back-from-explicit-near-miss
+  (testing "When explicit :cap/id does not support request intent, resolver falls back to canonical intent capability."
+    (let [seen (atom nil)
+          telemetry (atom {})
+          runtime {:protocol {:policy/default {:fallback []}
+                              :policy/intents {:text/respond {:fallback [:llm/voice]}}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice}}
+                              :caps/by-id {:llm/solver {:cap/id :llm/solver
+                                                        :cap/intents #{:problem/solve}
+                                                        :cap/can-produce #{:value}
+                                                        :cap/effects-allowed #{:none}}
+                                           :llm/voice {:cap/id :llm/voice
+                                                       :cap/intents #{:text/respond}
+                                                       :cap/can-produce #{:value}
+                                                       :cap/effects-allowed #{:none}}}}}
+          payload {:proto 1
+                   :trace {:id "t-cap-near-miss-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/solver}
+                   :input {:prompt "hej"}}]
+      (let [response (with-redefs [core/call-capability
+                                   (fn [_runtime _resolver opts]
+                                     (reset! seen opts)
+                                     {:result {:type :value
+                                               :out {:text "ok"}}})]
+                       (http/invoke-act runtime payload telemetry nil))
+            snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= 200 (:status response)))
+        (is (= :llm/voice (:cap-id @seen)))
+        (is (= 1 (get-in snapshot [:act :routing :cap/resolve-attempt])))
+        (is (= 1 (get-in snapshot [:act :routing :cap/resolve-hit])))
+        (is (= 0 (get-in snapshot [:act :routing :cap/resolve-miss])))
+        (is (= 1 (get-in snapshot [:act :routing :cap/reject-reasons :intent/not-supported])))))))
+
+(deftest invoke-act-capability-resolution-emits-diagnostics-on-unsupported-intent
+  (testing "unsupported/intent error includes rejected candidate diagnostics and resolution telemetry."
+    (let [calls (atom 0)
+          telemetry (atom {})
+          runtime {:protocol {:policy/default {:fallback []}
+                              :policy/intents {:text/respond {:fallback []}}}
+                   :resolver {:caps/by-id {:llm/solver {:cap/id :llm/solver
+                                                        :cap/intents #{:problem/solve}
+                                                        :cap/can-produce #{:value}
+                                                        :cap/effects-allowed #{:none}}}}}
+          payload {:proto 1
+                   :trace {:id "t-cap-unsupported-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/solver}
+                   :input {:prompt "hej"}}]
+      (let [response (with-redefs [core/call-capability
+                                   (fn [& _]
+                                     (swap! calls inc)
+                                     {:result {:type :value
+                                               :out {:text "unexpected"}}})]
+                       (http/invoke-act runtime payload telemetry nil))
+            details (get-in response [:body :error :details])
+            snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= 422 (:status response)))
+        (is (zero? @calls))
+        (is (= :unsupported/intent (get-in response [:body :error :type])))
+        (is (= :text/respond (:intent details)))
+        (is (= :llm/solver (:requested-cap/id details)))
+        (is (= :intent/not-supported
+               (get-in details [:rejected-candidates 0 :reason])))
+        (is (= 1 (get-in snapshot [:act :routing :cap/resolve-attempt])))
+        (is (= 0 (get-in snapshot [:act :routing :cap/resolve-hit])))
+        (is (= 1 (get-in snapshot [:act :routing :cap/resolve-miss])))
+        (is (= 1 (get-in snapshot [:act :routing :cap/reject-reasons :intent/not-supported])))))))
+
+(deftest invoke-act-capability-resolution-near-miss-reasons-are-deterministic
+  (testing "Near-miss reasons are deterministic and visible in both diagnostics and telemetry taxonomy."
+    (let [runtime {:protocol {:policy/default {:fallback []}}
+                   :resolver {:caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                       :cap/intents #{:text/respond}
+                                                       :cap/can-produce #{:value}
+                                                       :cap/effects-allowed #{:none}
+                                                       :io/in-schema :req/text
+                                                       :io/out-schema :res/text}}}}
+          cases [{:name :schema-mismatch
+                  :task {:intent :text/respond
+                         :cap/id :llm/voice
+                         :requires {:out-schema :res/problem}}
+                  :effects nil
+                  :expected-reason :requires/schema-mismatch}
+                 {:name :effects-not-allowed
+                  :task {:intent :text/respond
+                         :cap/id :llm/voice}
+                  :effects {:allowed #{:fs/write}}
+                  :expected-reason :effects/not-allowed}
+                 {:name :result-type-not-supported
+                  :task {:intent :text/respond
+                         :cap/id :llm/voice
+                         :requires {:result/type :plan}}
+                  :effects nil
+                  :expected-reason :result-type/not-supported}]]
+      (doseq [{:keys [name task effects expected-reason]} cases]
+        (let [telemetry (atom {})
+              payload (cond-> {:proto 1
+                               :trace {:id (str "t-cap-near-miss-" (clojure.core/name name))}
+                               :task task
+                               :input {:prompt "hej"}}
+                        (map? effects) (assoc :effects effects))
+              response (http/invoke-act runtime payload telemetry nil)
+              details (get-in response [:body :error :details])
+              snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+          (is (= 422 (:status response)) (str "status for " name))
+          (is (= :unsupported/intent (get-in response [:body :error :type])) (str "type for " name))
+          (is (= expected-reason
+                 (get-in details [:rejected-candidates 0 :reason]))
+              (str "reason for " name))
+          (is (= 1 (get-in snapshot [:act :routing :cap/resolve-attempt])) (str "attempt counter for " name))
+          (is (= 1 (get-in snapshot [:act :routing :cap/resolve-miss])) (str "miss counter for " name))
+          (is (= 1 (get-in snapshot [:act :routing :cap/reject-reasons expected-reason]))
+              (str "taxonomy counter for " name)))))))
+
 (deftest invoke-act-applies-session-var-defaults-when-missing
   (testing "invoke-act fills missing context/constraints/input defaults from session vars."
     (let [seen (atom nil)]
@@ -334,6 +449,33 @@
       (is (= :stream (get-in response [:body :result :type])))
       (is (= "czesc" (get-in response [:body :result :stream 0 :text]))))))
 
+(deftest invoke-act-sanitizes-final-output-and-keeps-debug-transcript-raw
+  (testing "Final payload strips tool/think markers, while debug transcript keeps raw diagnostic output."
+    (let [runtime {:protocol {}
+                   :resolver {}}
+          payload {:proto 1
+                   :trace {:id "t-sanitize-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :routing {:debug/transcript? true}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver _opts]
+                                   {:result {:type :value
+                                             :out {:text "<think>secret</think>OK <tool_call>{\"name\":\"x\"}</tool_call> done"}
+                                             :plan/run {:ok? true
+                                                        :transcript [{:op :call
+                                                                      :out {:text "<think>raw</think> <tool_call>{\"name\":\"x\"}</tool_call>"}}]}}})]
+                     (http/invoke-act runtime payload nil nil))
+          final-text (get-in response [:body :result :out :text])
+          raw-transcript-text (get-in response [:body :result :plan/run :transcript 0 :out :text])]
+      (is (= 200 (:status response)))
+      (is (not (str/includes? final-text "<think>")))
+      (is (not (str/includes? final-text "<tool_call>")))
+      (is (str/includes? final-text "OK"))
+      (is (str/includes? raw-transcript-text "<think>"))
+      (is (str/includes? raw-transcript-text "<tool_call>")))))
+
 (deftest invoke-act-accepted-submits-async-job
   (testing "response/type=accepted enqueues job and returns 202 accepted envelope without invoking core runtime."
     (let [calls (atom 0)
@@ -452,6 +594,38 @@
       (is (= 200 (:status response)))
       (is (= [:route/decide :text/respond] @calls))
       (is (= :llm/solver (:cap-id @seen))))))
+
+(deftest invoke-act-exposes-separate-routing-latency-fields
+  (testing "invoke-act exposes decider latency separately from full meta-routing phase latency."
+    (let [routing {:intent->cap {:route/decide :llm/meta
+                                 :text/respond :llm/voice}}
+          runtime {:protocol {}
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5-latency"}
+                   :task {:intent :text/respond}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (case (:intent opts)
+                                     :route/decide {:result {:type :value
+                                                             :out {:cap/id :llm/voice}}}
+                                     :text/respond {:result {:type :value
+                                                             :out {:text "ok"}}}
+                                     {:result {:type :value
+                                               :out {:text "unexpected"}}}))]
+                     (http/invoke-act runtime payload nil nil))
+          route-decide-ms (get-in response [:body :routing/route-decide-latency-ms])
+          route-phase-ms (get-in response [:body :routing/route-phase-latency-ms])
+          route-decider-ms (get-in response [:body :routing/route-decider-latency-ms])]
+      (is (= 200 (:status response)))
+      (is (number? route-decide-ms))
+      (is (number? route-phase-ms))
+      (is (number? route-decider-ms))
+      (is (= route-decide-ms route-decider-ms))
+      (is (<= route-decider-ms route-phase-ms)))))
 
 (deftest invoke-act-meta-routing-adapts-tool-call-to-solver-voice-plan
   (testing "Meta route/decide output in tool_call format is adapted into canonical solver->voice plan and executed."
@@ -629,14 +803,16 @@
                      (http/invoke-act runtime payload nil nil))]
       (is (= 200 (:status response)))
       (is (= [:route/decide :text/respond :problem/solve :text/respond] @calls))
+      (is (= :req/handoff
+             (get-in response [:body :result :plan/debug :nodes 2 :input/schema])))
       (is (= {:slot/id [:solver :out :text]}
-             (get-in response [:body :result :plan/debug :nodes 2 :input :prompt])))
+             (get-in response [:body :result :plan/debug :nodes 2 :input :handoff/text])))
       (is (string? (get-in response [:body :result :plan/debug :nodes 2 :system])))
       (is (str/includes? (get-in response [:body :result :plan/debug :nodes 2 :system])
                          "Rewrite for tone/style only"))
       (is (= [:schema-valid :no-truncated-ending]
              (get-in response [:body :result :plan/debug :nodes 2 :dispatch :checks/hard])))
-      (is (= {:same-cap-max 1 :fallback-max 0}
+      (is (= {:same-cap-max 2 :fallback-max 0}
              (get-in response [:body :result :plan/debug :nodes 2 :dispatch :retry])))
       (is (= {:slot/id [:voice-primary :out]}
              (get-in response [:body :result :plan/debug :nodes 3 :input])))
@@ -654,7 +830,7 @@
       (is (= :text/respond
              (get-in response [:body :result :plan/run :transcript 2 :intent])))
       (is (= "ACID to zestaw gwarancji poprawności transakcji."
-             (get-in response [:body :result :plan/run :transcript 2 :input :prompt]))))))
+             (get-in response [:body :result :plan/run :transcript 2 :input :handoff/text]))))))
 
 (deftest invoke-act-meta-routing-softens-voice-final-list-expansion-check
   (testing "Strict meta routing may recover to solver->voice-final when primary voice fails hard list-expansion gate."
@@ -784,7 +960,7 @@
                    :resolver {:routing routing}
                    :router {:policy :meta-decider
                             :routing routing
-                            :defaults {:meta? true
+                            :defaults {:meta? false
                                        :on-error :fail-open}}}
           payload {:proto 1
                    :trace {:id "t-6-request-strict-overrides-default"}
@@ -812,7 +988,7 @@
                    :resolver {:routing routing}
                    :router {:policy :meta-decider
                             :routing routing
-                            :defaults {:meta? true
+                            :defaults {:meta? false
                                        :on-error :fail-open}}}
           payload {:proto 1
                    :trace {:id "t-6-rich-details"}
@@ -995,7 +1171,7 @@
               snapshot (#'ferment.http/telemetry-snapshot telemetry)]
           (is (= 200 (:status response)))
           (is (= "fallback-ok" (get-in response [:body :result :out :text])))
-          (is (= [:route/decide :route/decide :route/decide :text/respond] @calls))
+          (is (= [:route/decide :route/decide :text/respond] @calls))
           (is (= 1 (get-in snapshot [:act :routing :route/decide-hit])))
           (is (= 1 (get-in snapshot [:act :routing :route/fail-open])))
           (is (= 0 (get-in snapshot [:act :routing :route/fail-closed])))
@@ -1151,6 +1327,77 @@
         (is (= 1 (get-in snapshot [:workflow :calls/failed])))
         (is (= 1 (get-in snapshot [:workflow :calls/failure-types :eval/must-failed])))
         (is (= 1.0 (get-in snapshot [:kpi :must-failed-rate :value])))))))
+
+(deftest telemetry-snapshot-exposes-orchestration-kpis
+  (testing "Diagnostics snapshot exposes orchestration branch and context-hit utility counters."
+    (let [runtime {:protocol {}
+                   :resolver {}
+                   :session {:store {:session-vars/contract
+                                     {:request/default-bindings
+                                      {:session/language {:target [:constraints :language]
+                                                          :coerce :keyword-or-string}}}}
+                             :get-vars! (fn [_sid _ks _opts]
+                                          {:session/language :en})}}
+          telemetry (atom {})
+          payload {:proto 1
+                   :trace {:id "t-orch-1"}
+                   :session/id "session/orch-1"
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      {:invoke/meta {:role :voice
+                                     :intent :text/respond
+                                     :cap/id :llm/voice
+                                     :model-key :ferment.model/voice
+                                     :model "voice-model"}
+                       :result {:type :value
+                                :out {:text "ok"}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry nil)))))
+      (let [snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= 1 (get-in snapshot [:orchestration :participants/diversity :participants/requests])))
+        (is (= 1 (get-in snapshot [:orchestration :participants/diversity :participants/total])))
+        (is (= 1.0 (get-in snapshot [:orchestration :participants/diversity :value])))
+        (is (= 1 (get-in snapshot [:orchestration :context/hit-utility :lookups])))
+        (is (= 1 (get-in snapshot [:orchestration :context/hit-utility :hits])))
+        (is (= 0 (get-in snapshot [:orchestration :context/hit-utility :misses])))
+        (is (= 1.0 (get-in snapshot [:orchestration :context/hit-utility :value])))
+        (is (nil? (get-in snapshot [:orchestration :route/decision-quality-trend :value])))))))
+
+(deftest invoke-act-auto-writes-session-memory-summary
+  (testing "Successful /v1/act auto-writes compacted context summary according to session memory policy."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}
+                   :session {:store {:session-vars/contract
+                                     {:memory/policy {:enabled? true
+                                                      :write/default? false
+                                                      :write/by-intent {:text/respond true}
+                                                      :write/key :context/summary
+                                                      :write/max-chars 24
+                                                      :compaction/trigger-chars 20
+                                                      :compaction/target-chars 12
+                                                      :compaction/mode :truncate}}}
+                             :put-vars! (fn [sid vars opts]
+                                          (reset! seen {:sid sid :vars vars :opts opts})
+                                          true)}}
+          payload {:proto 1
+                   :trace {:id "t-memory-write-1"}
+                   :session/id "session/memory-write-1"
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      {:result {:type :value
+                                :out {:text "This is a longer response that should be compacted."}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload nil nil)))))
+      (is (= "session/memory-write-1" (:sid @seen)))
+      (is (= :text/respond (get-in @seen [:opts :intent])))
+      (is (= :act/memory-auto-write (get-in @seen [:opts :operation])))
+      (is (= :text/respond (get-in @seen [:vars :context/last-intent])))
+      (is (= "This is a lo" (get-in @seen [:vars :context/summary]))))))
 
 (deftest invoke-act-writes-audit-trail-event
   (testing "invoke-act emits persistent audit event with trace/request/session/principal/intent/capability/outcome."

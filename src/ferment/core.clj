@@ -771,6 +771,9 @@
 (def ^:private tool-call-block-pattern
   #"(?is)<tool_call\b[^>]*>.*?</tool_call>")
 
+(def ^:private pseudo-tool-tag-pattern
+  #"(?is)</?\s*(?:tool_calls?|function_call|analysis|observation)\b[^>]*>")
+
 (def ^:private think-only-pattern
   #"(?is)^\s*<think\b[^>]*>(.*?)</think>\s*$")
 
@@ -783,11 +786,18 @@
       without-closed
       (subs without-closed 0 open-idx))))
 
+(defn- strip-tool-markers
+  [text]
+  (-> (or text "")
+      (str/replace tool-call-block-pattern "")
+      (str/replace pseudo-tool-tag-pattern "")))
+
 (defn- sanitize-model-text
   [text]
   (if (string? text)
     (-> text
         strip-think-blocks
+        strip-tool-markers
         str/trim)
     (str text)))
 
@@ -819,6 +829,30 @@
              (pos? max-chars)
              (> (count text) max-chars))
       (subs text 0 max-chars)
+      text)))
+
+(def ^:private sentence-end-chars
+  #{\. \! \? \: \; \u2026})
+
+(defn- last-sentence-end-index
+  [s]
+  (let [text (str (or s ""))]
+    (loop [idx (dec (count text))]
+      (cond
+        (neg? idx) nil
+        (contains? sentence-end-chars (.charAt ^String text idx)) idx
+        :else (recur (dec idx))))))
+
+(defn- clamp-text-respond-max-chars
+  [s max-chars]
+  (let [text (clamp-max-chars s max-chars)]
+    (if (and (integer? max-chars)
+             (pos? max-chars)
+             (> (count (str (or s ""))) max-chars))
+      (let [end-idx (last-sentence-end-index text)]
+        (if (and (integer? end-idx) (>= end-idx 0))
+          (subs text 0 (inc end-idx))
+          text))
       text)))
 
 (defn- normalize-list-format
@@ -863,8 +897,9 @@
                     (or (request-max-chars request)
                         default-text-respond-max-chars)
                     (request-max-chars request))]
-    (-> text1
-        (clamp-max-chars max-chars)
+    (-> (if (= :text/respond intent)
+          (clamp-text-respond-max-chars text1 max-chars)
+          (clamp-max-chars text1 max-chars))
         str/trim)))
 
 (defn- tool-call-output?
@@ -930,7 +965,39 @@
   (cond
     (string? input) input
     (string? (:prompt input)) (:prompt input)
-    (map? input) (pr-str input)
+    (map? input)
+    (let [handoff-text (some-> (:handoff/text input) sanitize-model-text str/trim not-empty)]
+      (if handoff-text
+        (let [facts-src (:handoff/facts input)
+              assumptions-src (:handoff/assumptions input)
+              facts (->> (if (and (sequential? facts-src) (not (map? facts-src)))
+                           facts-src
+                           [])
+                         (keep #(some-> % sanitize-model-text str/trim not-empty))
+                         vec)
+              assumptions (->> (if (and (sequential? assumptions-src) (not (map? assumptions-src)))
+                                 assumptions-src
+                                 [])
+                               (keep #(some-> % sanitize-model-text str/trim not-empty))
+                               vec)
+              lang (let [lang' (:handoff/lang input)]
+                     (cond
+                       (keyword? lang') (name lang')
+                       (string? lang') (some-> lang' str/trim not-empty)
+                       :else nil))]
+          (str/join
+           "\n\n"
+           (concat
+            [handoff-text]
+            (when (seq facts)
+              [(str "Key facts:\n"
+                    (str/join "\n" (map #(str "- " %) facts)))])
+            (when (seq assumptions)
+              [(str "Assumptions:\n"
+                    (str/join "\n" (map #(str "- " %) assumptions)))])
+            (when lang
+              [(str "Preferred language: " lang)]))))
+        (pr-str input)))
     (nil? input) ""
     :else (str input)))
 
@@ -1250,6 +1317,19 @@
       (and (not ok?) (keyword? (:failure/type run))) (assoc :failure/type (:failure/type run))
       (and (not ok?) (some? (:error run))) (assoc :error (:error run)))))
 
+(defn- positive-int-or-nil
+  [v]
+  (let [n (cond
+            (int? v) v
+            (integer? v) (int v)
+            (number? v) (int (Math/floor (double v)))
+            (string? v) (try
+                          (Integer/parseInt (str/trim v))
+                          (catch Throwable _ nil))
+            :else nil)]
+    (when (and (int? n) (pos? n))
+      n)))
+
 (defn call-capability
   "Canonical domain entrypoint.
 
@@ -1263,9 +1343,22 @@
          judge-fn      (runtime-judge-fn runtime resolver opts)
          debug-plan?   (true? (:debug/plan? opts))
          debug-transcript? (true? (:debug/transcript? opts))
+         policy-profile (or (some-> (:policy/profile opts) keywordish)
+                            (some-> (get-in opts [:routing :policy/profile]) keywordish)
+                            (some-> (get-in resolver [:policy/profile]) keywordish))
+         policy-profiles (or (when (map? (:policy/profiles opts))
+                               (:policy/profiles opts))
+                             (when (map? (get-in resolver [:policy/profiles]))
+                               (get-in resolver [:policy/profiles])))
+         max-call-attempts (or (positive-int-or-nil (:workflow/max-calls opts))
+                               (positive-int-or-nil (:max-call-attempts opts)))
+         max-fallback-hops (or (positive-int-or-nil (:workflow/max-fallback-hops opts))
+                               (positive-int-or-nil (:max-fallback-hops opts)))
          protocol      (or (runtime-protocol runtime) {})
          resolver'     (cond-> (if (map? resolver) resolver {})
-                         (map? protocol) (assoc :protocol protocol))
+                         (map? protocol) (assoc :protocol protocol)
+                         (keyword? policy-profile) (assoc :policy/profile policy-profile)
+                         (map? policy-profiles) (assoc :policy/profiles policy-profiles))
          workflow-env  (cond-> {}
                          (map? (:workflow/env opts)) (merge (:workflow/env opts))
                          (map? (:auth/user opts)) (assoc :auth/user (:auth/user opts))
@@ -1288,6 +1381,8 @@
                     :check-fns check-fns
                     :judge-fn judge-fn
                     :env workflow-env
+                    :max-call-attempts max-call-attempts
+                    :max-fallback-hops max-fallback-hops
                     :debug/transcript? debug-transcript?})
              out  (emitted->out (:emitted run))]
          (assoc base-result

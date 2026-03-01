@@ -1,8 +1,8 @@
 {
 
  :ferment.protocol/default
- {:intents {:route/decide {:constraints {:max-chars 600}
-                           :budget {:max-tokens 128
+ {:intents {:route/decide {:constraints {:max-chars 420}
+                           :budget {:max-tokens 96
                                     :max-roundtrips 2}}
             :text/respond {:constraints {:max-chars 480}
                            :budget {:max-tokens 220
@@ -12,6 +12,14 @@
                                      :max-roundtrips 2}}}
   :policy/intents {:route/decide {:retry {:max-attempts 2
                                           :same-cap-max 1
-                                          :fallback-max 0}}}}
+                                          :fallback-max 0}
+                                  :checks/hard [:schema-valid]
+                                  :checks/soft []}
+                   :text/respond {:done {:score-min 0.75}
+                                  :checks/hard [:schema-valid :no-truncated-ending]
+                                  :checks/soft [:no-hallucinated-apis]}
+                   :problem/solve {:done {:score-min 0.78}
+                                   :checks/hard [:schema-valid :no-truncated-ending]
+                                   :checks/soft [:no-hallucinated-apis]}}}
 
 }

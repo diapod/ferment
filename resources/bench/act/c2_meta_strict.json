@@ -1,0 +1,8 @@
+{
+  "proto": 1,
+  "trace": {"id": "bench-c2-meta-strict"},
+  "session/id": "session/bench-c2",
+  "task": {"intent": "text/respond"},
+  "routing": {"meta?": true, "strict?": true, "force?": true},
+  "input": {"prompt": "Explain ACID briefly and give one example."}
+}

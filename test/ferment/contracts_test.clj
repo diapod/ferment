@@ -43,8 +43,10 @@
              (get-in protocol [:policy/intents :text/respond :done :must])))
       (is (= #{:no-hallucinated-apis :no-list-expansion}
              (get-in protocol [:policy/intents :text/respond :done :should])))
-      (is (= [:schema-valid :no-hallucinated-apis :no-list-expansion]
-             (get-in protocol [:policy/intents :text/respond :checks])))
+      (is (= [:schema-valid :no-truncated-ending]
+             (get-in protocol [:policy/intents :text/respond :checks/hard])))
+      (is (= [:no-hallucinated-apis :no-list-expansion :sufficient-detail]
+             (get-in protocol [:policy/intents :text/respond :checks/soft])))
       (is (= [:llm/voice :llm/solver-text]
              (get-in protocol [:policy/intents :text/respond :fallback])))
       (is (= 900
@@ -355,7 +357,11 @@
                                             :intent :text/respond
                                             :as :voice-final
                                             :when {:failed? :voice-primary}
-                                            :input {:prompt {:slot/id [:solver :out :text]}}}
+                                            :input/schema :req/handoff
+                                            :input {:handoff/text {:slot/id [:solver :out :text]}
+                                                    :handoff/facts {:slot/id [:solver :out :facts]}
+                                                    :handoff/assumptions {:slot/id [:solver :out :assumptions]}
+                                                    :handoff/lang {:slot/id [:solver :out :lang]}}}
                                            {:op :emit
                                             :input {:slot/id [:voice-primary :out]}}
                                            {:op :emit
@@ -376,19 +382,58 @@
                                              :intent :text/respond
                                              :as :voice-final
                                              :when {:failed? :voice-primary}
-                                             :input {:prompt {:slot/id [:solver :out :text]}}}
+                                             :input/schema :req/handoff
+                                             :input {:handoff/text {:slot/id [:solver :out :text]}}}
                                             {:op :emit
                                              :input {:slot/id [:voice-primary :out]}}
                                             {:op :emit
                                              :when {:failed? :voice-primary}
                                              :input {:slot/id [:voice-final :out]}}]}}}
+          bad-handoff {:result {:type :plan
+                                :plan {:nodes [{:op :call
+                                                :intent :text/respond
+                                                :as :voice-primary
+                                                :input {:prompt "Q"}
+                                                :dispatch {:allow-failure? true}}
+                                               {:op :call
+                                                :intent :problem/solve
+                                                :as :solver
+                                                :when {:failed? :voice-primary}
+                                                :input {:prompt "Q"}}
+                                               {:op :call
+                                                :intent :text/respond
+                                                :as :voice-final
+                                                :when {:failed? :voice-primary}
+                                                :input/schema :req/handoff
+                                                :input {:handoff/text {:slot/id [:solver :out :missing]}}}
+                                               {:op :emit
+                                                :input {:slot/id [:voice-primary :out]}}
+                                               {:op :emit
+                                                :when {:failed? :voice-primary}
+                                                :input {:slot/id [:voice-final :out]}}]}}}
           bad-type {:result {:type :value
                              :out {:cap/id :llm/solver}}}]
       (is (:ok? (contracts/validate-result protocol :route/decide ok-plan)))
       (is (= :route/plan-second-intent-not-problem-solve
              (:reason (contracts/validate-result protocol :route/decide bad-plan))))
+      (is (= :route/plan-voice-final-handoff-text-not-solver-slot
+             (:reason (contracts/validate-result protocol :route/decide bad-handoff))))
       (is (= :route/plan-result-type-not-plan
              (:reason (contracts/validate-result protocol :route/decide bad-type)))))))
+
+(deftest req-handoff-schema-validates-required-shape
+  (testing "Handoff schema requires :handoff/text and forbids internal think/tool markers."
+    (is (:ok? (contracts/validate-schema :req/handoff
+                                         {:handoff/text "ACID to gwarancje transakcji."
+                                          :handoff/facts ["Atomicity" "Consistency"]
+                                          :handoff/assumptions ["Zakładamy SQL DB"]
+                                          :handoff/lang :pl})))
+    (is (= :schema/invalid
+           (:reason (contracts/validate-schema :req/handoff
+                                               {:handoff/facts ["brak tekstu"]}))))
+    (is (= :schema/invalid
+           (:reason (contracts/validate-schema :req/handoff
+                                               {:handoff/text "<think>sekret</think>tekst"}))))))
 
 (deftest invoke-with-contract-enforces-route-decide-shape
   (testing "invoke-with-contract retries :route/decide until decision payload is valid."

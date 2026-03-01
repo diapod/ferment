@@ -4,7 +4,7 @@
       :author "Paweł Wilk"
       :added  "1.0.0"}
 
-    ferment.middleware.act.prepare
+    ferment.http.act.middleware.prepare
 
   (:require [ferment.system :as system]))
 
@@ -27,9 +27,9 @@
 
 (defn middleware
   ([]
-   (middleware :act.middleware/prepare nil))
+   (middleware nil nil))
   ([k _config]
-   (let [name (module-name k :act.middleware/prepare)]
+   (let [name (module-name k ::prepare)]
      {:name name
       :compile (fn [_runtime _opts]
                  (fn [next]

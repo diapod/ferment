@@ -1,0 +1,10 @@
+{
+  "proto": 1,
+  "trace": {"id": "bench-c3-solver-handoff"},
+  "session/id": "session/bench-c3",
+  "task": {"intent": "text/respond"},
+  "routing": {"meta?": true, "strict?": true, "force?": true, "debug/transcript?": true},
+  "input": {
+    "prompt": "First solve analytically, then rewrite for end-user tone. Explain CAP theorem and include one practical example. Format answer as exactly 4 bullet points, each line starting with '- '."
+  }
+}

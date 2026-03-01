@@ -1,0 +1,16 @@
+{
+  "proto": 1,
+  "trace": {
+    "id": "bench-c2-meta-strict-ll"
+  },
+  "session/id": "session/bench-c2",
+  "task": {
+    "intent": "text/respond"
+  },
+  "routing": {
+    "profile": "low-latency"
+  },
+  "input": {
+    "prompt": "Explain ACID briefly and give one example."
+  }
+}

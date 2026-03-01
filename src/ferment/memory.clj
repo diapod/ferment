@@ -91,3 +91,7 @@
   [session-store]
   (store/request-default-bindings session-store))
 
+(defn session-memory-policy
+  "Returns declarative session memory auto-write/compaction policy."
+  [session-store]
+  (store/memory-policy session-store))
