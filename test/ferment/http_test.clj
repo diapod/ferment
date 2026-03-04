@@ -560,6 +560,92 @@
       (is (pos? (double (or (get-in replay [:replay :diagnostics :telemetry :delta :act :requests])
                             0.0)))))))
 
+(deftest invoke-act-training-auto-enables-transcript-for-configured-intents
+  (testing "Training mode auto-enables debug transcript only for configured request intent set."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}
+                   :training {:enabled? true
+                              :transcript/intents #{:text/respond}}}
+          payload {:proto 1
+                   :trace {:id "t-training-transcript-on-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= true (:debug/transcript? @seen))))))
+
+(deftest invoke-act-training-does-not-enable-transcript-outside-configured-intents
+  (testing "Training mode does not force transcript for intents outside :training/:transcript-intents."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}
+                   :training {:enabled? true
+                              :transcript/intents #{:code/patch}}}
+          payload {:proto 1
+                   :trace {:id "t-training-transcript-off-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= false (contains? @seen :debug/transcript?))))))
+
+(deftest invoke-act-training-respects-request-level-training-disable
+  (testing "Request-level training/enabled? false disables training consequences from runtime defaults."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}
+                   :training {:enabled? true
+                              :transcript/intents #{:text/respond}}}
+          payload {:proto 1
+                   :trace {:id "t-training-request-disable-1"}
+                   :training/enabled? false
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= false (contains? @seen :debug/transcript?))))))
+
+(deftest invoke-act-training-respects-explicit-transcript-disable
+  (testing "Explicit routing/debug-transcript=false wins over training auto-default."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}
+                   :training {:enabled? true
+                              :transcript/intents #{:text/respond}}}
+          payload {:proto 1
+                   :trace {:id "t-training-transcript-explicit-off-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :routing {:debug/transcript? false}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= false (contains? @seen :debug/transcript?))))))
+
 (deftest act-replay-response-maps-errors-to-stable-http-statuses
   (testing "Replay endpoint response helper maps canonical replay errors to deterministic HTTP statuses."
     (is (= 404
@@ -812,16 +898,16 @@
                                      :route/decide
                                      {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Kto stworzył Clojure?\"}}</tool_call>"}
                                      :problem/solve
-                                     {:response "Clojure został stworzony przez Richa Hickeya."}
+                                     {:response "{\"text\":\"Clojure został stworzony przez Richa Hickeya. source: official Clojure docs.\",\"answer/status\":\"ok\"}"}
                                      :text/respond
                                      (if (= 1 (swap! voice-calls inc))
-                                       {:response "Nie wiem"}
+                                       {:response "{\"text\":\"Nie wiem.\",\"answer/status\":\"needs-solver\"}"}
                                        {:response (str "VOICE:" prompt)})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
       (is (= 200 (:status response)))
       (is (= [:route/decide :text/respond :problem/solve :text/respond] @calls))
-      (is (= "VOICE:Clojure został stworzony przez Richa Hickeya."
+      (is (= "VOICE:Clojure został stworzony przez Richa Hickeya. source: official Clojure docs."
              (get-in response [:body :result :out :text])))
       (is (= #{:ferment.model/meta
                :ferment.model/solver
@@ -863,9 +949,9 @@
                                    (swap! calls conj intent)
                                    (case intent
                                      :route/decide {:response ""}
-                                     :problem/solve {:response "Ryby nie piją jak ssaki; regulują gospodarkę wodną osmotycznie."}
+                                     :problem/solve {:response "{\"text\":\"Ryby nie piją jak ssaki; regulują gospodarkę wodną osmotycznie.\",\"answer/status\":\"ok\"}"}
                                      :text/respond (if (= 1 (swap! voice-calls inc))
-                                                     {:response "Nie wiem"}
+                                                     {:response "{\"text\":\"Nie wiem.\",\"answer/status\":\"needs-solver\"}"}
                                                      {:response (str "VOICE:" prompt)})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
@@ -905,10 +991,10 @@
                                      :route/decide
                                      {:response "{\"plan\":{\"nodes\":[{\"op\":\"call\",\"intent\":\"text/respond\",\"cap/id\":\"llm/voice\"}]}}"}
                                      :problem/solve
-                                     {:response "ACID to zbiór gwarancji poprawności transakcji: atomowość, spójność, izolacja, trwałość."}
+                                     {:response "{\"text\":\"ACID to zbiór gwarancji poprawności transakcji: atomowość, spójność, izolacja, trwałość.\",\"answer/status\":\"ok\"}"}
                                      :text/respond
                                      (if (= 1 (swap! voice-calls inc))
-                                       {:response "Nie wiem"}
+                                       {:response "{\"text\":\"Nie wiem.\",\"answer/status\":\"needs-solver\"}"}
                                        {:response (str "VOICE:" prompt)})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
@@ -950,10 +1036,10 @@
                                      :route/decide
                                      {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Wyjaśnij ACID jednym zdaniem.\"}}</tool_call>"}
                                      :problem/solve
-                                     {:response "ACID to zestaw gwarancji poprawności transakcji."}
+                                     {:response "{\"text\":\"ACID to zestaw gwarancji poprawności transakcji.\",\"answer/status\":\"ok\"}"}
                                      :text/respond
                                      (if (= 1 (swap! voice-calls inc))
-                                       {:response "Nie wiem"}
+                                       {:response "{\"text\":\"Nie wiem.\",\"answer/status\":\"needs-solver\"}"}
                                        {:response (str "VOICE:" prompt)})
                                      {:response "UNEXPECTED"}))]
                      (http/invoke-act runtime payload nil nil))]
@@ -966,6 +1052,10 @@
       (is (string? (get-in response [:body :result :plan/debug :nodes 2 :system])))
       (is (str/includes? (get-in response [:body :result :plan/debug :nodes 2 :system])
                          "Rewrite for tone/style only"))
+      (is (= [:schema-valid :no-truncated-ending :sufficient-detail :answer-status-present :answer-known]
+             (get-in response [:body :result :plan/debug :nodes 0 :dispatch :checks/hard])))
+      (is (= [:schema-valid :answer-status-present :fact-question-grounded]
+             (get-in response [:body :result :plan/debug :nodes 1 :dispatch :checks/hard])))
       (is (= [:schema-valid :no-truncated-ending]
              (get-in response [:body :result :plan/debug :nodes 2 :dispatch :checks/hard])))
       (is (= {:same-cap-max 2 :fallback-max 0}
@@ -987,6 +1077,156 @@
              (get-in response [:body :result :plan/run :transcript 2 :intent])))
       (is (= "ACID to zestaw gwarancji poprawności transakcji."
              (get-in response [:body :result :plan/run :transcript 2 :input :handoff/text]))))))
+
+(deftest invoke-act-meta-routing-fallbacks-to-solver-when-voice-signals-needs-solver
+  (testing "voice-primary can signal :answer/status :needs-solver which triggers protocol fallback to solver->voice-final."
+    (let [calls (atom [])
+          text-respond-calls (atom 0)
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem
+                                              :out-schema :res/problem}
+                              :text/respond {:in-schema :req/text
+                                             :out-schema :res/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 1
+                    :policy/checks {:schema-valid :builtin/schema-valid
+                                    :answer-known :builtin/answer-known
+                                    :no-truncated-ending :builtin/no-truncated-ending
+                                    :sufficient-detail :builtin/sufficient-detail}}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5f"}
+                   :task {:intent :text/respond}
+                   :routing {:meta? true
+                             :strict? true
+                             :force? true}
+                   :input {:prompt "Kim jest autor randomseed.pl?"}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide
+                                     {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Kim jest autor randomseed.pl?\"}}</tool_call>"}
+                                     :problem/solve
+                                     {:response "{\"text\":\"Autorem randomseed.pl jest Paweł Wilk. source: local-profile\",\"answer/status\":\"ok\"}"}
+                                     :text/respond
+                                     (let [attempt (swap! text-respond-calls inc)]
+                                       (if (= 1 attempt)
+                                         {:response "{\"text\":\"Nie mam pewności.\",\"answer/status\":\"needs-solver\"}"}
+                                         {:response "Autorem serwisu randomseed.pl jest Paweł Wilk."}))
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= "Autorem serwisu randomseed.pl jest Paweł Wilk."
+             (get-in response [:body :result :out :text])))
+      (is (= [:route/decide :text/respond :problem/solve :text/respond] @calls)))))
+
+(deftest invoke-act-meta-routing-fallbacks-to-solver-when-voice-omits-answer-status
+  (testing "voice-primary plain text without answer/status fails hard gate and falls back to solver."
+    (let [calls (atom [])
+          text-respond-calls (atom 0)
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem
+                                              :out-schema :res/problem}
+                              :text/respond {:in-schema :req/text
+                                             :out-schema :res/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 1
+                    :policy/checks {:schema-valid :builtin/schema-valid
+                                    :answer-status-present :builtin/answer-status-present
+                                    :answer-known :builtin/answer-known
+                                    :no-truncated-ending :builtin/no-truncated-ending
+                                    :sufficient-detail :builtin/sufficient-detail}}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5g"}
+                   :task {:intent :text/respond}
+                   :routing {:meta? true
+                             :strict? true
+                             :force? true}
+                   :input {:prompt "Kim jest autor randomseed.pl?"}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide
+                                     {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Kim jest autor randomseed.pl?\"}}</tool_call>"}
+                                     :problem/solve
+                                     {:response "{\"text\":\"Autorem randomseed.pl jest Paweł Wilk. source: local-profile\",\"answer/status\":\"ok\"}"}
+                                     :text/respond
+                                     (let [attempt (swap! text-respond-calls inc)]
+                                       (if (= 1 attempt)
+                                         {:response "Nie wiem na pewno."}
+                                         {:response "{\"text\":\"Autorem serwisu randomseed.pl jest Paweł Wilk.\",\"answer/status\":\"ok\"}"}))
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= "Autorem serwisu randomseed.pl jest Paweł Wilk."
+             (get-in response [:body :result :out :text])))
+      (is (= [:route/decide :text/respond :problem/solve :text/respond] @calls)))))
+
+(deftest invoke-act-meta-routing-keeps-short-arithmetic-answer-without-solver-fallback
+  (testing "voice-primary concise arithmetic answer should pass hard gates and avoid solver fallback."
+    (let [calls (atom [])
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem
+                                              :out-schema :res/problem}
+                              :text/respond {:in-schema :req/text
+                                             :out-schema :res/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 1
+                    :policy/checks {:schema-valid :builtin/schema-valid
+                                    :answer-status-present :builtin/answer-status-present
+                                    :answer-known :builtin/answer-known
+                                    :no-truncated-ending :builtin/no-truncated-ending
+                                    :sufficient-detail :builtin/sufficient-detail}}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing}}
+          payload {:proto 1
+                   :trace {:id "t-5arith"}
+                   :task {:intent :text/respond}
+                   :routing {:meta? true
+                             :strict? true
+                             :force? true}
+                   :input {:prompt "Ile to jest 2+2?"}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide
+                                     {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Ile to jest 2+2?\"}}</tool_call>"}
+                                     :text/respond
+                                     {:response "{\"text\":\"4\",\"answer/status\":\"ok\"}"}
+                                     :problem/solve
+                                     {:response "{\"text\":\"2 + 2 to 4. source/standard arithmetic\",\"answer/status\":\"ok\"}"}
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= "4" (get-in response [:body :result :out :text])))
+      (is (= [:route/decide :text/respond] @calls)))))
 
 (deftest invoke-act-meta-routing-softens-voice-final-list-expansion-check
   (testing "Strict meta routing may recover to solver->voice-final when primary voice fails hard list-expansion gate."
@@ -1028,7 +1268,7 @@
                                      :route/decide
                                      {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Wyjaśnij ACID jednym zdaniem.\"}}</tool_call>"}
                                      :problem/solve
-                                     {:response "ACID to zestaw gwarancji dla transakcji."}
+                                     {:response "{\"text\":\"ACID to zestaw gwarancji dla transakcji.\",\"answer/status\":\"ok\"}"}
                                      :text/respond
                                      (let [attempt (swap! text-respond-calls inc)]
                                        (cond
@@ -1044,6 +1284,76 @@
       (is (= "- atomowość.\n- spójność.\n- izolacja.\n- trwałość."
              (get-in response [:body :result :out :text])))
       (is (= [:route/decide :text/respond :problem/solve :text/respond :text/respond] @calls)))))
+
+(deftest invoke-act-meta-routing-strict-request-inherits-strict-policy-profile-limits
+  (testing "strict request without explicit profile inherits strict-meta policy limits, so voice-final retry is not cut by low-latency call-tree limit."
+    (let [calls (atom [])
+          voice-calls (atom 0)
+          routing {:intent->cap {:route/decide :llm/meta
+                                 :problem/solve :llm/solver
+                                 :text/respond :llm/voice}}
+          protocol {:intents {:route/decide {:in-schema :req/route
+                                             :result/contract {:type :plan
+                                                               :contract/kind :route/solver->voice}}
+                              :problem/solve {:in-schema :req/problem
+                                              :out-schema :res/problem}
+                              :text/respond {:in-schema :req/text
+                                             :out-schema :res/text}}
+                    :result/types [:value :plan :error]
+                    :retry/max-attempts 1
+                    :policy/checks {:schema-valid :builtin/schema-valid
+                                    :no-truncated-ending :builtin/no-truncated-ending
+                                    :answer-status-present :builtin/answer-status-present
+                                    :answer-known :builtin/answer-known
+                                    :fact-question-grounded :builtin/fact-question-grounded}}
+          runtime {:protocol protocol
+                   :resolver {:routing routing}
+                   :router {:policy :meta-decider
+                            :routing routing
+                            :defaults {:meta? false
+                                       :strict? false
+                                       :force? false
+                                       :policy/profile :low-latency}
+                            :profiles {:strict-meta {:meta? true
+                                                     :strict? true
+                                                     :force? true
+                                                     :policy/profile :high-quality}}
+                            :policy-profiles {:low-latency {:limits {:call-tree/max-calls 3
+                                                                      :call-tree/max-fallback-hops 1}}
+                                              :high-quality {:limits {:call-tree/max-calls 10
+                                                                       :call-tree/max-fallback-hops 4}}}}}
+          payload {:proto 1
+                   :trace {:id "t-strict-policy"}
+                   :task {:intent :text/respond}
+                   :routing {:meta? true
+                             :strict? true
+                             :force? true
+                             :debug/transcript? true}
+                   :input {:prompt "Kim jest autor randomseed.pl?"}}
+          response (with-redefs [core/ollama-generate!
+                                 (fn [{:keys [intent]}]
+                                   (swap! calls conj intent)
+                                   (case intent
+                                     :route/decide
+                                     {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"Kim jest autor randomseed.pl?\"}}</tool_call>"}
+                                     :problem/solve
+                                     {:response "{\"text\":\"Nie ma publicznych danych o autorze randomseed.pl. source: brak publicznego źródła\",\"answer/status\":\"unknown\"}"}
+                                     :text/respond
+                                     (let [attempt (swap! voice-calls inc)]
+                                       (if (= 1 attempt)
+                                         {:response "{\"text\":\"Nie mam pewności.\",\"answer/status\":\"needs-solver\"}"}
+                                         (if (= 2 attempt)
+                                           {:response "Brak publicznych danych o autorze randomseed.pl"}
+                                           {:response "Brak publicznych danych o autorze randomseed.pl."})))
+                                     {:response "UNEXPECTED"}))]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= [:route/decide :text/respond :problem/solve :text/respond :text/respond] @calls))
+      (is (= "Brak publicznych danych o autorze randomseed.pl."
+             (get-in response [:body :result :out :text])))
+      (is (not (contains? (get-in response [:body :result :plan/run :telemetry :calls/failure-types] {})
+                          :policy/call-tree-limit)))
+      (is (= 0 (get-in response [:body :result :plan/run :telemetry :calls/fallback-hops]))))))
 
 (deftest invoke-act-meta-routing-strict-mode-fails-closed
   (testing "strict meta routing returns 502 when the decider fails and does not execute main capability."

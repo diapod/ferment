@@ -1489,8 +1489,8 @@
       (is (= "mock" (:ferment.env/ferment.llm.mode cfg)))
       (is (false? (get-in cfg [:ferment.model.defaults/runtime :enabled?]))))))
 
-(deftest test-live-config-is-lightweight-meta-plus-bielik-voice
-  (testing "Test-live config keeps shared meta runtime and separate small Bielik voice runtime."
+(deftest test-live-config-uses-shared-meta-runtime-plus-bielik-voice
+  (testing "Test-live config keeps shared meta runtime and separate Bielik voice runtime."
     (let [cfg (system/read-configs nil
                                    "config/common/prod"
                                    "config/local/prod"

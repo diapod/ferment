@@ -287,6 +287,30 @@ If no middleware is configured, runtime falls back to canonical default modules.
   3. critic/filter stage: evaluate constitution compliance and reject/repair records (the same teacher may act as judge),
   4. artifacts + evaluation stage: persist JSONL dataset, produce metrics report, run regression suite, and enforce promotion gate.
 - design intent: train/tune smaller models via prompt-response supervision derived from teacher outputs and constitution checks.
+- practical MLX LoRA baseline command (to be tuned per hardware/model):
+
+```bash
+mlx_lm.lora \
+  --model <MODEL_OR_QUANT_MODEL> \
+  --train \
+  --data ./data \
+  --iters 1200 \
+  --batch-size 1 \
+  --grad-accumulation-steps 8 \
+  --num-layers 4 \
+  --mask-prompt \
+  --adapter-path ./adapters-proto
+```
+
+- protocol/router distillation heuristics that usually matter:
+  1. keep at least ~50% of records as edge cases (missing field, wrong type, intent conflict, unknown protocol version) with expected `errors:[...]` behavior,
+  2. include paired near-identical inputs with different expected outputs (for example `proxy-only` vs `direct`) to force robust intent/out discrimination,
+  3. use multi-turn only for flows that need it (handshake/retry/authorization); keep the rest single-shot.
+- dataset layout note for `mlx_lm.lora`:
+  - training: `./data/train.jsonl`,
+  - evaluation: `./data/test.jsonl`,
+  - validation: optional `./data/valid.jsonl`.
+- backlog note: consider automatic or semi-automatic student retraining with strict protocol gates before promotion.
 
 ## 10. Consistency with `doc/stratification.md` (no conflicts)
 

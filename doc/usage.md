@@ -453,6 +453,25 @@ Contract:
 - final user output is sanitized (no `<think>` / tool markers),
 - raw model artifacts stay only in transcript diagnostics.
 
+### 11.1) Training mode (`:training`)
+
+HTTP config supports explicit training branch:
+
+```edn
+:training {:enabled? false
+           :transcript/intents [:text/respond :code/patch]}
+```
+
+Behavior:
+- when training is enabled, replay recording defaults to `true` per request,
+- debug transcript auto-enables only for intents listed in `:transcript/intents`,
+- explicit request override still wins:
+  - `:training/enabled? false` disables training consequences for that request,
+  - `:routing {:debug/transcript? false}` keeps transcript disabled even in training mode.
+
+`test-live` profile enables training by default in:
+- `resources/config/common/test-live/training.edn`
+
 ## 12) Deterministic replay package and diff
 
 Enable replay storage in HTTP config (`resources/config/common/prod/http.edn`):
@@ -513,6 +532,36 @@ Replay comparison output includes automated policy/config diff report:
 - `comparison.policy/config.same?`
 - `comparison.policy/config.diff` (recursive `from/to` for changed fields)
 - `comparison.policy/snapshot-id` when snapshot ids diverge.
+
+### 12.1) Export replay to training JSONL (`training.event/v1` + LoRA rows)
+
+Exporter reads replay records from JSON/JSONL and writes:
+- canonical events (`training.event/v1`) to JSONL,
+- LoRA SFT rows (`prompt`/`completion`) to JSONL.
+
+Example (single replay response saved from `/v1/act/replay/<trace-id>`):
+
+```bash
+curl -s "http://127.0.0.1:12002/v1/act/replay/<trace-id>" > target/replay-trace.json
+bin/export-training-events --in target/replay-trace.json
+```
+
+Custom outputs:
+
+```bash
+bin/export-training-events \
+  --in target/replay-trace.json \
+  --out-events target/training/events-v1.jsonl \
+  --out-train data/train.jsonl \
+  --train-task :meta-protocol
+```
+
+Input contract:
+- JSON object with `:replay` branch (response shape of `/v1/act/replay/<trace-id>`), or
+- raw replay entry object, or
+- JSONL with one of the above per line.
+
+`train.jsonl` includes accepted attempts by default; use `--include-failed` to include failed attempts too.
 
 ## 13) Repeatable live benchmark pack
 

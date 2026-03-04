@@ -780,6 +780,31 @@
         local   (set (or (get-in node [:dispatch :switch-on]) #{}))]
     (into (into policy routing) local)))
 
+(defn- gateway-hedging-config
+  [resolver intent]
+  (let [gateway (gateway-config resolver)
+        hedging (if (map? (:hedging gateway))
+                  (:hedging gateway)
+                  {})
+        intent->enabled? (if (map? (:intent->enabled? hedging))
+                           (:intent->enabled? hedging)
+                           {})
+        intent-enabled? (get intent->enabled? intent)
+        enabled? (if (boolean? intent-enabled?)
+                   intent-enabled?
+                   (boolean (:enabled? hedging)))
+        max-probes (let [n (:max-probes hedging)]
+                     (if (and (integer? n) (>= (long n) 2))
+                       (int n)
+                       2))
+        delay-ms (let [n (:delay-ms hedging)]
+                   (if (and (integer? n) (>= (long n) 0))
+                     (int n)
+                     0))]
+    {:enabled? enabled?
+     :max-probes max-probes
+     :delay-ms delay-ms}))
+
 (defn- default-schema-check
   [protocol call-node result]
   (:ok? (contracts/validate-result protocol
@@ -1073,6 +1098,83 @@
           (recur (inc attempt) outcome)
           outcome)))))
 
+(defn- hedging-probe-outcome
+  [ctx env switch-on candidate-node cap-id candidate-idx same-cap-attempts]
+  (try
+    (attempt-candidate ctx
+                       env
+                       switch-on
+                       candidate-node
+                       cap-id
+                       candidate-idx
+                       same-cap-attempts)
+    (catch clojure.lang.ExceptionInfo e
+      (let [data (or (ex-data e) {})
+            failure-type (or (:failure/type data)
+                             (:error data)
+                             :policy/call-tree-limit)]
+        {:ok? false
+         :cap/id cap-id
+         :failure/type failure-type
+         :failure/recover? false
+         :details data}))
+    (catch Throwable t
+      {:ok? false
+       :cap/id cap-id
+       :failure/type :policy/call-tree-limit
+       :failure/recover? false
+       :details {:message (.getMessage t)}})))
+
+(defn- hedging-failure-winner
+  [ordered-outcomes]
+  (loop [idx 0
+         last-outcome nil]
+    (if (>= idx (count ordered-outcomes))
+      (or last-outcome
+          {:ok? false
+           :failure/type :unsupported/intent
+           :failure/recover? false})
+      (let [outcome (nth ordered-outcomes idx)]
+        (if (and (:failure/recover? outcome)
+                 (< idx (dec (count ordered-outcomes))))
+          (recur (inc idx) outcome)
+          outcome)))))
+
+(defn- probe-hedged-candidates
+  [ctx env switch-on base-node candidates start-idx end-idx same-cap-attempts delay-ms]
+  (let [window-candidates (subvec candidates start-idx end-idx)
+        total-probes (count window-candidates)
+        outcomes* (atom {})
+        winner* (promise)]
+    (doseq [[offset cap-id] (map-indexed vector window-candidates)]
+      (future
+        (let [candidate-idx (+ start-idx offset)
+              _ (when (and (pos? delay-ms) (pos? offset))
+                  (Thread/sleep (long (* offset delay-ms))))
+              candidate-node (assoc base-node :cap/id cap-id)
+              outcome (hedging-probe-outcome ctx
+                                            env
+                                            switch-on
+                                            candidate-node
+                                            cap-id
+                                            candidate-idx
+                                            same-cap-attempts)]
+          (swap! outcomes* assoc candidate-idx outcome)
+          (when (:ok? outcome)
+            (deliver winner* {:candidate-idx candidate-idx
+                              :outcome outcome})))))
+    (loop []
+      (if (realized? winner*)
+        (:outcome @winner*)
+        (if (= total-probes (count @outcomes*))
+          (let [ordered-outcomes (mapv (fn [idx]
+                                         (get @outcomes* idx))
+                                       (range start-idx end-idx))]
+            (hedging-failure-winner ordered-outcomes))
+          (do
+            (Thread/sleep 2)
+            (recur)))))))
+
 (defn- resolve-call-outcome
   [ctx env base-node switch-on candidates same-cap-attempts]
   (loop [candidate-idx 0
@@ -1082,22 +1184,46 @@
           {:ok? false
            :failure/type :unsupported/intent
            :failure/recover? false})
-      (let [cap-id (nth candidates candidate-idx)
-            _ (when (pos? candidate-idx)
+      (let [_ (when (pos? candidate-idx)
                 (ensure-fallback-hop-budget! ctx)
                 (telemetry-inc! (:telemetry* ctx) :calls/fallback-hops))
-            candidate-node (assoc base-node :cap/id cap-id)
-            candidate-outcome (attempt-candidate ctx
-                                                 env
-                                                 switch-on
-                                                 candidate-node
-                                                 cap-id
-                                                 candidate-idx
-                                                 same-cap-attempts)]
-        (if (and (:failure/recover? candidate-outcome)
-                 (< candidate-idx (dec (count candidates))))
-          (recur (inc candidate-idx) candidate-outcome)
-          candidate-outcome)))))
+            hedging (gateway-hedging-config (:resolver ctx) (:intent base-node))
+            hedging? (and (:enabled? hedging)
+                          (> (:max-probes hedging) 1)
+                          (< candidate-idx (dec (count candidates))))]
+        (if hedging?
+          (let [end-idx (long (min (count candidates)
+                                   (+ candidate-idx
+                                      (long (:max-probes hedging)))))
+                _ (doseq [_ (range (inc candidate-idx) end-idx)]
+                    (ensure-fallback-hop-budget! ctx)
+                    (telemetry-inc! (:telemetry* ctx) :calls/fallback-hops))
+                candidate-outcome (probe-hedged-candidates ctx
+                                                           env
+                                                           switch-on
+                                                           base-node
+                                                           candidates
+                                                           candidate-idx
+                                                           end-idx
+                                                           same-cap-attempts
+                                                           (:delay-ms hedging))]
+            (if (and (:failure/recover? candidate-outcome)
+                     (< end-idx (count candidates)))
+              (recur end-idx candidate-outcome)
+              candidate-outcome))
+          (let [cap-id (nth candidates candidate-idx)
+                candidate-node (assoc base-node :cap/id cap-id)
+                candidate-outcome (attempt-candidate ctx
+                                                     env
+                                                     switch-on
+                                                     candidate-node
+                                                     cap-id
+                                                     candidate-idx
+                                                     same-cap-attempts)]
+            (if (and (:failure/recover? candidate-outcome)
+                     (< candidate-idx (dec (count candidates))))
+              (recur (inc candidate-idx) candidate-outcome)
+              candidate-outcome)))))))
 
 (defn- run-let-node
   [node env emitted]

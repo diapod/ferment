@@ -138,7 +138,37 @@
     <dependency>
       <groupId>io.randomseed</groupId>
       <artifactId>utils</artifactId>
-      <version>2.0.5</version>
+      <version>2.0.9</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>utils-auth</artifactId>
+      <version>2.0.9</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>utils-core</artifactId>
+      <version>2.0.9</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>utils-db</artifactId>
+      <version>2.0.9</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>utils-crypto</artifactId>
+      <version>2.0.9</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>utils-identity</artifactId>
+      <version>2.0.9</version>
+    </dependency>
+    <dependency>
+      <groupId>io.randomseed</groupId>
+      <artifactId>utils-time</artifactId>
+      <version>2.0.9</version>
     </dependency>
     <dependency>
       <groupId>logback-bundle</groupId>

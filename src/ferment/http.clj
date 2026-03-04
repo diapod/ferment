@@ -203,6 +203,65 @@
                    (catch Throwable _ default))
     :else        default))
 
+(defn- contains-path?
+  [m path]
+  (if-not (seq path)
+    true
+    (let [k (first path)
+          tail (next path)]
+      (and (map? m)
+           (contains? m k)
+           (if (seq tail)
+             (contains-path? (get m k) tail)
+             true)))))
+
+(defn- map-bool-option
+  [m key-candidates]
+  (when (map? m)
+    (reduce (fn [_ k]
+              (if (contains? m k)
+                (reduced (coerce-bool (get m k)))
+                nil))
+            nil
+            key-candidates)))
+
+(def ^:private training-enabled-nested-keys
+  [:enabled?])
+
+(def ^:private training-enabled-top-keys
+  [:training/enabled?])
+
+(def ^:private replay-enabled-nested-keys
+  [:enabled? :enabled "enabled?" "enabled"])
+
+(def ^:private replay-enabled-top-keys
+  [:replay/enabled?
+   :replay.enabled?
+   "replay/enabled?"
+   "replay.enabled?"])
+
+(defn- normalize-act-training
+  [request]
+  (let [request' (if (map? request) request {})
+        nested-training (if (map? (:training request'))
+                          (:training request')
+                          nil)
+        enabled? (or (map-bool-option nested-training training-enabled-nested-keys)
+                     (map-bool-option request' training-enabled-top-keys))]
+    (cond-> request
+      (some? enabled?) (assoc-in [:training :enabled?] enabled?))))
+
+(defn- normalize-act-replay
+  [request]
+  (let [request' (if (map? request) request {})
+        nested-replay (if (map? (:replay request'))
+                        (:replay request')
+                        nil)
+        enabled? (or (map-bool-option nested-replay replay-enabled-nested-keys)
+                     (map-bool-option request' replay-enabled-top-keys))]
+    (cond-> request
+      (some? enabled?) (assoc-in [:replay :enabled?] enabled?))))
+
 (defn- normalize-act-routing
   [routing]
   (let [routing'    (if (map? routing) routing {})
@@ -244,25 +303,27 @@
                           (some-> request :response :type keywordish))
         stream?       (or (coerce-bool (:stream? request))
                           (coerce-bool (get-in request [:response :stream?])))]
-    (cond-> request
-      (keyword? intent)          (assoc-in [:task :intent] intent)
-      (keyword? cap-id)          (assoc-in [:task :cap/id] cap-id)
-      (map? requires)            (assoc-in [:task :requires] requires)
-      (keyword? role)            (assoc :role role)
-      (keyword? response-type)   (assoc :response/type response-type)
-      (some? stream?)            (assoc :stream? stream?)
-      (contains? request :proto) (update :proto coerce-int 1)
-      (contains? request :done)
-      (-> (update-in [:done :must] coerce-keyword-coll)
-          (update-in [:done :should] coerce-keyword-coll))
-      (contains? request :effects)
-      (update-in [:effects :allowed] coerce-keyword-coll)
-      (contains? request :budget)
-      (update-in [:budget :max-roundtrips] coerce-int nil)
-      (contains? request :constraints)
-      (update-in [:constraints :language] #(or (keywordish %) %))
-      (contains? request :routing)
-      (update :routing normalize-act-routing))))
+    (-> (cond-> request
+          (keyword? intent)          (assoc-in [:task :intent] intent)
+          (keyword? cap-id)          (assoc-in [:task :cap/id] cap-id)
+          (map? requires)            (assoc-in [:task :requires] requires)
+          (keyword? role)            (assoc :role role)
+          (keyword? response-type)   (assoc :response/type response-type)
+          (some? stream?)            (assoc :stream? stream?)
+          (contains? request :proto) (update :proto coerce-int 1)
+          (contains? request :done)
+          (-> (update-in [:done :must] coerce-keyword-coll)
+              (update-in [:done :should] coerce-keyword-coll))
+          (contains? request :effects)
+          (update-in [:effects :allowed] coerce-keyword-coll)
+          (contains? request :budget)
+          (update-in [:budget :max-roundtrips] coerce-int nil)
+          (contains? request :constraints)
+          (update-in [:constraints :language] #(or (keywordish %) %))
+          (contains? request :routing)
+          (update :routing normalize-act-routing))
+        normalize-act-training
+        normalize-act-replay)))
 
 (defn- coerce-act-request
   [payload]
@@ -674,6 +735,10 @@
   {:entries {}
    :order []})
 
+(def ^:private default-training-transcript-intents
+  #{:text/respond
+    :code/patch})
+
 (defn- normalize-act-response-cache
   [cfg]
   (let [src (if (map? (:response-cache cfg))
@@ -724,6 +789,21 @@
      :redact-keys (normalize-replay-redact-keys (:redact-keys src))
      :state state'}))
 
+(defn- normalize-training-config
+  [cfg]
+  (let [cfg' (if (map? cfg) cfg {})
+        src (if (map? (:training cfg'))
+              (:training cfg')
+              {})
+        transcript-intents
+        (if (contains? src :transcript/intents)
+          (keyword-set (:transcript/intents src))
+          default-training-transcript-intents)
+        enabled? (or (map-bool-option src training-enabled-nested-keys)
+                     (map-bool-option cfg' training-enabled-top-keys))]
+    {:enabled? (true? enabled?)
+     :transcript/intents transcript-intents}))
+
 (defn- act-cache-runtime
   [runtime]
   (let [cache (when (map? runtime) (:response-cache runtime))]
@@ -734,9 +814,70 @@
   (let [replay (when (map? runtime) (:replay runtime))]
     (when (map? replay) replay)))
 
-(defn- replay-enabled?
+(defn- runtime-training-enabled?
+  [runtime]
+  (true? (get-in runtime [:training :enabled?])))
+
+(defn- runtime-training-transcript-intents
+  [runtime]
+  (let [intents (get-in runtime [:training :transcript/intents])]
+    (if (set? intents)
+      intents
+      default-training-transcript-intents)))
+
+(defn- request-training-override
+  [request]
+  (when (contains-path? request [:training :enabled?])
+    (true? (get-in request [:training :enabled?]))))
+
+(defn- training-enabled?
+  ([runtime]
+   (runtime-training-enabled? runtime))
+  ([runtime request]
+   (if (contains-path? request [:training :enabled?])
+     (request-training-override request)
+     (runtime-training-enabled? runtime))))
+
+(defn- runtime-replay-enabled?
   [runtime]
   (true? (get-in runtime [:replay :enabled?])))
+
+(defn- replay-enabled?
+  ([runtime]
+   (or (runtime-replay-enabled? runtime)
+       (training-enabled? runtime)))
+  ([runtime request]
+   (if (contains-path? request [:replay :enabled?])
+     (true? (get-in request [:replay :enabled?]))
+     (or (training-enabled? runtime request)
+         (runtime-replay-enabled? runtime)))))
+
+(defn- training-transcript-enabled-for-request?
+  [runtime request]
+  (let [intent (some-> request :task :intent keywordish)
+        intents (runtime-training-transcript-intents runtime)]
+    (and (keyword? intent)
+         (or (contains? intents intent)
+             (contains? intents :all)
+             (contains? intents :*)))))
+
+(defn- apply-request-training-defaults
+  [runtime request]
+  (if-not (map? request)
+    request
+    (let [training? (training-enabled? runtime request)
+          transcript-enabled? (and training?
+                                   (training-transcript-enabled-for-request?
+                                    runtime
+                                    request))
+          replay-explicit? (contains-path? request [:replay :enabled?])
+          transcript-explicit? (contains-path? request [:routing :debug/transcript?])]
+      (cond-> request
+        (and training? (not replay-explicit?))
+        (assoc-in [:replay :enabled?] true)
+
+        (and transcript-enabled? (not transcript-explicit?))
+        (assoc-in [:routing :debug/transcript?] true)))))
 
 (defn- act-cache-enabled?
   [runtime]
@@ -981,12 +1122,24 @@
 
 (declare request-routing-config)
 (declare effective-routing-config)
+(declare routing-profiles)
 
 (defn- resolve-routing-policy-profile
   [runtime resolver request intent]
   (let [router-cfg (if (map? (:router runtime)) (:router runtime) {})
         routing-cfg (effective-routing-config runtime request)
         request-cfg (request-routing-config request)
+        request-policy-explicit? (or (contains? request-cfg :policy/profile)
+                                     (contains? request-cfg :policy-profile)
+                                     (contains? request-cfg :profile))
+        strict-policy-profile (when (and (true? (:strict? request-cfg))
+                                         (not request-policy-explicit?))
+                                (let [profiles (routing-profiles runtime)
+                                      strict-cfg (or (when (map? profiles)
+                                                       (get profiles :strict-meta))
+                                                     (when (map? profiles)
+                                                       (get profiles :strict)))]
+                                  (some-> strict-cfg :policy/profile keywordish)))
         intent->profile (if (map? (:intent->policy-profile router-cfg))
                           (:intent->policy-profile router-cfg)
                           {})
@@ -994,6 +1147,7 @@
                          (some-> (get intent->profile intent) keywordish))]
     (or (some-> request-cfg :policy/profile keywordish)
         (some-> request-cfg :policy-profile keywordish)
+        strict-policy-profile
         (some-> routing-cfg :policy/profile keywordish)
         (some-> routing-cfg :policy-profile keywordish)
         routed-profile
@@ -1734,32 +1888,35 @@
   ([runtime phase response auth elapsed-ms]
    (record-act-replay! runtime phase response auth elapsed-ms nil nil))
   ([runtime phase response auth elapsed-ms telemetry-before telemetry-after]
-  (when (and (replay-enabled? runtime)
-             (map? phase)
-             (map? response))
-    (let [replay-cfg (replay-runtime runtime)
-          state-atom (:state replay-cfg)
-          trace-id   (replay-trace-id phase response)]
-      (when (and (instance? clojure.lang.IAtom state-atom)
-                 (some? trace-id))
-        (let [now-ms    (System/currentTimeMillis)
-              ttl-ms    (or (parse-non-negative-long (:ttl-ms replay-cfg))
-                            default-replay-ttl-ms)
-              max-size  (or (positive-int (:max-size replay-cfg))
-                            default-replay-max-size)
-              entry0    (replay-entry phase response auth elapsed-ms replay-cfg telemetry-before telemetry-after)
-              entry     (assoc entry0 :expires-at (+ now-ms ttl-ms))]
-          (swap! state-atom
-                 (fn [state]
-                   (let [base (if (map? state) state (default-replay-state))
-                         {:keys [state]} (replay-prune-expired-state base now-ms)
-                         state' (-> state
-                                    (assoc-in [:entries trace-id] entry)
-                                    (update :order (fn [order]
-                                                     (conj (order-without order trace-id)
-                                                           trace-id))))
-                         {:keys [state]} (replay-prune-size-state state' max-size)]
-                     state)))))))
+   (let [request* (when (map? phase)
+                    (or (:request* phase)
+                        (:request phase)))]
+     (when (and (replay-enabled? runtime request*)
+                (map? phase)
+                (map? response))
+       (let [replay-cfg (replay-runtime runtime)
+             state-atom (:state replay-cfg)
+             trace-id   (replay-trace-id phase response)]
+         (when (and (instance? clojure.lang.IAtom state-atom)
+                    (some? trace-id))
+           (let [now-ms    (System/currentTimeMillis)
+                 ttl-ms    (or (parse-non-negative-long (:ttl-ms replay-cfg))
+                               default-replay-ttl-ms)
+                 max-size  (or (positive-int (:max-size replay-cfg))
+                               default-replay-max-size)
+                 entry0    (replay-entry phase response auth elapsed-ms replay-cfg telemetry-before telemetry-after)
+                 entry     (assoc entry0 :expires-at (+ now-ms ttl-ms))]
+             (swap! state-atom
+                    (fn [state]
+                      (let [base (if (map? state) state (default-replay-state))
+                            {:keys [state]} (replay-prune-expired-state base now-ms)
+                            state' (-> state
+                                       (assoc-in [:entries trace-id] entry)
+                                       (update :order (fn [order]
+                                                        (conj (order-without order trace-id)
+                                                              trace-id))))
+                            {:keys [state]} (replay-prune-size-state state' max-size)]
+                        state))))))))
   nil))
 
 (defn- replay-get
@@ -1996,33 +2153,43 @@
       (trim-s (:prompt request))))
 
 (def ^:private route-voice-preserve-system
-  "Role: VOICE. Rewrite for tone/style only. Preserve all factual claims, technical details, constraints, and examples from input handoff. Do not summarize away meaning. Keep output compact. If source text appears truncated, complete it naturally in at most two sentences, without adding new facts.")
+  "Role: VOICE. Rewrite for tone/style only. Preserve all factual claims, technical details, constraints, and examples from input handoff. Do not summarize away meaning. Keep output compact. Keep the same language as input handoff/text and do not translate it. Correct spelling, grammar, punctuation, and obvious wording defects in the final text, while preserving facts and uncertainty level exactly. Never introduce new names, entities, attributions, numbers, or sources. If the input states uncertainty/unknown, keep that uncertainty explicit in final wording. If source text appears truncated, complete it naturally in at most two sentences, without adding new facts.")
+
+(def ^:private route-voice-primary-system
+  "Role: VOICE. Always return a JSON object with keys: text and answer/status. Allowed statuses: ok, unknown, needs-solver. If uncertain or missing reliable facts use needs-solver (or unknown). For confident answers use ok. Do not use markdown wrappers.")
+
+(def ^:private route-solver-factual-system
+  "Role: SOLVER. Always return a JSON object with keys: text and answer/status. Allowed statuses: ok, unknown, needs-solver. For fact questions (who/author/identity), if you cannot provide reliable evidence in text, set answer/status to unknown. When answer/status is ok, include a short source cue in text (for example: source/according to/URL). Do not fabricate facts.")
 
 (defn- route-solver->voice-plan
   [user-prompt]
   {:nodes [{:op :call
             :intent :text/respond
             :cap/id :llm/voice
+            :system route-voice-primary-system
            :constraints {:max-chars 420}
             :budget {:max-tokens 220}
             :done {:score-min 0.85}
             :input {:prompt user-prompt}
             :as :voice-primary
-            :dispatch {:allow-failure? true
-                       :checks/hard [:schema-valid :no-truncated-ending]
-                       :checks/soft [:no-hallucinated-apis :sufficient-detail :no-list-expansion]
+             :dispatch {:allow-failure? true
+                       :checks/hard [:schema-valid :no-truncated-ending :sufficient-detail :answer-status-present :answer-known]
+                       :checks/soft [:no-hallucinated-apis :no-list-expansion]
                        :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
                        :retry {:same-cap-max 0
                                :fallback-max 0}}}
            {:op :call
-            :intent :problem/solve
+           :intent :problem/solve
             :cap/id :llm/solver
+            :system route-solver-factual-system
             :constraints {:max-chars 700}
-            :budget {:max-tokens 240}
+            :budget {:max-tokens 360}
             :done {:score-min 0.5}
             :input {:prompt user-prompt}
-            :dispatch {:checks/hard [:schema-valid]
-                       :checks/soft [:no-hallucinated-apis :no-truncated-ending]}
+            :dispatch {:checks/hard [:schema-valid :answer-status-present :fact-question-grounded]
+                       :checks/soft [:no-hallucinated-apis :no-truncated-ending]
+                       :retry {:same-cap-max 2
+                               :fallback-max 0}}
             :as :solver
             :when {:failed? :voice-primary}}
            {:op :call
@@ -2034,7 +2201,7 @@
             :input {:handoff/text {:slot/id [:solver :out :text]}}
             :constraints {:max-chars 700}
             :budget {:max-tokens 240}
-            :done {:score-min 0.0}
+            :done {:score-min 0.2}
             :dispatch {:checks/hard [:schema-valid :no-truncated-ending]
                        :checks/soft [:no-hallucinated-apis :no-list-expansion]
                        :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
@@ -2293,16 +2460,17 @@
 (defn- route-decider-opts
   [runtime resolver request cap-id intent]
   (let [route-role (router/resolve-role runtime resolver cap-id intent)
+        strict-routing? (meta-routing-strict? runtime request)
         policy-profile (resolve-routing-policy-profile runtime resolver request intent)
         policy-profiles (resolve-routing-policy-profiles runtime resolver)
         policy-cfg (if (and (keyword? policy-profile)
                             (map? policy-profiles))
                      (get policy-profiles policy-profile)
                      nil)
-        route-decider-max-chars 420
-        route-decider-max-tokens 96
-        route-decider-max-attempts 2
-        route-decider-timeout-ms 12000
+        route-decider-max-chars (if strict-routing? 320 420)
+        route-decider-max-tokens (if strict-routing? 64 96)
+        route-decider-max-attempts (if strict-routing? 1 2)
+        route-decider-timeout-ms (if strict-routing? 6000 12000)
         request-constraints (if (map? (:constraints request)) (:constraints request) {})
         request-budget (if (map? (:budget request)) (:budget request) {})
         bounded-max-chars (let [v (parse-positive-int (:max-chars request-constraints) nil)]
@@ -2665,8 +2833,9 @@
                          (and (map? request0)
                               auth-session-id
                               (nil? (:session/id request0)))
-                         (assoc :session/id auth-session-id))]
-    (request-with-session-defaults runtime request1)))
+                         (assoc :session/id auth-session-id))
+        request2       (apply-request-training-defaults runtime request1)]
+    (request-with-session-defaults runtime request2)))
 
 (defn- invoke-act-route-phase
   [runtime request accepted-mode? protocol resolver]
@@ -3116,9 +3285,7 @@
                            (and (map? runtime)
                                 (instance? clojure.lang.IAtom telemetry))
                            (assoc :telemetry telemetry))
-         replay-enabled?* (replay-enabled? runtime*)
-         telemetry-before (when (and replay-enabled?*
-                                     (instance? clojure.lang.IAtom telemetry))
+         telemetry-before (when (instance? clojure.lang.IAtom telemetry)
                             (telemetry-snapshot telemetry))
          started-at      (now-nanos)
          phase3          ((runtime-act-pipeline runtime*)
@@ -3141,13 +3308,15 @@
          elapsed-ms      (nanos->millis started-at)
          route-telemetry (:route-telemetry phase3)
          cache-telemetry (:cache/telemetry phase3)
-         request*        (:request* phase3)]
+         request*        (:request* phase3)
+         replay-enabled?* (replay-enabled? runtime* request*)]
      (record-act-telemetry! telemetry response'' elapsed-ms route-telemetry cache-telemetry)
      (let [telemetry-after (when (and replay-enabled?*
                                       (instance? clojure.lang.IAtom telemetry))
                              (telemetry-snapshot telemetry))]
-     (report-act! runtime* request* response'' auth elapsed-ms)
-       (record-act-replay! runtime* phase3 response'' auth elapsed-ms telemetry-before telemetry-after))
+       (report-act! runtime* request* response'' auth elapsed-ms)
+       (when replay-enabled?*
+         (record-act-replay! runtime* phase3 response'' auth elapsed-ms telemetry-before telemetry-after)))
      response'')))
 
 (def ^:private session-public-keys
@@ -4851,6 +5020,7 @@
           port     (parse-port (:port cfg))
           response-cache (normalize-act-response-cache cfg)
           replay (normalize-replay-config cfg)
+          training (normalize-training-config cfg)
           act-middleware (when (sequential? (:act/middleware cfg))
                            (vec (:act/middleware cfg)))
           runtime0 (let [r (if (map? (:runtime cfg)) (:runtime cfg) {})]
@@ -4863,6 +5033,8 @@
                        (assoc :response-cache response-cache)
                        (map? replay)
                        (assoc :replay replay)
+                       (map? training)
+                       (assoc :training training)
                        (seq act-middleware)
                        (assoc :act/middleware act-middleware)))
           runtime  (assoc runtime0
@@ -4907,9 +5079,10 @@
                                                  :routes (count public-routes)
                                                  :act/middleware (count (if (seq act-middleware)
                                                                           act-middleware
-                                                                          (default-act-middleware-modules)))
+                                                 (default-act-middleware-modules)))
                                                  :cache/enabled? (true? (:enabled? response-cache))
-                                                 :replay/enabled? (true? (:enabled? replay))})
+                                                 :replay/enabled? (true? (:enabled? replay))
+                                                 :training/enabled? (true? (:enabled? training))})
       {:host host
        :port port
        :server server
@@ -4917,6 +5090,7 @@
        :telemetry telemetry-state
        :response-cache response-cache
        :replay replay
+       :training training
        :routes public-routes})
     (catch Throwable t
       (telemetry/record-lifecycle! :http :error {:key _k

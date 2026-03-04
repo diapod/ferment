@@ -217,6 +217,57 @@
       (contains? violations :hallucinated/api) false
       :else true)))
 
+(defn- answer-known?
+  [call-node _env result]
+  (let [intent (keywordish (:intent call-node))]
+    (if (not (contains? #{:text/respond :problem/solve} intent))
+      true
+      (let [out (contracts/result-out-of result)
+            status (when (map? out)
+                     (keywordish (:answer/status out)))]
+        (not (contains? #{:unknown :needs-solver} status))))))
+
+(defn- answer-status-present?
+  [call-node _env result]
+  (let [intent (keywordish (:intent call-node))]
+    (if (not (contains? #{:text/respond :problem/solve} intent))
+      true
+      (let [out (contracts/result-out-of result)
+            status (when (map? out)
+                     (keywordish (:answer/status out)))]
+        (contains? #{:ok :unknown :needs-solver} status)))))
+
+(def ^:private factoid-question-pattern
+  #"(?i)\b(kto|kim|czyj|whose|who|author|autorem|autor)\b")
+
+(def ^:private source-evidence-pattern
+  #"(?i)(https?://|źr[oó]d[łl]o|source|according to|wg\.?\s)")
+
+(defn- fact-question-grounded?
+  [call-node _env result]
+  (let [intent (keywordish (:intent call-node))]
+    (if (not= :problem/solve intent)
+      true
+      (let [input (if (map? (:input call-node)) (:input call-node) {})
+            prompt (or (some-> (:prompt input) str)
+                       (some-> (:question input) str)
+                       (some-> (:problem input) str)
+                       (some-> (:task input) str))
+            factoid? (and (string? prompt)
+                          (boolean (re-find factoid-question-pattern prompt)))]
+        (if-not factoid?
+          true
+          (let [out (contracts/result-out-of result)
+                text (str/trim (or (when (string? (:text out)) (:text out))
+                                   (when (string? (:content out)) (:content out))
+                                   (when (string? out) out)
+                                   ""))
+                status (when (map? out)
+                         (keywordish (:answer/status out)))]
+            (or (contains? #{:unknown :needs-solver} status)
+                (and (= :ok status)
+                     (boolean (re-find source-evidence-pattern text))))))))))
+
 (def ^:private list-item-line-pattern
   #"(?m)^\s*(?:[-*+•]|\d+[.)])\s+")
 
@@ -249,6 +300,12 @@
 
 (def ^:private sentence-end-pattern
   #"(?is).*[.!?…](?:[\s\"'\)\]\}»”]*)$")
+
+(def ^:private concise-arithmetic-answer-pattern
+  #"(?is)^\s*[-+]?\d+(?:[.,]\d+)?\s*(?:[%]|[a-z]{1,5})?\s*$")
+
+(def ^:private concise-arithmetic-expression-pattern
+  #"(?is)^\s*[-+]?\d+(?:[.,]\d+)?(?:\s*[+\-*/]\s*[-+]?\d+(?:[.,]\d+)?)+(?:\s*=\s*[-+]?\d+(?:[.,]\d+)?)?\s*$")
 
 (def ^:private prompt-needs-example-pattern
   #"(?i)\b(example|examples|for instance|e\.g\.|przyk[łl]ad|przyk[łl]ady|na przyk[łl]ad)\b")
@@ -307,9 +364,13 @@
                      (when (string? (:content out)) (:content out))
                      (when (string? out) out)
                      "")
-            text' (str/trim text)]
+            text' (str/trim text)
+            concise-arithmetic? (and (= :text/respond intent)
+                                     (or (boolean (re-matches concise-arithmetic-answer-pattern text'))
+                                         (boolean (re-matches concise-arithmetic-expression-pattern text'))))]
         (and (not (str/blank? text'))
-             (boolean (re-matches sentence-end-pattern text')))))))
+             (or concise-arithmetic?
+                 (boolean (re-matches sentence-end-pattern text'))))))))
 
 (defn- schema-valid?
   [protocol call-node result]
@@ -321,6 +382,9 @@
 (def ^:private builtin-check-fns
   {:tests-pass tests-pass?
    :no-hallucinated-apis no-hallucinated-apis?
+   :answer-known answer-known?
+   :answer-status-present answer-status-present?
+   :fact-question-grounded fact-question-grounded?
    :no-list-expansion no-list-expansion?
    :sufficient-detail sufficient-detail?
    :no-truncated-ending no-truncated-ending?})
@@ -329,6 +393,9 @@
   {:schema-valid :builtin/schema-valid
    :tests-pass :builtin/tests-pass
    :no-hallucinated-apis :builtin/no-hallucinated-apis
+   :answer-known :builtin/answer-known
+   :answer-status-present :builtin/answer-status-present
+   :fact-question-grounded :builtin/fact-question-grounded
    :sufficient-detail :builtin/sufficient-detail
    :no-list-expansion :builtin/no-list-expansion
    :no-truncated-ending :builtin/no-truncated-ending})
@@ -343,6 +410,9 @@
 
     (= descriptor :builtin/tests-pass) tests-pass?
     (= descriptor :builtin/no-hallucinated-apis) no-hallucinated-apis?
+    (= descriptor :builtin/answer-known) answer-known?
+    (= descriptor :builtin/answer-status-present) answer-status-present?
+    (= descriptor :builtin/fact-question-grounded) fact-question-grounded?
     (= descriptor :builtin/sufficient-detail) sufficient-detail?
     (= descriptor :builtin/no-list-expansion) no-list-expansion?
     (= descriptor :builtin/no-truncated-ending) no-truncated-ending?
@@ -631,7 +701,7 @@
 (defn ollama-generate!
   "Model generator (HF/MLX command backend, mock-aware)."
   [{:keys [runtime resolver cap-id intent model prompt system mode session-id
-           max-tokens top-p]}]
+           max-tokens top-p timeout-ms]}]
   (if (= :mock mode)
     {:response (mock-llm-response {:prompt (compose-prompt system prompt)})
      :raw {:mode :mock}}
@@ -643,7 +713,8 @@
                              {:prompt prompt
                               :system system
                               :max-tokens max-tokens
-                              :top-p top-p}
+                              :top-p top-p
+                              :timeout-ms timeout-ms}
                              {:session/id session-id}))
           invoke-text (runtime-invoke-text invoke-response)]
       (cond
@@ -911,13 +982,32 @@
          (and low (str/includes? low "\"tool_call\""))
          (and low (str/includes? low "\"tool_calls\""))))))
 
+(defn- parse-answer-status
+  [v]
+  (let [k (keywordish v)]
+    (when (contains? #{:ok :unknown :needs-solver} k)
+      k)))
+
+(defn- parsed-text-out
+  [text request]
+  (let [parsed (parse-structured-text text)
+        parsed-map (when (map? parsed) parsed)
+        status (when (map? parsed-map)
+                 (parse-answer-status (:answer/status parsed-map)))
+        parsed-text (when (map? parsed-map)
+                      (or (some-> (:text parsed-map) str)
+                          (some-> (:content parsed-map) str)))
+        final-text (parse-model-text (or parsed-text text) request)]
+    (cond-> {:text final-text}
+      (keyword? status) (assoc :answer/status status))))
+
 (defn- default-result-parser
   [text {:keys [request mode]}]
-  (let [text' (parse-model-text text request)]
+  (let [out (parsed-text-out text request)]
     {:proto  1
      :trace  (:trace request)
      :result {:type  :value
-              :out   {:text text'}
+              :out   out
               :usage {:mode mode}}}))
 
 (defn- default-stream-result-parser
@@ -1008,6 +1098,7 @@
   `:value`, `:plan` or `:stream` depending on the configured parser."
   [runtime {:keys [role intent cap-id model system prompt input temperature max-tokens top-p
                    max-attempts result-parser context constraints done budget effects
+                   timeout-ms
                    requires
                    request-id trace proto session-version resolver]
             :as opts}]
@@ -1080,6 +1171,7 @@
                                                     :temperature temperature
                                                     :max-tokens max-tokens'
                                                     :top-p top-p'
+                                                    :timeout-ms timeout-ms
                                                     :mode mode})
                           text (:response result)
                           text' (if (string? text) text "")]

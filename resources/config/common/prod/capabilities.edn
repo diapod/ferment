@@ -176,6 +176,11 @@
                                                  :text/respond :latency-first
                                                  :route/decide :latency-first}
                               :ema-alpha 0.25
+                              :hedging {:enabled? false
+                                        :intent->enabled? {:text/respond false
+                                                           :problem/solve false}
+                                        :max-probes 2
+                                        :delay-ms 0}
                               :circuit-breaker {:enabled? true
                                                 :min-samples 8
                                                 :error-rate-open 0.65

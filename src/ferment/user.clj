@@ -11,7 +11,7 @@
             [next.jdbc :as jdbc]
             [ferment.auth :as auth]
             [ferment.db :as db]
-            [ferment.identity :as identity]
+            [io.randomseed.utils.identity :as identity]
             [io.randomseed.utils.auth.types :as auth-types]
             [io.randomseed.utils :refer [safe-parse-long
                                          some-keyword

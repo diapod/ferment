@@ -302,6 +302,12 @@
       n
       (long default))))
 
+(defn- optional-positive-long
+  [v]
+  (let [n (parse-positive-long v -1)]
+    (when (pos? n)
+      n)))
+
 (defn- normalize-http-endpoint
   [v default]
   (let [e (or (some-> v str str/trim not-empty)
@@ -528,10 +534,15 @@
              first)))
 
 (defn- send-http-json!
-  [url body-map worker-config]
+  [url body-map worker-config payload]
   (let [cfg                 (invoke-http-config worker-config)
         connect-timeout-ms  (parse-positive-long (:connect-timeout-ms cfg) 2000)
-        request-timeout-ms  (parse-positive-long (:timeout-ms cfg) 120000)
+        payload-timeout-ms  (or (when (map? payload)
+                                  (optional-positive-long (:timeout-ms payload)))
+                                (when (map? payload)
+                                  (optional-positive-long (:invoke/timeout-ms payload))))
+        request-timeout-ms  (or payload-timeout-ms
+                                (parse-positive-long (:timeout-ms cfg) 120000))
         method              (-> (or (:method cfg) :post) name str/lower-case)
         headers             (if (map? (:headers cfg)) (:headers cfg) {})
         request-body        (json/generate-string body-map)
@@ -598,7 +609,7 @@
     (loop [attempt 1]
       (let [outcome (try
                       {:ok? true
-                       :value (let [{:keys [status response body]} (send-http-json! url body-map worker-config)
+                       :value (let [{:keys [status response body]} (send-http-json! url body-map worker-config payload)
                                     text (or (when (map? response)
                                                (pick-response-text response worker-config))
                                              (some-> body str str/trim not-empty)
@@ -621,7 +632,7 @@
                 ;; Optional readiness probe for server-style backends.
                 (when ready-url
                   (try
-                    (send-http-json! ready-url {} (assoc worker-config :invoke/http (assoc cfg :method :get)))
+                    (send-http-json! ready-url {} (assoc worker-config :invoke/http (assoc cfg :method :get)) nil)
                     (catch Throwable _ nil)))
                 (Thread/sleep (long retry-ms))
                 (recur (inc attempt)))
@@ -992,7 +1003,12 @@
         stdout-buf (get-in runtime-state [:io :stdout])
         stderr-buf (get-in runtime-state [:io :stderr])
         lock (or (get-in runtime-state [:io :lock]) (Object.))
-        prompt (str (invoke-prompt payload) "\n")]
+        prompt (str (invoke-prompt payload) "\n")
+        payload-timeout-ms (when (map? payload)
+                             (or (optional-positive-long (:timeout-ms payload))
+                                 (optional-positive-long (:invoke/timeout-ms payload))))
+        worker-config' (cond-> worker-config
+                         (pos-int? payload-timeout-ms) (assoc :invoke/timeout-ms payload-timeout-ms))]
     (when-not (instance? Process process)
       (throw (ex-info "Runtime process is not available for invoke."
                       {:error :runtime-process-missing})))
@@ -1021,7 +1037,7 @@
                             t))))
         (let [{:keys [stdout stderr]
                :as capture} (wait-for-runtime-response!
-                             stdout-buf stderr-buf out-total0 err-total0 worker-config)
+                             stdout-buf stderr-buf out-total0 err-total0 worker-config')
               stdout' (some-> stdout str str/trim not-empty)
               stderr' (some-> stderr str str/trim not-empty)
               text (or stdout' stderr' "")]

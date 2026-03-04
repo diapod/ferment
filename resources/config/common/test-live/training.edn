@@ -1,0 +1,5 @@
+{
+ :ferment.http/default
+ {:training {:enabled? true
+             :transcript/intents [:text/respond :code/patch]}}
+}

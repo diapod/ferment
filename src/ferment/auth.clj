@@ -9,7 +9,7 @@
   (:refer-clojure :exclude [parse-long uuid random-uuid])
 
   (:require [ferment.db             :as        db]
-            [ferment.db.sql         :as       sql]
+            [io.randomseed.utils.db.sql :as   sql]
             [ferment.logging        :as       log]
             [ferment.system         :as    system]
             [ferment.proto.auth     :as         p]

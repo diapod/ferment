@@ -43,7 +43,7 @@
              (get-in protocol [:policy/intents :text/respond :done :must])))
       (is (= #{:no-hallucinated-apis :no-list-expansion}
              (get-in protocol [:policy/intents :text/respond :done :should])))
-      (is (= [:schema-valid :no-truncated-ending]
+      (is (= [:schema-valid :no-truncated-ending :answer-known]
              (get-in protocol [:policy/intents :text/respond :checks/hard])))
       (is (= [:no-hallucinated-apis :no-list-expansion :sufficient-detail]
              (get-in protocol [:policy/intents :text/respond :checks/soft])))
@@ -241,7 +241,18 @@
       (is (:ok? (contracts/validate-result protocol
                                            :text/respond
                                            {:result {:type :value
-                                                     :out {:text "ok"}}}))))))
+                                                     :out {:text "ok"}}})))
+      (is (:ok? (contracts/validate-result protocol
+                                           :text/respond
+                                           {:result {:type :value
+                                                     :out {:text "ok"
+                                                           :answer/status :needs-solver}}})))
+      (is (= :output/schema-invalid
+             (:reason (contracts/validate-result protocol
+                                                 :text/respond
+                                                 {:result {:type :value
+                                                           :out {:text "ok"
+                                                                 :answer/status :maybe}}})))))))
 
 (deftest requires-are-used-as-hard-result-contract
   (testing "Request-level :task/:requires enforces expected result type and schema."

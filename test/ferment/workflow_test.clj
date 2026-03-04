@@ -896,3 +896,47 @@
       (is (pos? (get-in @health* [:ferment.model/solver :calls] 0)))
       (is (number? (get-in @health* [:ferment.model/solver :latency/ema-ms])))
       (is (number? (get-in @health* [:ferment.model/solver :quality/ema]))))))
+
+(deftest execute-plan-hedging-selects-faster-successful-candidate
+  (testing "Gateway hedging can probe candidates in parallel and pick the fastest successful result."
+    (let [run (workflow/execute-plan
+               {:plan {:nodes [{:op :call
+                                :intent :text/respond
+                                :dispatch {:candidates [:llm/voice :llm/solver-text]
+                                           :retry {:same-cap-max 0
+                                                   :fallback-max 1}
+                                           :switch-on #{:eval/low-score}}
+                                :as :answer}
+                               {:op :emit
+                                :input {:slot/id [:answer :out]}}]}
+                :resolver {:routing {:gateway {:strategy :latency-first
+                                               :hedging {:enabled? true
+                                                         :intent->enabled? {:text/respond true}
+                                                         :max-probes 2
+                                                         :delay-ms 0}}
+                                     :intent->cap {:text/respond :llm/voice}}
+                           :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                    :cap/intents #{:text/respond}
+                                                    :cap/can-produce #{:value}
+                                                    :cap/effects-allowed #{:none}
+                                                    :dispatch/model-key :ferment.model/voice}
+                                        :llm/solver-text {:cap/id :llm/solver-text
+                                                          :cap/intents #{:text/respond}
+                                                          :cap/can-produce #{:value}
+                                                          :cap/effects-allowed #{:none}
+                                                          :dispatch/model-key :ferment.model/solver}}}
+                :invoke-call (fn [call-node _env]
+                               (case (:cap/id call-node)
+                                 :llm/voice
+                                 (do
+                                   (Thread/sleep 80)
+                                   {:result {:type :value
+                                             :out {:text "voice"}}})
+                                 :llm/solver-text
+                                 (do
+                                   (Thread/sleep 5)
+                                   {:result {:type :value
+                                             :out {:text "solver"}}})
+                                 {:error {:type :unsupported/capability}}))})]
+      (is (:ok? run))
+      (is (= {:text "solver"} (:emitted run))))))

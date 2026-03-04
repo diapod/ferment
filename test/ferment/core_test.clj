@@ -146,15 +146,17 @@
                             :system "sys"
                             :max-tokens 420
                             :top-p 0.77
+                            :timeout-ms 4321
                             :session-id "s-42"
                             :mode :live}))))
         (is (= :ferment.model/solver (:model-k @called)))
         (is (= 420 (get-in @called [:payload :max-tokens])))
         (is (= 0.77 (get-in @called [:payload :top-p])))
+        (is (= 4321 (get-in @called [:payload :timeout-ms])))
         (is (= "s-42" (get-in @called [:opts :session/id])))))))
 
 (deftest invoke-capability-forwards-budget-generation-overrides
-  (testing "invoke-capability! forwards budget :max-tokens and :top-p into runtime invoke payload."
+  (testing "invoke-capability! forwards budget :max-tokens/:top-p and timeout into runtime invoke payload."
     (let [seen (atom nil)]
       (with-redefs [core/ollama-generate!
                     (fn [opts]
@@ -166,13 +168,15 @@
                        :intent :text/respond
                        :cap-id :llm/voice
                        :input {:prompt "hej"}
+                       :timeout-ms 2222
                        :budget {:max-tokens 321
                                 :top-p 0.91}
                        :max-attempts 1})]
           (is (= :value (contracts/result-type-of result)))
           (is (= "OK" (get-in result [:result :out :text])))
           (is (= 321 (:max-tokens @seen)))
-          (is (= 0.91 (:top-p @seen))))))))
+          (is (= 0.91 (:top-p @seen)))
+          (is (= 2222 (:timeout-ms @seen))))))))
 
 (deftest model-generate-uses-capability-dispatch-model-key-from-resolver
   (testing "Generator resolves model runtime key from resolver capability metadata."
@@ -283,6 +287,22 @@
         (is (string? text))
         (is (not (str/includes? text "<think")))
         (is (= "Ferment is a multi-model orchestrator." text))))))
+
+(deftest invoke-capability-parses-answer-status-from-structured-text-output
+  (testing "For text/respond, structured JSON output may carry :answer/status for protocol-aware fallback."
+    (with-redefs [core/ollama-generate!
+                  (fn [_]
+                    {:response "{\"text\":\"Nie wiem na pewno.\",\"answer/status\":\"needs-solver\"}"})]
+      (let [result (core/invoke-capability!
+                    nil
+                    {:role :voice
+                     :intent :text/respond
+                     :cap-id :llm/voice
+                     :model "voice-model"
+                     :prompt "Kim jest autor randomseed.pl?"
+                     :max-attempts 1})]
+        (is (= "Nie wiem na pewno." (get-in result [:result :out :text])))
+        (is (= :needs-solver (get-in result [:result :out :answer/status])))))))
 
 (deftest invoke-capability-falls-back-to-think-body-for-non-voice-intents
   (testing "For non-user-facing intents, parser keeps non-empty text when output is think-only."

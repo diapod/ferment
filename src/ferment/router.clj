@@ -36,13 +36,20 @@
   #{:strategy
     :intent->strategy
     :ema-alpha
-    :circuit-breaker})
+    :circuit-breaker
+    :hedging})
 
 (def ^:private gateway-breaker-keys
   #{:enabled?
     :min-samples
     :error-rate-open
     :cooldown-ms})
+
+(def ^:private gateway-hedging-keys
+  #{:enabled?
+    :intent->enabled?
+    :max-probes
+    :delay-ms})
 
 (def ^:private routing-default-keys
   #{:meta? :strict? :force? :on-error :policy/profile})
@@ -226,6 +233,41 @@
   (when (contains? gateway :circuit-breaker)
     (validate-gateway-breaker! (:circuit-breaker gateway)
                                (conj path :circuit-breaker)))
+  (when (contains? gateway :hedging)
+    (let [hedging (:hedging gateway)
+          hpath (conj path :hedging)]
+      (ensure-keyword-map! hedging hpath)
+      (ensure-only-keys! hedging gateway-hedging-keys hpath)
+      (when (contains? hedging :enabled?)
+        (when-not (boolean? (:enabled? hedging))
+          (fail-router! "Gateway hedging :enabled? must be a boolean."
+                        {:path (conj hpath :enabled?)
+                         :expected :boolean
+                         :value (:enabled? hedging)})))
+      (when (contains? hedging :intent->enabled?)
+        (let [intent-map (:intent->enabled? hedging)
+              ipath (conj hpath :intent->enabled?)]
+          (ensure-keyword-map! intent-map ipath)
+          (doseq [[intent enabled?] intent-map]
+            (when-not (boolean? enabled?)
+              (fail-router! "Gateway hedging :intent->enabled? values must be booleans."
+                            {:path (conj ipath intent)
+                             :expected :boolean
+                             :value enabled?})))))
+      (when (contains? hedging :max-probes)
+        (let [n (:max-probes hedging)]
+          (when-not (and (integer? n) (>= (long n) 2))
+            (fail-router! "Gateway hedging :max-probes must be an integer >= 2."
+                          {:path (conj hpath :max-probes)
+                           :expected :int>=2
+                           :value n}))))
+      (when (contains? hedging :delay-ms)
+        (let [n (:delay-ms hedging)]
+          (when-not (and (integer? n) (>= (long n) 0))
+            (fail-router! "Gateway hedging :delay-ms must be a non-negative integer."
+                          {:path (conj hpath :delay-ms)
+                           :expected :non-negative-int
+                           :value n}))))))
   gateway)
 
 (defn validate-router-config!

@@ -39,6 +39,9 @@
                                "If the received source text appears truncated,"
                                "complete it stylistically in at most two"
                                "sentences while preserving original meaning."
+                               "If you are uncertain or lack reliable facts,"
+                               "you may return structured output with"
+                               "answer/status set to needs-solver."
                                "Do not expose reasoning"
                                "and do not use <think>."]
                       :coder  ["Role: CODER."
@@ -75,6 +78,9 @@
                                           "semantic compression is not."
                                           "The term 'Ferment' means this project"
                                           "(not a JavaScript library)."
+                                          "When uncertain, prefer structured output"
+                                          "with answer/status=needs-solver"
+                                          "instead of guessing."
                                           "Keep the answer to at most 4 sentences"
                                           "unless the user asks for more."]
                       :problem/solve     ["For :problem/solve return a substantive"
@@ -176,6 +182,9 @@
   :policy/checks {:schema-valid         :builtin/schema-valid
                   :tests-pass           :builtin/tests-pass
                   :no-hallucinated-apis :builtin/no-hallucinated-apis
+                  :answer-status-present :builtin/answer-status-present
+                  :answer-known         :builtin/answer-known
+                  :fact-question-grounded :builtin/fact-question-grounded
                   :no-list-expansion    :builtin/no-list-expansion
                   :no-truncated-ending  :builtin/no-truncated-ending}
 
@@ -220,7 +229,7 @@
                    :text/respond      {:done     {:must      #{:schema-valid}
                                                   :should    #{:no-hallucinated-apis :no-list-expansion}
                                                   :score-min 0.85}
-                                       :checks/hard [:schema-valid :no-truncated-ending]
+                                       :checks/hard [:schema-valid :no-truncated-ending :answer-known]
                                        :checks/soft [:no-hallucinated-apis :no-list-expansion :sufficient-detail]
                                        :fallback [:llm/voice :llm/solver-text]
                                        :judge    {:enabled?     true

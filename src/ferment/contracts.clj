@@ -165,7 +165,10 @@
 (defn- res-text?
   [v]
   (and (map? v)
-       (contains-nonblank-string? v [:text :content])))
+       (contains-nonblank-string? v [:text :content])
+       (or (not (contains? v :answer/status))
+           (contains? #{:ok :unknown :needs-solver}
+                      (keywordish (:answer/status v))))))
 
 (defn- res-problem?
   [v]

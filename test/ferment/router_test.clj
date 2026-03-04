@@ -110,7 +110,11 @@
                                    :circuit-breaker {:enabled? true
                                                      :min-samples 5
                                                      :error-rate-open 0.6
-                                                     :cooldown-ms 15000}}}})]
+                                                     :cooldown-ms 15000}
+                                   :hedging {:enabled? true
+                                             :intent->enabled? {:text/respond true}
+                                             :max-probes 2
+                                             :delay-ms 5}}}})]
       (is (= :latency-first (get-in ok [:routing :gateway :strategy])))
       (is (= :quality-first (get-in ok [:routing :gateway :intent->strategy :problem/solve]))))
     (let [err (try
@@ -133,7 +137,18 @@
                 (catch clojure.lang.ExceptionInfo e
                   (ex-data e)))]
       (is (= :router/invalid-config (:error err)))
-      (is (= [:routing :gateway :circuit-breaker :error-rate-open] (:path err))))))
+      (is (= [:routing :gateway :circuit-breaker :error-rate-open] (:path err))))
+    (let [err (try
+                (router/init-router
+                 :ferment.router/default
+                 {:routing {:intent->cap {:problem/solve :llm/solver}
+                            :gateway {:strategy :latency-first
+                                      :hedging {:max-probes 1}}}})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :router/invalid-config (:error err)))
+      (is (= [:routing :gateway :hedging :max-probes] (:path err))))))
 
 (deftest router-config-validation-validates-defaults
   (testing "Router branch validates :defaults for meta/strict/force/on-error."

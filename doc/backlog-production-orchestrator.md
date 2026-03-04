@@ -3,7 +3,9 @@
 Status: new production track for orchestration maturity.
 Existing tuning backlog is preserved in `doc/backlog.md` and the #2-#9 tuning package is marked delivered (sync: 2026-02-28).
 Completed historical work remains in `doc/backlogs-done.md`.
-Execution for top priorities is tracked in `doc/execution-plan-q1.md`.
+Execution for top priorities is tracked in:
+- `doc/execution-plan-q1.md` (priorities 1-3),
+- `doc/execution-plan-q2-distillation.md` (priority 11).
 
 ## Priority Order
 
@@ -35,14 +37,14 @@ Execution for top priorities is tracked in `doc/execution-plan-q1.md`.
      - the same replay package reproduces the same execution path,
      - policy/config diffs can be compared against replay outcomes.
 
-3. [ ] Advanced model gateway (`#3`)
+3. [x] Advanced model gateway (`#3`)
    - Add per-model health/latency/error scoring.
    - Add gateway strategies: cost-aware selection, circuit breaker, optional hedging.
    - Delivery status (sync: 2026-03-01):
      - [x] runtime model-health registry (`:gateway/model-health`) wired to resolver/workflow,
      - [x] candidate ranking strategies (`:latency-first`, `:quality-first`, `:cost-first`) via `:routing/:gateway`,
      - [x] circuit-breaker quarantine on open circuits (`:gateway/circuit-open`) with cooldown,
-     - [ ] optional hedging execution (parallel probes + winner selection).
+     - [x] optional hedging execution (parallel probes + winner selection).
    - Done when:
      - routing can pick model by policy (`latency-first`, `quality-first`, `cost-first`),
      - unstable models are automatically quarantined/fallbacked.
@@ -96,8 +98,22 @@ Execution for top priorities is tracked in `doc/execution-plan-q1.md`.
      - sensitive actions require explicit approval policy,
      - non-approved flows fail closed with clear operator feedback.
 
+11. [ ] Distillation dataset pipeline for LoRA/QLoRA (`#11`)
+   - Extend current replay/export flow into a durable, reproducible training-data pipeline.
+   - Delivery scope:
+     - persist training events in append-only storage (not only in-memory replay TTL cache),
+     - add critic/judge labels (constitution checks, score, reject/repair reason),
+     - add strict redaction/PII scrubbing before dataset export,
+     - support deterministic dataset build (`train/valid/test` split + manifest + snapshot hash),
+     - export training rows in trainer-ready format (chat template/messages and/or canonical text format),
+     - add post-train evaluation suite and promotion gate criteria.
+   - Done when:
+     - the same input snapshot reproduces identical dataset artifacts,
+     - exported datasets are directly consumable by target LoRA/QLoRA trainers,
+     - promotion decision is automated by explicit quality/latency regression thresholds.
+
 ## Suggested Delivery Phases
 
 1. Phase A (stability + operability): priorities 1, 2, 3.
 2. Phase B (resilience + memory): priorities 4, 5, 6.
-3. Phase C (quality + governance): priorities 7, 8, 9, 10.
+3. Phase C (quality + governance): priorities 7, 8, 9, 10, 11.
