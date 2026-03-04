@@ -8,7 +8,8 @@
 
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [ferment.training.events :as training-events]))
 
 (def ^:private replay-redacted-placeholder
   "[REDACTED]")
@@ -21,7 +22,12 @@
    :out-events "target/training/events-v1.jsonl"
    :out-train "target/training/train.jsonl"
    :train-task :meta-protocol
-   :include-failed? false})
+   :include-failed? false
+   :target-format :sft-prompt-completion
+   :sanity-check {:enabled? true
+                  :row/fn nil}
+   :redaction {:enabled? true}
+   :judge {:mode :rules-only}})
 
 (defn- usage
   []
@@ -36,6 +42,7 @@
     "  --out-events PATH        Output JSONL for training.event/v1 (default: target/training/events-v1.jsonl)"
     "  --out-train PATH         Output JSONL for LoRA SFT rows (default: target/training/train.jsonl)"
     "  --train-task KEYWORD     Label for training task (default: :meta-protocol)"
+    "  --target-format FORMAT   :sft-prompt-completion (default), :messages, :chatml"
     "  --include-failed         Include failed call attempts in train JSONL"
     "  -h, --help               Show this help"]))
 
@@ -235,14 +242,7 @@
   ([records]
    (replay-records->events records default-opts))
   ([records opts]
-   (->> (or records [])
-        (map normalize-replay-entry)
-        (filter replay-entry?)
-        (mapcat (fn [replay]
-                  (->> (transcript-calls replay)
-                       (map (fn [[idx call]]
-                              (transcript-entry->event replay idx call opts))))))
-         vec)))
+   (training-events/replay-records->events records opts)))
 
 (defn event->train-row
   "Converts one `training.event/v1` map to a LoRA-friendly JSONL row."
@@ -281,18 +281,121 @@
             :outcome (some-> event :response :outcome keywordish name)
             :call_latency_ms (get-in event [:timing :call/latency-ms])}}))
 
+(defn- event->messages-row
+  [event]
+  (let [request-resolved (if (map? (get-in event [:request :resolved]))
+                           (get-in event [:request :resolved])
+                           {})
+        call            (if (map? (:call event)) (:call event) {})
+        routing         (if (map? (:routing event)) (:routing event) {})
+        source          (if (map? (:source event)) (:source event) {})
+        task            (if (map? (get request-resolved :task))
+                          (get request-resolved :task)
+                          {})
+        prompt-map {:task {:intent (keywordish (:intent task))
+                           :requires (:requires task)}
+                    :input (:input call)
+                    :routing {:mode (keywordish (:mode routing))
+                              :execution-path (:execution-path routing)
+                              :policy/snapshot-id (get-in event [:policy :snapshot-id])}
+                    :call {:intent (keywordish (:intent call))
+                           :cap/id (keywordish (:cap/id call))
+                           :attempt (:attempt call)
+                           :candidate-index (:candidate-index call)}}
+        completion-map {:result {:type (keywordish (:result/type call))
+                                 :out  (:out call)}
+                        :decision {:accepted? (true? (get-in event [:labels :accepted?]))
+                                   :failure/type (keywordish (:failure/type call))}}
+        user-content (json/generate-string prompt-map)
+        assistant-content (json/generate-string completion-map)]
+    {:id (:training.event/id event)
+     :messages [{:role "system"
+                 :content "Follow protocol and produce deterministic structured output."}
+                {:role "user"
+                 :content user-content}
+                {:role "assistant"
+                 :content assistant-content}]
+     :meta {:trace_id (:trace/id source)
+            :request_id (:request/id source)
+            :intent (some-> call :intent keywordish name)
+            :cap_id (some-> call :cap/id keywordish name)
+            :status (get-in event [:response :status])
+            :outcome (some-> event :response :outcome keywordish name)
+            :call_latency_ms (get-in event [:timing :call/latency-ms])}}))
+
+(defn- event->train-row-target
+  [event target-format]
+  (case target-format
+    :messages (event->messages-row event)
+    :chatml (event->messages-row event)
+    :sft-prompt-completion (event->train-row event)
+    (event->train-row event)))
+
+(defn- valid-target-row?
+  [row target-format]
+  (case target-format
+    :sft-prompt-completion
+    (and (string? (:prompt row))
+         (not (str/blank? (:prompt row)))
+         (string? (:completion row))
+         (not (str/blank? (:completion row))))
+
+    (:messages :chatml)
+    (let [messages (:messages row)]
+      (and (vector? messages)
+           (seq messages)
+           (every? (fn [entry]
+                     (and (map? entry)
+                          (string? (:role entry))
+                          (not (str/blank? (:role entry)))
+                          (string? (:content entry))
+                          (not (str/blank? (:content entry)))))
+                   messages)))
+
+    false))
+
+(defn- run-sanity-check!
+  [row idx target-format opts]
+  (let [sanity (if (map? (:sanity-check opts))
+                 (:sanity-check opts)
+                 {})
+        enabled? (if (contains? sanity :enabled?)
+                   (true? (:enabled? sanity))
+                   true)
+        row-hook (or (:row/fn sanity)
+                     (:sanity-check/row-fn opts))]
+    (when enabled?
+      (when-not (valid-target-row? row target-format)
+        (throw (ex-info "Exported row failed built-in sanity schema check."
+                        {:error :training/export-invalid-row
+                         :target-format target-format
+                         :index idx
+                         :row row})))
+      (when (fn? row-hook)
+        (when-not (row-hook row)
+          (throw (ex-info "Exported row rejected by custom sanity hook."
+                          {:error :training/export-row-rejected
+                           :target-format target-format
+                           :index idx
+                           :row row})))))))
+
 (defn events->train-rows
   "Converts training events to LoRA JSONL rows.
   By default includes only accepted events."
   ([events]
    (events->train-rows events default-opts))
   ([events opts]
-   (let [include-failed? (true? (:include-failed? opts))]
+   (let [include-failed? (true? (:include-failed? opts))
+         target-format (or (keywordish (:target-format opts))
+                           :sft-prompt-completion)]
      (->> (or events [])
           (filter (fn [event]
                     (or include-failed?
                         (true? (get-in event [:labels :accepted?])))))
-          (map event->train-row)
+          (map #(event->train-row-target % target-format))
+          (map-indexed (fn [idx row]
+                         (run-sanity-check! row idx target-format opts)
+                         row))
           vec))))
 
 (defn- write-jsonl!
@@ -356,6 +459,14 @@
           (if-let [v (first more)]
             (recur (rest more) (assoc opts :train-task (or (keywordish v) :meta-protocol)))
             {:error "Missing value for --train-task"})
+
+          (= arg "--target-format")
+          (if-let [v (first more)]
+            (let [fmt (or (keywordish v) :sft-prompt-completion)]
+              (if (contains? #{:sft-prompt-completion :messages :chatml} fmt)
+                (recur (rest more) (assoc opts :target-format fmt))
+                {:error (str "Unsupported --target-format: " v)}))
+            {:error "Missing value for --target-format"})
 
           (= arg "--include-failed")
           (recur more (assoc opts :include-failed? true))

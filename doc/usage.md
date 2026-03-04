@@ -563,6 +563,117 @@ Input contract:
 
 `train.jsonl` includes accepted attempts by default; use `--include-failed` to include failed attempts too.
 
+Target trainer row formats:
+- `:sft-prompt-completion` (default): `{:prompt ... :completion ...}`
+- `:messages`: `{:messages [{:role ... :content ...} ...]}`
+- `:chatml`: alias to `:messages` row shape
+
+Example with explicit target format:
+
+```bash
+bin/export-training-events \
+  --in target/replay-trace.json \
+  --target-format :messages \
+  --out-train target/training/train-messages.jsonl
+```
+
+### 12.2) Build deterministic train/valid/test dataset + manifest
+
+Build reproducible dataset artifacts from replay records or canonical `training.event/v1` JSONL:
+
+```bash
+bin/build-training-dataset \
+  --in target/training/events-v1.jsonl \
+  --out-dir target/training/dataset \
+  --target-format :messages \
+  --split-seed 20260304 \
+  --train-ratio 0.8 \
+  --valid-ratio 0.1 \
+  --test-ratio 0.1
+```
+
+Idempotency behavior (default enabled):
+- source files are fingerprinted (`size`, `mtime`, optional checksum),
+- unchanged sources are skipped (`:skip/reason :idempotency/sources-unchanged`),
+- already exported `training.event/id` values are not exported again,
+- when only new events arrive, builder appends new rows (`:mode :incremental-append`).
+- when dataset config changes (split/format/include-failed/train-task), builder enforces full rebuild (`:mode :full-rebuild`, `:mode/reason :config-changed`).
+
+Input forms for `--in`:
+- single JSON/JSONL file,
+- directory with `*.json` / `*.jsonl` files (sorted by filename),
+- comma-separated list of file/directory paths.
+
+CLI idempotency options:
+- `--state-file PATH` (state under `--out-dir`, default `.dataset-state.json`),
+- `--no-source-checksum` (faster fingerprinting),
+- `--fail-on-config-change` (abort build instead of full rebuild when config hash changes),
+- `--no-idempotency` (always rebuild from input).
+
+Generated artifacts:
+- `events-v1.jsonl` (deduplicated canonical events),
+- `train.jsonl`, `valid.jsonl`, `test.jsonl` (deterministic split),
+- `manifest.json` with counts, hashes, filters, time window, and stable `snapshot/id`.
+
+Quick verification:
+
+```bash
+jq '.["snapshot/id"], .counts, .hashes, .["time/window"]' target/training/dataset/manifest.json
+```
+
+### 12.3) Offline student evaluation + promotion gate
+
+Run eval suites and promotion decision from exported training rows/events:
+
+```bash
+bin/eval-student \
+  --in target/training/events-v1.jsonl \
+  --out-report target/training/eval-report.json \
+  --out-promotion target/training/promotion-report.json
+```
+
+Use custom thresholds (CLI overrides config):
+
+```bash
+bin/eval-student \
+  --in target/training/events-v1.jsonl \
+  --overall-min 0.90 \
+  --protocol-min 0.95 \
+  --constitution-min 0.90 \
+  --regression-min 0.90 \
+  --fail-on-reject
+```
+
+Use external config files (root map expected for each branch):
+
+```bash
+cat > target/training/eval-config.edn <<'EOF'
+{:suites [:protocol-conformance :constitution-compliance :regression]
+ :report {:include-cases? true :failed-only? false}}
+EOF
+
+cat > target/training/promotion-config.edn <<'EOF'
+{:enabled? true
+ :blocking? true
+ :required-suites [:protocol-conformance :constitution-compliance :regression]
+ :thresholds {:overall/pass-rate-min 0.85
+              :suite-pass-rate-min {:protocol-conformance 0.90
+                                    :constitution-compliance 0.90
+                                    :regression 0.90}}}
+EOF
+
+bin/eval-student \
+  --in target/training/events-v1.jsonl \
+  --eval-config target/training/eval-config.edn \
+  --promotion-config target/training/promotion-config.edn
+```
+
+Notes:
+- accepted inputs: JSON array, JSONL, or line-delimited JSON objects,
+- report includes per-suite and overall pass-rate summary with deterministic `failed/case-ids`,
+- promotion report includes explicit rejection reasons and normalized threshold config,
+- with `--fail-on-reject`, process exits with code `3` on gate reject (useful for CI).
+
 ## 13) Repeatable live benchmark pack
 
 Run canonical benchmark suite against a running node:

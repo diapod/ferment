@@ -107,6 +107,13 @@ Execution for top priorities is tracked in:
      - support deterministic dataset build (`train/valid/test` split + manifest + snapshot hash),
      - export training rows in trainer-ready format (chat template/messages and/or canonical text format),
      - add post-train evaluation suite and promotion gate criteria.
+   - Delivery status (sync: 2026-03-04):
+     - [x] durable append-only training collector + export event stream tooling,
+     - [x] critic/judge labels in canonical `training.event/v1`,
+     - [x] redaction/PII scrubbing before export/build,
+     - [x] deterministic dataset builder with manifest/hash/idempotent incremental append,
+     - [x] trainer-ready export adapters (`sft-prompt-completion`, `messages`, `chatml`),
+     - [x] offline eval runner + promotion gate CLI (`bin/eval-student`) with deterministic decision reasons.
    - Done when:
      - the same input snapshot reproduces identical dataset artifacts,
      - exported datasets are directly consumable by target LoRA/QLoRA trainers,

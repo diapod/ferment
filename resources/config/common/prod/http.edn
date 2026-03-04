@@ -16,7 +16,61 @@
                                  :max-size 512
                                  :redact-keys [:password :secret :token :authorization :api-key :api/key]}
                         :training {:enabled? false
-                                   :transcript/intents [:text/respond :code/patch]}
+                                   :transcript/intents [:text/respond :code/patch]
+                                   :judge {:mode :disabled
+                                           :constitution/ref nil
+                                           :rules [:no-internal-markers
+                                                   :non-empty-output-text
+                                                   :accepted-consistent]}
+                                   :redaction {:enabled? true
+                                               :placeholder "[REDACTED]"
+                                               :deny/keys [:password :secret :token :authorization :api-key :api/key :cookie :set-cookie :email :phone :phone-number]
+                                               :deny/paths []
+                                               :deny/patterns ["(?i)bearer\\s+[a-z0-9._\\-]+"
+                                                               "(?i)api[_-]?key\\s*[:=]\\s*[^\\s,;]+"
+                                                               "(?i)[a-z0-9._%+\\-]+@[a-z0-9.\\-]+\\.[a-z]{2,}"
+                                                               "\\+?[0-9][0-9\\-\\s]{7,}[0-9]"]}
+                                   :collector {:enabled? false
+                                               :store/type :fs-jsonl
+                                               :store/path "target/training/collector"
+                                               :flush-policy :per-event
+                                               :max-file-size-bytes 8388608}
+                                   :dataset {:split {:ratios {:train 0.8
+                                                              :valid 0.1
+                                                              :test 0.1}
+                                                     :seed 1337}
+                                             :include-failed? false
+                                             :idempotency {:enabled? true
+                                                           :state-file ".dataset-state.json"
+                                                           :source-checksum? true
+                                                           :fail-on-config-change? false}}
+                                   :export {:target-format :sft-prompt-completion
+                                            :out-dir "target/training/dataset"
+                                            :out-events "target/training/events-v1.jsonl"
+                                            :out-train "target/training/train.jsonl"
+                                            :sanity-check {:enabled? true
+                                                           :row/fn nil}}
+                                   :eval {:enabled? true
+                                          :suites [:protocol-conformance
+                                                   :constitution-compliance
+                                                   :regression]
+                                          :report {:include-cases? true
+                                                   :failed-only? false}
+                                          :thresholds {:overall/pass-rate-min 0.85
+                                                       :suite-pass-rate-min {:protocol-conformance 0.90
+                                                                             :constitution-compliance 0.90
+                                                                             :regression 0.90}}}
+                                   :promotion {:enabled? true
+                                               :blocking? true
+                                               :required-suites [:protocol-conformance
+                                                                 :constitution-compliance
+                                                                 :regression]
+                                               :thresholds {:overall/pass-rate-min 0.85
+                                                            :suite-pass-rate-min {:protocol-conformance 0.90
+                                                                                  :constitution-compliance 0.90
+                                                                                  :regression 0.90}
+                                                            :max-failed-cases nil
+                                                            :max-failed-by-suite {}}}}
                         :models #ref :ferment/models
                         :auth   {:enabled? false
                                  :realm    "ferment"

@@ -4,7 +4,8 @@
             [ferment.core :as core]
             [ferment.http :as http]
             [ferment.queue :as queue]
-            [ferment.telemetry :as telemetry]))
+            [ferment.telemetry :as telemetry]
+            [ferment.training.collector :as training-collector]))
 
 (deftest invoke-act-injects-auth-principal-into-core-options
   (testing "invoke-act passes authenticated user and role policy to core execution options."
@@ -645,6 +646,194 @@
                      (http/invoke-act runtime payload nil nil))]
       (is (= 200 (:status response)))
       (is (= false (contains? @seen :debug/transcript?))))))
+
+(deftest invoke-act-training-collector-appends-events-when-enabled
+  (testing "When training collector is enabled, invoke-act appends canonical training events from transcript calls."
+    (let [appended (atom [])
+          collector (reify training-collector/TrainingCollector
+                      (append! [_ event]
+                        (swap! appended conj event)
+                        {:ok? true :duplicate? false})
+                      (flush! [_] nil)
+                      (close! [_] nil)
+                      (stats [_] {:enabled? true}))
+          runtime {:protocol {}
+                   :resolver {}
+                   :replay {:enabled? false
+                            :ttl-ms 60000
+                            :max-size 16
+                            :redact-keys #{}
+                            :state (atom {:entries {}
+                                          :order []})}
+                   :training {:enabled? true
+                              :transcript/intents #{:text/respond}
+                              :collector {:enabled? true
+                                          :instance collector}}}
+          payload {:proto 1
+                   :trace {:id "t-training-collector-on-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver _opts]
+                                   {:invoke/meta {:role :voice
+                                                  :intent :text/respond
+                                                  :cap/id :llm/voice}
+                                    :result {:type :value
+                                             :out {:text "ok"}
+                                             :plan/run {:transcript [{:op :call
+                                                                      :intent :text/respond
+                                                                      :cap/id :llm/voice
+                                                                      :as :voice-primary
+                                                                      :attempt 1
+                                                                      :candidate-index 0
+                                                                      :input {:prompt "hej"}
+                                                                      :result/type :value
+                                                                      :out {:text "ok"}
+                                                                      :latency-ms 12.3}]}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= 1 (count @appended)))
+      (is (= :text/respond (get-in (first @appended) [:call :intent])))
+      (is (= :llm/voice (get-in (first @appended) [:call :cap/id])))
+      (is (= "t-training-collector-on-1#call-0000#a1"
+             (:training.event/id (first @appended)))))))
+
+(deftest invoke-act-training-collector-respects-request-level-training-disable
+  (testing "Request-level training/enabled? false suppresses collector append."
+    (let [appended (atom [])
+          collector (reify training-collector/TrainingCollector
+                      (append! [_ event]
+                        (swap! appended conj event)
+                        {:ok? true :duplicate? false})
+                      (flush! [_] nil)
+                      (close! [_] nil)
+                      (stats [_] {:enabled? true}))
+          runtime {:protocol {}
+                   :resolver {}
+                   :replay {:enabled? false
+                            :ttl-ms 60000
+                            :max-size 16
+                            :redact-keys #{}
+                            :state (atom {:entries {}
+                                          :order []})}
+                   :training {:enabled? true
+                              :transcript/intents #{:text/respond}
+                              :collector {:enabled? true
+                                          :instance collector}}}
+          payload {:proto 1
+                   :trace {:id "t-training-collector-off-1"}
+                   :training/enabled? false
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver _opts]
+                                   {:result {:type :value
+                                             :out {:text "ok"}
+                                             :plan/run {:transcript [{:op :call
+                                                                      :intent :text/respond
+                                                                      :cap/id :llm/voice
+                                                                      :attempt 1
+                                                                      :candidate-index 0
+                                                                      :input {:prompt "hej"}
+                                                                      :result/type :value
+                                                                      :out {:text "ok"}}]}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (empty? @appended)))))
+
+(deftest invoke-act-training-collector-explicit-transcript-disable-does-not-break
+  (testing "Explicit debug/transcript? false does not break collector flow (no transcript events, no error)."
+    (let [appended (atom [])
+          seen-opts (atom nil)
+          collector (reify training-collector/TrainingCollector
+                      (append! [_ event]
+                        (swap! appended conj event)
+                        {:ok? true :duplicate? false})
+                      (flush! [_] nil)
+                      (close! [_] nil)
+                      (stats [_] {:enabled? true}))
+          runtime {:protocol {}
+                   :resolver {}
+                   :replay {:enabled? false
+                            :ttl-ms 60000
+                            :max-size 16
+                            :redact-keys #{}
+                            :state (atom {:entries {}
+                                          :order []})}
+                   :training {:enabled? true
+                              :transcript/intents #{:text/respond}
+                              :collector {:enabled? true
+                                          :instance collector}}}
+          payload {:proto 1
+                   :trace {:id "t-training-collector-transcript-off-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :routing {:debug/transcript? false}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen-opts opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= false (contains? @seen-opts :debug/transcript?)))
+      (is (empty? @appended)))))
+
+(deftest normalize-training-config-includes-dataset-and-export-branches
+  (testing "HTTP training config keeps explicit dataset/export settings with sane defaults."
+    (let [cfg {:training {:enabled? true
+                          :dataset {:split {:ratios {:train 0.75
+                                                     :valid 0.15
+                                                     :test 0.10}
+                                            :seed 20260304}
+                                    :include-failed? true
+                                    :idempotency {:enabled? false
+                                                  :source-checksum? false
+                                                  :fail-on-config-change? true
+                                                  :state-file "state-custom.json"}}
+                          :export {:target-format :messages
+                                   :out-dir "target/training/custom"
+                                   :out-events "target/training/custom/events.jsonl"
+                                   :out-train "target/training/custom/train.jsonl"}
+                          :eval {:enabled? false
+                                 :thresholds {:overall/pass-rate-min 0.9}}
+                          :promotion {:enabled? true
+                                      :blocking? false
+                                      :thresholds {:overall/pass-rate-min 0.92}}}}
+          training (#'ferment.http/normalize-training-config cfg)
+          defaults-training (#'ferment.http/normalize-training-config
+                             {:training {:dataset {:split {:seed 7}}
+                                         :export {:sanity-check {:enabled? false}}}})]
+      (is (= true (:enabled? training)))
+      (is (= 20260304 (get-in training [:dataset :split :seed])))
+      (is (= 0.75 (get-in training [:dataset :split :ratios :train])))
+      (is (= true (get-in training [:dataset :include-failed?])))
+      (is (= false (get-in training [:dataset :idempotency :enabled?])))
+      (is (= false (get-in training [:dataset :idempotency :source-checksum?])))
+      (is (= true (get-in training [:dataset :idempotency :fail-on-config-change?])))
+      (is (= "state-custom.json" (get-in training [:dataset :idempotency :state-file])))
+      (is (= :messages (get-in training [:export :target-format])))
+      (is (= "target/training/custom" (get-in training [:export :out-dir])))
+      (is (= "target/training/custom/events.jsonl" (get-in training [:export :out-events])))
+      (is (= "target/training/custom/train.jsonl" (get-in training [:export :out-train])))
+      (is (= false (get-in training [:eval :enabled?])))
+      (is (= 0.9 (get-in training [:eval :thresholds :overall/pass-rate-min])))
+      (is (= true (get-in training [:promotion :enabled?])))
+      (is (= false (get-in training [:promotion :blocking?])))
+      (is (= 0.92 (get-in training [:promotion :thresholds :overall/pass-rate-min])))
+      (is (= 0.8 (get-in defaults-training [:dataset :split :ratios :train])))
+      (is (= 0.1 (get-in defaults-training [:dataset :split :ratios :valid])))
+      (is (= 0.1 (get-in defaults-training [:dataset :split :ratios :test])))
+      (is (= true (get-in defaults-training [:dataset :idempotency :enabled?])))
+      (is (= true (get-in defaults-training [:dataset :idempotency :source-checksum?])))
+      (is (= false (get-in defaults-training [:dataset :idempotency :fail-on-config-change?])))
+      (is (= false (get-in defaults-training [:export :sanity-check :enabled?])))
+      (is (= true (get-in defaults-training [:eval :enabled?])))
+      (is (= true (get-in defaults-training [:promotion :blocking?])))
+      (is (contains? (get-in defaults-training [:export :sanity-check]) :row/fn)))))
 
 (deftest act-replay-response-maps-errors-to-stable-http-statuses
   (testing "Replay endpoint response helper maps canonical replay errors to deterministic HTTP statuses."

@@ -26,6 +26,8 @@
             [ferment.router :as router]
             [ferment.system :as system]
             [ferment.telemetry :as telemetry]
+            [ferment.training.collector :as training-collector]
+            [ferment.training.events :as training-events]
             [ferment.workflow :as workflow]
             [io.randomseed.utils.ip :as ip])
 
@@ -739,6 +741,155 @@
   #{:text/respond
     :code/patch})
 
+(def ^:private default-training-collector-config
+  {:enabled? false
+   :store/type :fs-jsonl
+   :store/path "target/training/collector"
+   :flush-policy :per-event
+   :max-file-size-bytes (* 8 1024 1024)})
+
+(def ^:private default-training-judge-config
+  {:mode :disabled
+   :constitution/ref nil
+   :rules [:no-internal-markers
+           :non-empty-output-text
+           :accepted-consistent]})
+
+(def ^:private default-training-redaction-config
+  {:enabled? true
+   :placeholder "[REDACTED]"
+   :deny/keys [:password :secret :token :authorization :api-key :api/key :cookie :set-cookie :email :phone :phone-number]
+   :deny/paths []
+   :deny/patterns ["(?i)bearer\\s+[a-z0-9._\\-]+"
+                   "(?i)api[_-]?key\\s*[:=]\\s*[^\\s,;]+"
+                   "(?i)[a-z0-9._%+\\-]+@[a-z0-9.\\-]+\\.[a-z]{2,}"
+                   "\\+?[0-9][0-9\\-\\s]{7,}[0-9]"]})
+
+(def ^:private default-training-dataset-config
+  {:split {:ratios {:train 0.8
+                    :valid 0.1
+                    :test 0.1}
+           :seed 1337}
+   :include-failed? false
+   :idempotency {:enabled? true
+                 :state-file ".dataset-state.json"
+                 :source-checksum? true
+                 :fail-on-config-change? false}})
+
+(def ^:private default-training-export-config
+  {:target-format :sft-prompt-completion
+   :out-dir "target/training/dataset"
+   :out-events "target/training/events-v1.jsonl"
+   :out-train "target/training/train.jsonl"
+   :sanity-check {:enabled? true
+                  :row/fn nil}})
+
+(def ^:private default-training-eval-config
+  {:enabled? true
+   :suites [:protocol-conformance
+            :constitution-compliance
+            :regression]
+   :report {:include-cases? true
+            :failed-only? false}
+   :thresholds {:overall/pass-rate-min 0.85
+                :suite-pass-rate-min {:protocol-conformance 0.90
+                                      :constitution-compliance 0.90
+                                      :regression 0.90}}})
+
+(def ^:private default-training-promotion-config
+  {:enabled? true
+   :blocking? true
+   :required-suites [:protocol-conformance
+                     :constitution-compliance
+                     :regression]
+   :thresholds {:overall/pass-rate-min 0.85
+                :suite-pass-rate-min {:protocol-conformance 0.90
+                                      :constitution-compliance 0.90
+                                      :regression 0.90}
+                :max-failed-cases nil
+                :max-failed-by-suite {}}})
+
+(defn- normalize-training-dataset-config
+  [v]
+  (let [src (if (map? v) v {})
+        split-src (if (map? (:split src))
+                    (:split src)
+                    {})
+        idempotency-src (if (map? (:idempotency src))
+                          (:idempotency src)
+                          {})
+        ratios-src (if (map? (:ratios split-src))
+                     (:ratios split-src)
+                     {})
+        cfg (-> default-training-dataset-config
+                (merge src)
+                (assoc :split (merge (:split default-training-dataset-config)
+                                     split-src))
+                (assoc :idempotency
+                       (merge (:idempotency default-training-dataset-config)
+                              idempotency-src))
+                (assoc-in [:split :ratios]
+                          (merge (get-in default-training-dataset-config [:split :ratios])
+                                 ratios-src)))]
+    (cond-> cfg
+      (contains? src :include-failed?)
+      (assoc :include-failed? (true? (:include-failed? src)))
+
+      (contains? idempotency-src :enabled?)
+      (assoc-in [:idempotency :enabled?]
+                (true? (:enabled? idempotency-src)))
+
+      (contains? idempotency-src :source-checksum?)
+      (assoc-in [:idempotency :source-checksum?]
+                (true? (:source-checksum? idempotency-src)))
+
+      (contains? idempotency-src :fail-on-config-change?)
+      (assoc-in [:idempotency :fail-on-config-change?]
+                (true? (:fail-on-config-change? idempotency-src))))))
+
+(defn- normalize-training-export-config
+  [v]
+  (let [src (if (map? v) v {})
+        sanity-src (if (map? (:sanity-check src))
+                     (:sanity-check src)
+                     {})
+        cfg (-> default-training-export-config
+                (merge src)
+                (assoc :sanity-check
+                       (merge (:sanity-check default-training-export-config)
+                              sanity-src)))]
+    (if (contains? sanity-src :enabled?)
+      (assoc-in cfg [:sanity-check :enabled?]
+                (true? (:enabled? sanity-src)))
+      cfg)))
+
+(defn- normalize-training-eval-config
+  [v]
+  (let [src (if (map? v) v {})
+        report-src (if (map? (:report src))
+                     (:report src)
+                     {})
+        thresholds-src (if (map? (:thresholds src))
+                         (:thresholds src)
+                         {})]
+    (-> default-training-eval-config
+        (merge src)
+        (assoc :report (merge (:report default-training-eval-config)
+                              report-src))
+        (assoc :thresholds (merge (:thresholds default-training-eval-config)
+                                  thresholds-src)))))
+
+(defn- normalize-training-promotion-config
+  [v]
+  (let [src (if (map? v) v {})
+        thresholds-src (if (map? (:thresholds src))
+                         (:thresholds src)
+                         {})]
+    (-> default-training-promotion-config
+        (merge src)
+        (assoc :thresholds (merge (:thresholds default-training-promotion-config)
+                                  thresholds-src)))))
+
 (defn- normalize-act-response-cache
   [cfg]
   (let [src (if (map? (:response-cache cfg))
@@ -795,6 +946,27 @@
         src (if (map? (:training cfg'))
               (:training cfg')
               {})
+        collector-raw (if (map? (:collector src))
+                        (:collector src)
+                        {})
+        judge-raw (if (map? (:judge src))
+                    (:judge src)
+                    {})
+        redaction-raw (if (map? (:redaction src))
+                        (:redaction src)
+                        {})
+        dataset-raw (if (map? (:dataset src))
+                      (:dataset src)
+                      {})
+        export-raw (if (map? (:export src))
+                     (:export src)
+                     {})
+        eval-raw (if (map? (:eval src))
+                   (:eval src)
+                   {})
+        promotion-raw (if (map? (:promotion src))
+                        (:promotion src)
+                      {})
         transcript-intents
         (if (contains? src :transcript/intents)
           (keyword-set (:transcript/intents src))
@@ -802,7 +974,15 @@
         enabled? (or (map-bool-option src training-enabled-nested-keys)
                      (map-bool-option cfg' training-enabled-top-keys))]
     {:enabled? (true? enabled?)
-     :transcript/intents transcript-intents}))
+     :transcript/intents transcript-intents
+     :collector (training-collector/normalize-config
+                 (merge default-training-collector-config collector-raw))
+     :judge (merge default-training-judge-config judge-raw)
+     :redaction (merge default-training-redaction-config redaction-raw)
+     :dataset (normalize-training-dataset-config dataset-raw)
+     :export (normalize-training-export-config export-raw)
+     :eval (normalize-training-eval-config eval-raw)
+     :promotion (normalize-training-promotion-config promotion-raw)}))
 
 (defn- act-cache-runtime
   [runtime]
@@ -824,6 +1004,18 @@
     (if (set? intents)
       intents
       default-training-transcript-intents)))
+
+(defn- runtime-training-collector
+  [runtime]
+  (let [collector (get-in runtime [:training :collector])]
+    (when (map? collector)
+      collector)))
+
+(defn- runtime-training-collector-instance
+  [runtime]
+  (let [instance (:instance (runtime-training-collector runtime))]
+    (when (satisfies? training-collector/TrainingCollector instance)
+      instance)))
 
 (defn- request-training-override
   [request]
@@ -1884,6 +2076,29 @@
      :diagnostics (replay-diagnostics phase response telemetry-before telemetry-after)
      :timing {:elapsed-ms (double (or elapsed-ms 0.0))}}))
 
+(defn- append-training-events!
+  [runtime request* replay-entry]
+  (let [collector (runtime-training-collector-instance runtime)
+        training-cfg (if (map? (:training runtime))
+                       (:training runtime)
+                       {})
+        event-opts {:judge (:judge training-cfg)
+                    :redaction (:redaction training-cfg)}]
+    (when (and (some? collector)
+               (training-enabled? runtime request*)
+               (map? replay-entry))
+      (doseq [event (training-events/replay-entry->events replay-entry event-opts)]
+        (let [append-result (training-collector/append! collector event)]
+          (when-not (:ok? append-result)
+            (telemetry/record-lifecycle!
+             :training/collector
+             :error
+             {:error :training/collector-append-failed
+              :training.event/id (:training.event/id event)
+              :trace/id (or (:trace/id replay-entry)
+                            (get-in replay-entry [:request :resolved :trace :id]))
+              :details append-result})))))))
+
 (defn- record-act-replay!
   ([runtime phase response auth elapsed-ms]
    (record-act-replay! runtime phase response auth elapsed-ms nil nil))
@@ -1916,8 +2131,9 @@
                                                         (conj (order-without order trace-id)
                                                               trace-id))))
                             {:keys [state]} (replay-prune-size-state state' max-size)]
-                        state))))))))
-  nil))
+                        state)))
+             (append-training-events! runtime request* entry)))))
+     nil)))
 
 (defn- replay-get
   [runtime trace-id]
@@ -5000,6 +5216,65 @@
       (write-response! exchange 200 (encode-response {:ok? true
                                                       :routes routes})))))
 
+(defn- init-training-runtime
+  [training]
+  (let [training' (if (map? training) training {})
+        collector-cfg (if (map? (:collector training'))
+                        (:collector training')
+                        (training-collector/normalize-config nil))]
+    (if-not (:enabled? collector-cfg)
+      (assoc training' :collector (assoc collector-cfg :instance nil))
+      (try
+        (let [collector-instance (training-collector/init-collector collector-cfg)
+              collector-stats (when (some? collector-instance)
+                                (training-collector/stats collector-instance))]
+          (telemetry/record-lifecycle!
+           :training/collector
+           :start
+           {:enabled? true
+            :store/type (:store/type collector-cfg)
+            :store/path (:store/path collector-cfg)
+            :flush-policy (:flush-policy collector-cfg)
+            :max-file-size-bytes (:max-file-size-bytes collector-cfg)
+            :stats collector-stats})
+          (assoc training' :collector (assoc collector-cfg :instance collector-instance)))
+        (catch Throwable t
+          (telemetry/record-lifecycle!
+           :training/collector
+           :error
+           {:error :training/collector-init-failed
+            :message (.getMessage t)
+            :store/type (:store/type collector-cfg)
+            :store/path (:store/path collector-cfg)})
+          (assoc training'
+                 :collector
+                 (assoc collector-cfg
+                        :enabled? false
+                        :instance nil
+                        :init/error (.getMessage t))))))))
+
+(defn- stop-training-runtime!
+  [training]
+  (let [collector (get-in training [:collector :instance])]
+    (when (satisfies? training-collector/TrainingCollector collector)
+      (try
+        (let [collector-stats (training-collector/stats collector)]
+          (training-collector/close! collector)
+          (telemetry/record-lifecycle!
+           :training/collector
+           :stop
+           {:stats collector-stats
+            :store/type (get-in training [:collector :store/type])
+            :store/path (get-in training [:collector :store/path])}))
+        (catch Throwable t
+          (telemetry/record-lifecycle!
+           :training/collector
+           :error
+           {:error :training/collector-stop-failed
+            :message (.getMessage t)
+            :store/type (get-in training [:collector :store/type])
+            :store/path (get-in training [:collector :store/path])}))))))
+
 (defn preconfigure-http
   "Pre-configuration hook for HTTP bridge."
   [_k config]
@@ -5021,6 +5296,7 @@
           response-cache (normalize-act-response-cache cfg)
           replay (normalize-replay-config cfg)
           training (normalize-training-config cfg)
+          training-runtime (init-training-runtime training)
           act-middleware (when (sequential? (:act/middleware cfg))
                            (vec (:act/middleware cfg)))
           runtime0 (let [r (if (map? (:runtime cfg)) (:runtime cfg) {})]
@@ -5033,8 +5309,8 @@
                        (assoc :response-cache response-cache)
                        (map? replay)
                        (assoc :replay replay)
-                       (map? training)
-                       (assoc :training training)
+                       (map? training-runtime)
+                       (assoc :training training-runtime)
                        (seq act-middleware)
                        (assoc :act/middleware act-middleware)))
           runtime  (assoc runtime0
@@ -5082,7 +5358,8 @@
                                                  (default-act-middleware-modules)))
                                                  :cache/enabled? (true? (:enabled? response-cache))
                                                  :replay/enabled? (true? (:enabled? replay))
-                                                 :training/enabled? (true? (:enabled? training))})
+                                                 :training/enabled? (true? (:enabled? training-runtime))
+                                                 :training/collector-enabled? (true? (get-in training-runtime [:collector :enabled?]))})
       {:host host
        :port port
        :server server
@@ -5090,7 +5367,7 @@
        :telemetry telemetry-state
        :response-cache response-cache
        :replay replay
-       :training training
+       :training training-runtime
        :routes public-routes})
     (catch Throwable t
       (telemetry/record-lifecycle! :http :error {:key _k
@@ -5100,6 +5377,7 @@
 (defn stop-http
   "Stops HTTP bridge."
   [_k state]
+  (stop-training-runtime! (:training state))
   (when-some [^HttpServer server (:server state)]
     (.stop server 0))
   (when-some [^ExecutorService executor (:executor state)]
