@@ -8,9 +8,19 @@
     ferment.runtime-test
 
   (:require [clojure.test :refer [deftest is testing]]
+            [ferment.execution-graph :as execution-graph]
             [ferment.queue :as queue]
             [ferment.runtime :as runtime]
             [ferment.telemetry :as telemetry]))
+
+(defn- tmp-events-path
+  [suffix]
+  (str (System/getProperty "java.io.tmpdir")
+       "/ferment-runtime-test-"
+       suffix
+       "-"
+       (System/currentTimeMillis)
+       ".ednl"))
 
 (defn- await-job-status
   [service job-id statuses timeout-ms]
@@ -186,3 +196,48 @@
       (is (= :unsupported/intent (get-in result [:error :type])))
       (is (= :result-type/not-supported
              (get-in result [:error :details :rejected-candidates 0 :reason]))))))
+
+(deftest init-runtime-restores-inflight-jobs-from-execution-graph
+  (testing "Runtime restores queued/running jobs from durable execution graph on startup."
+    (let [path (tmp-events-path "resume")
+          graph-cfg {:enabled? true
+                     :store/type :fs-ednl
+                     :store/path path}
+          graph (execution-graph/init-service graph-cfg)
+          _ (execution-graph/append-event! graph
+                                           {:event/type :job/submitted
+                                            :job/id "job/42"
+                                            :run/id "job/42"
+                                            :trace/id "resume-42"
+                                            :request {:proto 1
+                                                      :trace {:id "resume-42"}
+                                                      :task {:intent :text/respond}
+                                                      :input {:prompt "hej"}}})
+          _ (execution-graph/append-event! graph
+                                           {:event/type :job/running
+                                            :job/id "job/42"})
+          _ (execution-graph/append-event! graph
+                                           {:event/type :node/succeeded
+                                            :job/id "job/42"
+                                            :checkpoint {:next-index 1
+                                                         :env {:seed "x"}
+                                                         :emitted nil}})
+          state (runtime/init-runtime
+                 :ferment.runtime/default
+                 {:protocol {}
+                  :router {:routing {:intent->cap {:text/respond :llm/voice}}}
+                  :resolver {:routing {:intent->cap {:text/respond :llm/voice}}}
+                  :execution-graph graph-cfg
+                  :queue {:enabled? true
+                          :workers 0
+                          :max-size 8}})
+          queue-service (:queue/service state)
+          restored (queue/get-job queue-service "job/42")]
+      (try
+        (is (:ok? restored))
+        (is (contains? #{:queued :running}
+                       (get-in restored [:job :job/status])))
+        (is (map? (get-in restored [:job :request :workflow/resume-checkpoint])))
+        (is (= 1 (get-in restored [:job :request :workflow/resume-checkpoint :next-index])))
+        (finally
+          (runtime/stop-runtime :ferment.runtime/default state))))))

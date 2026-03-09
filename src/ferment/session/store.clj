@@ -140,10 +140,17 @@
    :class/policy             {}
    :request/default-bindings {}
    :memory/policy            {:enabled? false
+                              :read/default? true
+                              :read/by-intent {}
                               :write/default? false
                               :write/by-intent {}
                               :write/key :context/summary
                               :write/max-chars 1200
+                              :principal/isolation? false
+                              :principal/key :context/principal-id
+                              :history/enabled? false
+                              :history/key :context/history
+                              :history/max-items 8
                               :compaction/trigger-chars 1200
                               :compaction/target-chars 900
                               :compaction/mode :truncate}})
@@ -316,6 +323,17 @@
         enabled? (if (contains? src :enabled?)
                    (truthy? (:enabled? src))
                    (:enabled? defaults))
+        read-default? (if (contains? src :read/default?)
+                        (truthy? (:read/default? src))
+                        (:read/default? defaults))
+        read-by-intent (if (map? (:read/by-intent src))
+                         (reduce-kv (fn [acc k v]
+                                      (if-some [intent (keywordish k)]
+                                        (assoc acc intent (truthy? v))
+                                        acc))
+                                    {}
+                                    (:read/by-intent src))
+                         (:read/by-intent defaults))
         write-default? (if (contains? src :write/default?)
                          (truthy? (:write/default? src))
                          (:write/default? defaults))
@@ -338,13 +356,32 @@
                          (:compaction/target-chars defaults)
                          target-default)
         target-chars' (min trigger-chars target-chars)
+        principal-isolation? (if (contains? src :principal/isolation?)
+                               (truthy? (:principal/isolation? src))
+                               (:principal/isolation? defaults))
+        principal-key (or (keywordish (:principal/key src))
+                          (:principal/key defaults))
+        history-enabled? (if (contains? src :history/enabled?)
+                           (truthy? (:history/enabled? src))
+                           (:history/enabled? defaults))
+        history-key (or (keywordish (:history/key src))
+                        (:history/key defaults))
+        history-max-items (or (positive-int (:history/max-items src) nil)
+                              (:history/max-items defaults))
         mode (or (keywordish (:compaction/mode src))
                  (:compaction/mode defaults))]
     {:enabled? enabled?
+     :read/default? read-default?
+     :read/by-intent read-by-intent
      :write/default? write-default?
      :write/by-intent write-by-intent
      :write/key write-key
      :write/max-chars write-max-chars
+     :principal/isolation? principal-isolation?
+     :principal/key principal-key
+     :history/enabled? history-enabled?
+     :history/key history-key
+     :history/max-items history-max-items
      :compaction/trigger-chars trigger-chars
      :compaction/target-chars target-chars'
      :compaction/mode mode}))

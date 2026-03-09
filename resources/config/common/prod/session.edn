@@ -76,12 +76,26 @@
                              :coerce :trimmed-string}}
    :memory/policy
    {:enabled? true
+    :read/default? true
+    :read/by-intent {:text/respond true
+                     :problem/solve true
+                     :context/summarize true
+                     :code/generate false
+                     :code/patch false
+                     :code/explain false
+                     :code/review false
+                     :eval/grade false}
     :write/default? false
     :write/by-intent {:text/respond true
                       :problem/solve true
                       :context/summarize true}
     :write/key :context/summary
     :write/max-chars 1200
+    :principal/isolation? true
+    :principal/key :context/principal-id
+    :history/enabled? true
+    :history/key :context/history
+    :history/max-items 8
     :compaction/trigger-chars 1200
     :compaction/target-chars 900
     :compaction/mode :truncate}

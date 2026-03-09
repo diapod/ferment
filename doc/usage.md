@@ -235,6 +235,34 @@ Freeze behavior on write/delete:
 - when session is frozen, permission is checked per key class first,
 - if class rule is missing, runtime falls back to global `:freeze/allow-write?` / `:freeze/allow-delete?`.
 
+Long-term memory policy layer (`#7`) is configured under `:session-vars/contract :memory/policy`:
+- `:read/default?` + `:read/by-intent` control whether default context bindings are injected into `/v1/act` input for a given intent.
+- `:write/default?` + `:write/by-intent` control whether `/v1/act` writes memory summary for a given intent.
+- `:principal/isolation? true` with `:principal/key` prevents context recall across principals; if request principal and stored principal differ, context bindings are skipped.
+- `:history/enabled? true` with `:history/key` and `:history/max-items` keeps bounded memory history (oldest entries are evicted deterministically).
+
+Telemetry for principal-isolation blocks is exposed at:
+- `/diag/telemetry` -> `telemetry.orchestration["context/principal-isolation"].blocked`
+
+Example policy fragment:
+
+```edn
+:memory/policy
+{:enabled? true
+ :read/default? true
+ :read/by-intent {:text/respond true
+                  :problem/solve true
+                  :code/patch false}
+ :write/default? false
+ :write/by-intent {:text/respond true
+                   :problem/solve true}
+ :principal/isolation? true
+ :principal/key :context/principal-id
+ :history/enabled? true
+ :history/key :context/history
+ :history/max-items 8}
+```
+
 ```bash
 # Write a var in namespace "request" (allowed for put operation by default policy)
 curl -s http://127.0.0.1:12002/v1/session \

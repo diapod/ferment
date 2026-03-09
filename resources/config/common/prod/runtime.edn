@@ -36,6 +36,11 @@
    :retry {:max-attempts 2
            :base-backoff-ms 100
            :jitter-ms 25}}
+  :execution-graph
+  {:enabled? false
+   :store/type :fs-ednl
+   :store/path "target/runtime/execution-graph/events.ednl"
+   :max-events 200000}
   :oplog    #ref :ferment.logging/oplog}
 
  }

@@ -49,16 +49,26 @@ Execution for top priorities is tracked in:
      - routing can pick model by policy (`latency-first`, `quality-first`, `cost-first`),
      - unstable models are automatically quarantined/fallbacked.
 
-4. [ ] Durable execution graph (`#1`)
+4. [x] Durable execution graph (`#1`)
    - Persist workflow state by node (`pending/running/succeeded/failed`).
    - Add resume after process crash/restart.
+   - Delivery status (sync: 2026-03-05):
+     - [x] durable node lifecycle events with persisted checkpoints (`:node/succeeded` + `:checkpoint`),
+     - [x] runtime startup recovery from execution-graph into async queue (`resume-queued-jobs!`),
+     - [x] tool-node pre-commit checkpoint before outer loop finalization (prevents side-effect re-run on crash window),
+     - [x] regression coverage for crash/resume and runtime restore (`ferment.workflow-test`, `ferment.runtime-test`, `ferment.execution-graph-test`).
    - Done when:
      - in-flight plans can be resumed without duplicating side effects,
      - recovery path is covered by integration tests.
 
-5. [ ] Long-term memory policy layer (`#7`)
+5. [x] Long-term memory policy layer (`#7`)
    - Extend session memory with retrieval/summarization policy and bounded retention.
    - Add anti-contamination rules across sessions/principals.
+   - Delivery status (synced: 2026-03-06):
+     - [x] intent-aware memory read/write policy (`:memory/policy` with `:read/by-intent`, `:write/by-intent`),
+     - [x] principal-isolation guard for context recall (`:principal/isolation?`, `:principal/key`) with telemetry counter for blocked recalls,
+     - [x] bounded history retention (`:history/enabled?`, `:history/key`, `:history/max-items`) on memory auto-write,
+     - [x] regression tests for policy normalization, recall gating, and bounded history persistence.
    - Done when:
      - memory improves multi-turn consistency without unbounded growth,
      - recall behavior is explicit and testable.

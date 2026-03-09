@@ -7,6 +7,7 @@
     ferment.runtime
 
   (:require [clojure.string :as str]
+            [ferment.execution-graph :as execution-graph]
             [ferment.queue :as queue]
             [ferment.contracts :as contracts]
             [ferment.core :as core]
@@ -88,6 +89,10 @@
   ;; Omit normalized runtime helpers rebuilt by queue/init-service.
   (-> (queue/default-config)
       (dissoc :clock :classes/set)))
+
+(defn- fallback-execution-graph-config
+  []
+  (execution-graph/normalize-config nil))
 
 (defn- trim-s
   [v]
@@ -187,6 +192,51 @@
       (map? auth-user)                        (assoc :auth/user auth-user)
       (map? (:roles runtime))                 (assoc :roles (:roles runtime)))))
 
+(defn- runtime-execution-graph
+  [runtime]
+  (when (map? runtime)
+    (:execution-graph/service runtime)))
+
+(defn- append-execution-event!
+  [runtime event]
+  (let [service (runtime-execution-graph runtime)]
+    (when (execution-graph/service? service)
+      (execution-graph/append-event! service event))))
+
+(defn- node-callback-context
+  [request]
+  {:job/id (trim-s (:queue/job-id request))
+   :run/id (or (trim-s (:queue/job-id request))
+               (some-> request :trace :id trim-s))
+   :trace/id (some-> request :trace :id trim-s)
+   :session/id (trim-s (:session/id request))})
+
+(defn- workflow-node-state-callback
+  [runtime request]
+  (let [ctx (node-callback-context request)
+        job-id (:job/id ctx)
+        run-id (:run/id ctx)
+        trace-id (:trace/id ctx)
+        session-id (:session/id ctx)]
+    (when (or run-id job-id)
+      (fn [event]
+        (when (map? event)
+          (append-execution-event!
+           runtime
+           (cond-> {:event/type (or (keywordish (:event/type event))
+                                    :node/running)
+                    :details (select-keys event [:node/index
+                                                 :node/op
+                                                 :node/as
+                                                 :node/intent
+                                                 :error
+                                                 :failure/type])}
+             (string? job-id) (assoc :job/id job-id)
+             (string? run-id) (assoc :run/id run-id)
+             (string? trace-id) (assoc :trace/id trace-id)
+             (string? session-id) (assoc :session/id session-id)
+             (map? (:checkpoint event)) (assoc :checkpoint (:checkpoint event)))))))))
+
 (defn- non-retryable-failure?
   [error-type]
   (contains? #{:invalid-request
@@ -250,8 +300,14 @@
                    :message "No capability can handle the queued intent."
                    :details unsupported-details}}
           (try
-            {:ok? true
-             :result (core/call-capability runtime resolver (request->invoke-opts runtime resolver request cap-id))}
+            (let [node-state-cb (workflow-node-state-callback runtime request)
+                  invoke-opts (cond-> (request->invoke-opts runtime resolver request cap-id)
+                                (map? (:workflow/resume-checkpoint request))
+                                (assoc :workflow/resume-checkpoint (:workflow/resume-checkpoint request))
+                                (fn? node-state-cb)
+                                (assoc :workflow/on-node-state node-state-cb))]
+             {:ok? true
+             :result (core/call-capability runtime resolver invoke-opts)})
             (catch clojure.lang.ExceptionInfo e
               (let [data (or (ex-data e) {})
                     error-type (or (:error data) (:failure/type data) :runtime/invoke-failed)]
@@ -376,7 +432,8 @@
 (defn- execute-queued-job!
   [invoke-fn queue-cfg service job]
   (let [job-id (:job/id job)
-        request (queue-request-map job)
+        request (assoc (queue-request-map job)
+                       :queue/job-id job-id)
         {:keys [max-attempts base-backoff-ms jitter-ms]} (queue-retry-policy queue-cfg request)]
     (loop [attempt 1]
       (let [status (queue-job-status service job-id)]
@@ -403,12 +460,38 @@
                     outcome))))))))))
 
 (defn- handle-queued-job!
-  [invoke-fn queue-cfg service job]
+  [runtime invoke-fn queue-cfg service job]
   (let [job-id (:job/id job)
+        _ (append-execution-event! runtime
+                                   {:event/type :job/running
+                                    :job/id job-id
+                                    :run/id job-id
+                                    :trace/id (some-> job :request :trace :id trim-s)
+                                    :session/id (some-> job :request :session/id trim-s)
+                                    :attempt (:attempt job)
+                                    :queue/class (:queue/class job)
+                                    :deadline-at (:deadline-at job)})
         outcome (execute-queued-job! invoke-fn queue-cfg service job)]
     (if (:ok? outcome)
-      (terminal-transition-ok? (queue/complete! service job-id (:result outcome)))
-      (terminal-transition-ok? (queue/fail! service job-id (:error outcome))))))
+      (let [ok? (terminal-transition-ok? (queue/complete! service job-id (:result outcome)))]
+        (append-execution-event! runtime
+                                 {:event/type :job/completed
+                                  :job/id job-id
+                                  :run/id job-id
+                                  :trace/id (some-> job :request :trace :id trim-s)
+                                  :session/id (some-> job :request :session/id trim-s)
+                                  :attempt (:attempt job)})
+        ok?)
+      (let [ok? (terminal-transition-ok? (queue/fail! service job-id (:error outcome)))]
+        (append-execution-event! runtime
+                                 {:event/type :job/failed
+                                  :job/id job-id
+                                  :run/id job-id
+                                  :trace/id (some-> job :request :trace :id trim-s)
+                                  :session/id (some-> job :request :session/id trim-s)
+                                  :attempt (:attempt job)
+                                  :details {:error (:error outcome)}})
+        ok?))))
 
 (defn- queue-worker-loop!
   [runtime queue-cfg service running? invoke-fn]
@@ -417,13 +500,22 @@
       (let [started (queue/start-next! service)]
         (if (:ok? started)
           (try
-            (handle-queued-job! invoke-fn queue-cfg service (:job started))
+            (handle-queued-job! runtime invoke-fn queue-cfg service (:job started))
             (catch Throwable t
               (let [job-id (get-in started [:job :job/id])]
                 (when (string? job-id)
                   (queue/fail! service job-id {:type :runtime/internal
                                                :message (.getMessage t)
-                                               :details {:class (str (class t))}})))))
+                                               :details {:class (str (class t))}})
+                  (append-execution-event! runtime
+                                           {:event/type :job/failed
+                                            :job/id job-id
+                                            :run/id job-id
+                                            :trace/id (some-> started :job :request :trace :id trim-s)
+                                            :session/id (some-> started :job :request :session/id trim-s)
+                                            :details {:error {:type :runtime/internal
+                                                              :message (.getMessage t)
+                                                              :class (str (class t))}}})))))
           (sleep-ms! poll-interval-ms))))))
 
 (defn- start-queue-workers!
@@ -465,6 +557,41 @@
           (.join t 2000)
           (catch Throwable _ nil))))))
 
+(defn- resume-queued-jobs!
+  [runtime]
+  (let [service (:queue/service runtime)
+        graph   (:execution-graph/service runtime)
+        queue-cfg (if (map? (:queue runtime)) (:queue runtime) {})
+        enabled? (true? (:enabled? queue-cfg))]
+    (when (and enabled?
+               (queue/service? service)
+               (execution-graph/service? graph))
+      (let [jobs (execution-graph/inflight-jobs graph)]
+        (doseq [job jobs]
+          (let [request0 (if (map? (:request job)) (:request job) {})
+                request' (cond-> request0
+                           (map? (:checkpoint job))
+                           (assoc :workflow/resume-checkpoint (:checkpoint job)))
+                restore-job (-> job
+                                (assoc :request request')
+                                (assoc :job/status :queued))
+                restored (queue/restore! service restore-job)]
+            (when (:ok? restored)
+              (append-execution-event! runtime
+                                       {:event/type :job/queued
+                                        :job/id (:job/id restore-job)
+                                        :run/id (or (:run/id restore-job)
+                                                    (:job/id restore-job))
+                                        :trace/id (:trace/id restore-job)
+                                        :session/id (:session/id restore-job)
+                                        :queue/class (:queue/class restore-job)
+                                        :deadline-at (:deadline-at restore-job)
+                                        :attempt (:attempt restore-job)}))))
+        (when (seq jobs)
+          (telemetry/record-lifecycle! :runtime
+                                       :resume
+                                       {:queue/jobs-restored (count jobs)}))))))
+
 (defn preconfigure-runtime
   "Pre-configuration hook for runtime config branch."
   [_k config]
@@ -478,6 +605,8 @@
           (assoc :oplog (system/ref :ferment.logging/oplog)))
         (cond-> (not (contains? cfg :queue))
           (assoc :queue (fallback-queue-config)))
+        (cond-> (not (contains? cfg :execution-graph))
+          (assoc :execution-graph (fallback-execution-graph-config)))
         (update :ferment.model.session/enabled? #(if (nil? %) true (boolean %)))
         (update :ferment.model.session/idle-ttl-ms #(or % 900000))
         (update :ferment.model.session/max-per-model #(or % 4)))))
@@ -496,14 +625,18 @@
                       (assoc (:resolver cfg) :gateway/model-health gateway-health)
                       (:resolver cfg))
           queue-service (queue/init-service (:queue cfg))
+          execution-graph-service (execution-graph/init-service (:execution-graph cfg))
           runtime0 (assoc cfg
                           :resolver resolver'
                           :queue (queue/config queue-service)
                           :queue/service queue-service
+                          :execution-graph (execution-graph/config execution-graph-service)
+                          :execution-graph/service execution-graph-service
                           :gateway/model-health gateway-health
                           :ferment.model.session/workers (atom {})
                           :ferment.model.session/last-id-by-model (atom {})
                           :ferment.model.session/lock (Object.))
+          _ (resume-queued-jobs! runtime0)
           workers  (start-queue-workers! runtime0)
           runtime' (cond-> runtime0
                      (map? workers)
@@ -520,6 +653,7 @@
   "Stop hook for runtime config branch."
   [_k state]
   (stop-queue-workers! state)
+  (execution-graph/stop-service (:execution-graph/service state))
   (telemetry/record-lifecycle! :runtime :stop {:key _k})
   nil)
 

@@ -975,7 +975,7 @@
       (telemetry-inc! telemetry :quality/judge-pass)
       (telemetry-inc! telemetry :quality/judge-fail))))
 
-(declare execute-plan)
+(declare execute-plan checkpoint-state node-event-base notify-node-state!)
 
 (defn- execute-sub-plan
   [ctx env result]
@@ -1305,7 +1305,7 @@
                                :details (:details call-outcome)}))))))))
 
 (defn- run-tool-node
-  [ctx node env emitted]
+  [ctx idx node env emitted]
   (let [base-node      (-> node
                            (update :input contracts/materialize-plan env)
                            normalize-call-node)
@@ -1401,19 +1401,33 @@
         (if (:ok? outcome)
           (do
             (telemetry-inc! telemetry* :calls/succeeded)
-            {:env (if (keyword? (:as node))
-                    (assoc env (:as node) (:slot-val outcome))
-                    env)
-             :emitted emitted})
+            (let [env' (if (keyword? (:as node))
+                         (assoc env (:as node) (:slot-val outcome))
+                         env)]
+              ;; Pre-commit checkpoint for tool nodes closes crash window between
+              ;; side-effect completion and outer loop checkpoint persistence.
+              (notify-node-state! ctx
+                                  (assoc (node-event-base idx node)
+                                         :event/type :node/succeeded
+                                         :checkpoint (checkpoint-state idx env' emitted)))
+              {:env env'
+               :emitted emitted
+               :checkpoint/already-emitted? true}))
           (do
             (telemetry-inc! telemetry* :calls/failed)
             (when (keyword? (:failure/type outcome))
               (telemetry-inc-in! telemetry* [:calls/failure-types (:failure/type outcome)]))
             (if allow-failure?
-              {:env (if (keyword? (:as node))
-                      (assoc env (:as node) (:slot-val outcome))
-                      env)
-               :emitted emitted}
+              (let [env' (if (keyword? (:as node))
+                           (assoc env (:as node) (:slot-val outcome))
+                           env)]
+                (notify-node-state! ctx
+                                    (assoc (node-event-base idx node)
+                                           :event/type :node/succeeded
+                                           :checkpoint (checkpoint-state idx env' emitted)))
+                {:env env'
+                 :emitted emitted
+                 :checkpoint/already-emitted? true})
               (throw (ex-info "Tool node execution failed"
                               (merge {:node node
                                       :outcome outcome}
@@ -1425,12 +1439,33 @@
   {:env env
    :emitted (materialize-emit-input (:input node) env)})
 
+(defn- checkpoint-state
+  [idx env emitted]
+  {:next-index (inc idx)
+   :env env
+   :emitted emitted})
+
+(defn- node-event-base
+  [idx node]
+  (cond-> {:node/index idx
+           :node/op (:op node)}
+    (keyword? (:as node)) (assoc :node/as (:as node))
+    (keyword? (:intent node)) (assoc :node/intent (:intent node))))
+
+(defn- notify-node-state!
+  [ctx event]
+  (let [f (:on-node-state ctx)]
+    (when (fn? f)
+      (try
+        (f event)
+        (catch Throwable _ nil)))))
+
 (defn- run-node
-  [ctx node env emitted]
+  [ctx idx node env emitted]
   (case (:op node)
     :let (run-let-node node env emitted)
     :call (run-call-node ctx node env emitted)
-    :tool (run-tool-node ctx node env emitted)
+    :tool (run-tool-node ctx idx node env emitted)
     :emit (run-emit-node node env)
     (throw (ex-info "Unsupported plan node operation"
                     {:op (:op node)
@@ -1461,6 +1496,9 @@
   - `:invoke-tool` fn of `[tool-node env] -> canonical result envelope`
   - `:max-call-attempts` optional hard limit for total call attempts in one run
   - `:max-fallback-hops` optional hard limit for fallback hops in one run
+  - `:resume/checkpoint` optional persisted checkpoint map (`:next-index`, `:env`, `:emitted`)
+  - `:on-node-state` optional callback fn receiving node lifecycle events
+  - `:after-node` optional hook fn used by tests/diagnostics (runs after node execution, before outer-loop checkpoint)
   - `:debug/transcript?` include per-call transcript in run output
   - `:env`        optional initial environment map
 
@@ -1473,6 +1511,17 @@
         telemetry* (telemetry-atom telemetry)
         protocol   (or (:protocol resolver) {})
         debug-transcript? (true? (:debug/transcript? opts))
+        resume-checkpoint (when (map? (:resume/checkpoint opts))
+                            (:resume/checkpoint opts))
+        resumed-next-index (when (and (map? resume-checkpoint)
+                                      (integer? (:next-index resume-checkpoint))
+                                      (<= 0 (:next-index resume-checkpoint))
+                                      (<= (:next-index resume-checkpoint) (count nodes)))
+                             (:next-index resume-checkpoint))
+        resumed-env (when (map? (:env resume-checkpoint))
+                      (:env resume-checkpoint))
+        resumed-emitted (when (contains? resume-checkpoint :emitted)
+                          (:emitted resume-checkpoint))
         max-call-attempts (positive-int-or-nil (:max-call-attempts opts))
         max-fallback-hops (positive-int-or-nil (:max-fallback-hops opts))
         call-attempts* (if (instance? clojure.lang.Atom (:call-attempts opts))
@@ -1497,10 +1546,16 @@
              :max-fallback-hops max-fallback-hops
              :timings* timings*
              :transcript* transcript*
+             :on-node-state (:on-node-state opts)
+             :after-node (:after-node opts)
              :debug-transcript? debug-transcript?}]
-    (loop [idx 0
-           env env
-           emitted nil]
+    (loop [idx (or resumed-next-index 0)
+           env (if (map? resumed-env)
+                 (merge env resumed-env)
+                 env)
+           emitted (if (contains? resume-checkpoint :emitted)
+                     resumed-emitted
+                     nil)]
       (if (>= idx (count nodes))
         (finalize-run telemetry* timings* transcript* env emitted)
         (let [node (nth nodes idx)]
@@ -1509,7 +1564,35 @@
             (telemetry-inc-in! telemetry* [:nodes/by-op (:op node)]))
           (if-not (should-run-node? node env)
             (recur (inc idx) env emitted)
-            (let [{env' :env
-                   emitted' :emitted}
-                  (run-node ctx node env emitted)]
-              (recur (inc idx) env' emitted'))))))))
+            (let [event-base (node-event-base idx node)]
+              (notify-node-state! ctx (assoc event-base :event/type :node/pending))
+              (notify-node-state! ctx (assoc event-base :event/type :node/running))
+              (let [{env' :env
+                     emitted' :emitted
+                     checkpoint-emitted? :checkpoint/already-emitted?}
+                    (try
+                      (run-node ctx idx node env emitted)
+                      (catch clojure.lang.ExceptionInfo e
+                        (notify-node-state! ctx
+                                            (assoc event-base
+                                                   :event/type :node/failed
+                                                   :error (or (ex-data e) {:message (.getMessage e)})))
+                        (throw e))
+                      (catch Throwable t
+                        (notify-node-state! ctx
+                                            (assoc event-base
+                                                   :event/type :node/failed
+                                                   :error {:message (.getMessage t)
+                                                           :class (str (class t))}))
+                        (throw t)))]
+                (when (fn? (:after-node ctx))
+                  ((:after-node ctx) {:node/index idx
+                                      :node node
+                                      :env env'
+                                      :emitted emitted'}))
+                (when-not checkpoint-emitted?
+                  (notify-node-state! ctx
+                                      (assoc event-base
+                                             :event/type :node/succeeded
+                                             :checkpoint (checkpoint-state idx env' emitted'))))
+                (recur (inc idx) env' emitted')))))))))

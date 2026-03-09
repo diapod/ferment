@@ -2055,6 +2055,113 @@
       (is (= :text/respond (get-in @seen [:vars :context/last-intent])))
       (is (= "This is a lo" (get-in @seen [:vars :context/summary]))))))
 
+(deftest invoke-act-session-defaults-block-context-on-principal-mismatch
+  (testing "Context defaults are not injected when memory principal isolation detects mismatch."
+    (let [seen (atom nil)
+          telemetry (atom {})
+          runtime {:protocol {}
+                   :resolver {}
+                   :session {:store {:session-vars/contract
+                                     {:memory/policy {:enabled? true
+                                                      :read/default? true
+                                                      :principal/isolation? true
+                                                      :principal/key :context/principal-id}}}
+                             :get-vars! (fn [_sid _ks _opts]
+                                          {:session/context-summary "ctx-secure"
+                                           :context/principal-id "1"})}}
+          payload {:proto 1
+                   :trace {:id "t-memory-principal-1"}
+                   :session/id "session/memory-principal-1"
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          auth {:source :http/basic
+                :user {:user/id 2
+                       :user/email "u2@example.com"
+                       :user/account-type :user
+                       :user/roles #{:role/user}}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver opts]
+                      (reset! seen opts)
+                      {:result {:type :value
+                                :out {:text "ok"}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry auth)))))
+      (is (nil? (get-in @seen [:context :summary])))
+      (let [snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= 1 (get-in snapshot [:orchestration :context/principal-isolation :blocked])))))))
+
+(deftest invoke-act-session-defaults-respect-memory-read-policy
+  (testing "Context defaults are skipped when memory read policy disables recall for intent."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}
+                   :session {:store {:session-vars/contract
+                                     {:memory/policy {:enabled? true
+                                                      :read/default? true
+                                                      :read/by-intent {:text/respond false}}}}
+                             :get-vars! (fn [_sid _ks _opts]
+                                          {:session/context-summary "ctx-disabled"})}}
+          payload {:proto 1
+                   :trace {:id "t-memory-read-policy-1"}
+                   :session/id "session/memory-read-policy-1"
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver opts]
+                      (reset! seen opts)
+                      {:result {:type :value
+                                :out {:text "ok"}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload nil nil)))))
+      (is (nil? (get-in @seen [:context :summary]))))))
+
+(deftest invoke-act-memory-auto-write-persists-principal-and-bounded-history
+  (testing "Memory auto-write stores principal id and bounded summary history."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}
+                   :session {:store {:session-vars/contract
+                                     {:memory/policy {:enabled? true
+                                                      :write/default? false
+                                                      :write/by-intent {:text/respond true}
+                                                      :write/key :context/summary
+                                                      :write/max-chars 200
+                                                      :principal/isolation? true
+                                                      :principal/key :context/principal-id
+                                                      :history/enabled? true
+                                                      :history/key :context/history
+                                                      :history/max-items 2
+                                                      :compaction/trigger-chars 200
+                                                      :compaction/target-chars 200
+                                                      :compaction/mode :truncate}}}
+                             :get-var! (fn [_sid _k _opts]
+                                         ["old-1" "old-2"])
+                             :put-vars! (fn [sid vars opts]
+                                          (reset! seen {:sid sid :vars vars :opts opts})
+                                          true)}}
+          payload {:proto 1
+                   :trace {:id "t-memory-history-1"}
+                   :session/id "session/memory-history-1"
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          auth {:source :http/basic
+                :user {:user/id 77
+                       :user/email "u77@example.com"
+                       :user/account-type :user
+                       :user/roles #{:role/user}}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      {:result {:type :value
+                                :out {:text "Fresh summary"}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload nil auth)))))
+      (is (= "session/memory-history-1" (:sid @seen)))
+      (is (= "77" (get-in @seen [:vars :context/principal-id])))
+      (is (= ["old-2" "Fresh summary"]
+             (get-in @seen [:vars :context/history])))
+      (is (= "Fresh summary"
+             (get-in @seen [:vars :context/summary]))))))
+
 (deftest invoke-act-writes-audit-trail-event
   (testing "invoke-act emits persistent audit event with trace/request/session/principal/intent/capability/outcome."
     (let [seen (atom nil)

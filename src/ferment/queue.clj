@@ -282,6 +282,14 @@
   [service]
   (str "job/" (swap! (:queue/seq service) inc)))
 
+(defn- job-id->seq
+  [job-id]
+  (when-let [id' (trim-s job-id)]
+    (when-let [[_ n] (re-matches #"job/([0-9]+)" id')]
+      (try
+        (Long/parseLong n)
+        (catch Throwable _ nil)))))
+
 (defn- resolve-deadline-ms
   [cfg opts]
   (let [raw-deadline (or (nonneg-long (:deadline-ms opts))
@@ -430,6 +438,99 @@
              (when (:ok? result)
                (record-transition! service :queued {:job/id (get-in result [:job :job/id])}))
              result)))))))
+
+(defn restore!
+  "Restores queued job into service state.
+
+  The restored job always enters queue in `:queued` status.
+  Returns:
+  - `{:ok? true :job ...}`
+  - `{:ok? false :error ...}`"
+  [service job]
+  (let [cfg (config service)]
+    (cond
+      (not (service? service))
+      {:ok? false :error :queue/not-initialized}
+
+      (not (:enabled? cfg))
+      {:ok? false :error :queue/disabled}
+
+      (not (map? job))
+      {:ok? false :error :queue/invalid-job}
+
+      :else
+      (let [job-id   (trim-s (:job/id job))
+            request  (when (map? (:request job)) (:request job))
+            class-k0 (or (keywordish (:queue/class job))
+                         (:default-class cfg))
+            class-k  (if (contains? (:classes/set cfg) class-k0)
+                       class-k0
+                       (:default-class cfg))]
+        (cond
+          (nil? job-id)
+          {:ok? false :error :queue/invalid-job-id}
+
+          (nil? request)
+          {:ok? false :error :queue/invalid-request}
+
+          :else
+          (let [now-ms'     (now-ms service)
+                now-iso     (iso-now now-ms')
+                deadline-at (trim-s (:deadline-at job))
+                attempt     (if (and (integer? (:attempt job))
+                                     (<= 0 (:attempt job)))
+                              (:attempt job)
+                              0)
+                out         (volatile! nil)]
+            (swap! (:queue/state service)
+                   (fn [state]
+                     (cond
+                       (contains? (:jobs state) job-id)
+                       (do
+                         (vreset! out {:ok? false
+                                       :error :queue/job-exists
+                                       :job/id job-id})
+                         state)
+
+                       (>= (state-active-count state) (:max-size cfg))
+                       (do
+                         (vreset! out {:ok? false
+                                       :error :queue/full
+                                       :max-size (:max-size cfg)})
+                         state)
+
+                       :else
+                       (let [job' {:job/id job-id
+                                   :job/status :queued
+                                   :queue/class class-k
+                                   :request request
+                                   :attempt attempt
+                                   :submitted-at (or (trim-s (:submitted-at job))
+                                                     now-iso)
+                                   :updated-at now-iso
+                                   :deadline-at deadline-at}
+                             state' (-> state
+                                        (assoc-in [:jobs job-id] job')
+                                        (update :jobs/active
+                                                (fn [n]
+                                                  (inc (long (or n 0)))))
+                                        (queue-conj class-k job-id)
+                                        (append-event cfg {:at now-iso
+                                                           :at-ms now-ms'
+                                                           :job/id job-id
+                                                           :from nil
+                                                           :to :queued}))]
+                         (vreset! out {:ok? true :job job'})
+                         state'))))
+            (when-let [n (job-id->seq job-id)]
+              (swap! (:queue/seq service)
+                     (fn [cur]
+                       (long (max (long (or cur 0)) n)))))
+            (let [result @out]
+              (when (:ok? result)
+                (record-transition! service :queued {:job/id job-id
+                                                     :restored? true}))
+              result)))))))
 
 (defn get-job
   "Returns job by id."

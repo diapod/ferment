@@ -9,5 +9,10 @@
    :max-deadline-ms 60000
    :retry {:max-attempts 2
            :base-backoff-ms 50
-           :jitter-ms 15}}}
+           :jitter-ms 15}}
+  :execution-graph
+  {:enabled? true
+   :store/type :fs-ednl
+   :store/path "target/runtime/execution-graph-test-live/events.ednl"
+   :max-events 50000}}}
 }

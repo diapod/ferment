@@ -31,6 +31,98 @@
       (is (= 1 (count (:timings run))))
       (is (number? (get-in run [:timings 0 :latency-ms]))))))
 
+(deftest execute-plan-resumes-from-checkpoint
+  (testing "Evaluator resumes from persisted checkpoint without re-executing finished nodes."
+    (let [calls (atom 0)
+          plan {:nodes [{:op :let
+                         :value {:text "warmup"}
+                         :as :seed}
+                        {:op :call
+                         :intent :text/respond
+                         :input {:prompt {:slot/id [:seed :text]}}
+                         :as :answer}
+                        {:op :emit
+                         :input {:slot/id [:answer :out]}}]}
+          run (workflow/execute-plan
+               {:plan plan
+                :resolver {:routing {:intent->cap {:text/respond :llm/voice}}}
+                :resume/checkpoint {:next-index 1
+                                    :env {:seed {:text "checkpoint-seed"}}
+                                    :emitted nil}
+                :invoke-call (fn [call-node _env]
+                               (swap! calls inc)
+                               {:result {:type :value
+                                         :out {:text (str "ECHO:" (get-in call-node [:input :prompt]))}}})})]
+      (is (:ok? run))
+      (is (= 1 @calls))
+      (is (= {:text "ECHO:checkpoint-seed"} (:emitted run))))))
+
+(deftest execute-plan-tool-node-precommits-checkpoint-before-outer-loop
+  (testing "Tool node persists checkpoint before outer-loop hook, so resume does not rerun side effects."
+    (let [tool-calls (atom 0)
+          events (atom [])
+          plan {:nodes [{:op :tool
+                         :tool/id :tool/demo
+                         :effects {:allowed #{:none}}
+                         :as :tool-out}
+                        {:op :emit
+                         :input {:slot/id [:tool-out :out]}}]}
+          crash (try
+                  (workflow/execute-plan
+                   {:plan plan
+                    :resolver {}
+                    :on-node-state (fn [event] (swap! events conj event))
+                    :after-node (fn [{node-index :node/index}]
+                                  (when (zero? (long node-index))
+                                    (throw (ex-info "synthetic-crash-after-tool" {:node/index node-index}))))
+                    :invoke-tool (fn [_ _]
+                                   (swap! tool-calls inc)
+                                   {:result {:type :value
+                                             :out {:text "tool-ok"}}})})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e
+                    {:message (ex-message e)
+                     :data (ex-data e)}))
+          checkpoint (some->> @events
+                              (filter #(= :node/succeeded (:event/type %)))
+                              last
+                              :checkpoint)
+          resumed (workflow/execute-plan
+                   {:plan plan
+                    :resolver {}
+                    :resume/checkpoint checkpoint
+                    :invoke-tool (fn [_ _]
+                                   (swap! tool-calls inc)
+                                   {:result {:type :value
+                                             :out {:text "tool-ok"}}})})]
+      (is (= "synthetic-crash-after-tool" (:message crash)))
+      (is (map? checkpoint))
+      (is (= 1 (:next-index checkpoint)))
+      (is (= 1 @tool-calls))
+      (is (:ok? resumed))
+      (is (= {:text "tool-ok"} (:emitted resumed))))))
+
+(deftest execute-plan-notifies-node-state-callback
+  (testing "Evaluator reports node lifecycle transitions to callback."
+    (let [events (atom [])
+          plan {:nodes [{:op :call
+                         :intent :text/respond
+                         :as :answer}
+                        {:op :emit
+                         :input {:slot/id [:answer :out]}}]}
+          run (workflow/execute-plan
+               {:plan plan
+                :resolver {:routing {:intent->cap {:text/respond :llm/voice}}}
+                :on-node-state (fn [event] (swap! events conj event))
+                :invoke-call (fn [_ _]
+                               {:result {:type :value
+                                         :out {:text "ok"}}})})]
+      (is (:ok? run))
+      (is (= [:node/pending :node/running :node/succeeded
+              :node/pending :node/running :node/succeeded]
+             (mapv :event/type @events)))
+      (is (= 2 (count (filter #(contains? % :checkpoint) @events)))))))
+
 (deftest execute-plan-recurses-when-call-returns-plan
   (testing "Evaluator executes nested plan returned by a call and propagates emitted output."
     (let [calls (atom [])

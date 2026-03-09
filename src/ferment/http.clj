@@ -14,6 +14,7 @@
             [ferment.auth.user :as auth-user]
             [ferment.contracts :as contracts]
             [ferment.core :as core]
+            [ferment.execution-graph :as execution-graph]
             [ferment.memory :as memory]
             [ferment.http.act.middleware.execute :as act-middleware-execute]
             [ferment.http.act.middleware.finalize :as act-middleware-finalize]
@@ -573,6 +574,7 @@
         context-lookups (counter-value (:context/default-lookups orchestration))
         context-hits (counter-value (:context/default-hits orchestration))
         context-misses (counter-value (:context/default-misses orchestration))
+        context-principal-blocked (counter-value (:context/principal-isolation-blocked orchestration))
         route-total (counter-value (:route/decide-hit routing))
         continue' (counter-value (:route/decide-continue routing))
         final' (counter-value (:route/decide-final routing))
@@ -599,7 +601,9 @@
      :context/hit-utility {:value (safe-rate context-hits context-lookups)
                            :lookups context-lookups
                            :hits context-hits
-                           :misses context-misses}}))
+                           :misses context-misses}
+     :context/principal-isolation
+     {:blocked context-principal-blocked}}))
 
 (defn- record-act-telemetry!
   ([telemetry response latency-ms]
@@ -1483,6 +1487,14 @@
       bindings
       fallback-request-default-bindings)))
 
+(defn- session-memory-policy
+  [runtime]
+  (let [service (when (map? runtime) (:session runtime))
+        store (when (map? service) (:store service))
+        policy (when (map? store)
+                 (memory/session-memory-policy store))]
+    (if (map? policy) policy {})))
+
 (defn- coerce-session-default-value
   [coerce raw]
   (case (keywordish coerce)
@@ -1594,34 +1606,116 @@
                    (update-in [:orchestration :context/default-hits] (fnil + 0) hits')
                    (update-in [:orchestration :context/default-misses] (fnil + 0) misses')))))))
 
+(defn- record-context-principal-isolation-telemetry!
+  [runtime blocked]
+  (let [telemetry (when (map? runtime) (:telemetry runtime))
+        blocked' (counter-value blocked)]
+    (when (and (instance? clojure.lang.IAtom telemetry)
+               (pos? blocked'))
+      (swap! telemetry
+             (fn [state]
+               (-> (telemetry/merge-counters (default-telemetry) state)
+                   (update-in [:orchestration :context/principal-isolation-blocked] (fnil + 0) blocked')))))))
+
+(defn- memory-read-enabled?
+  [policy intent]
+  (let [by-intent (if (map? (:read/by-intent policy))
+                    (:read/by-intent policy)
+                    {})
+        default? (if (contains? policy :read/default?)
+                   (true? (:read/default? policy))
+                   true)]
+    (if (contains? by-intent intent)
+      (true? (get by-intent intent))
+      default?)))
+
+(defn- binding-target
+  [binding]
+  (let [target (when (map? binding) (:target binding))]
+    (when (or (vector? target)
+              (sequential? target))
+      (vec target))))
+
+(defn- context-binding-key?
+  [bindings k]
+  (let [target (binding-target (get bindings k))]
+    (= :context (first target))))
+
+(defn- context-binding-keys
+  [bindings]
+  (->> (keys (if (map? bindings) bindings {}))
+       (filter #(context-binding-key? bindings %))
+       vec))
+
+(defn- principal-token-from-request
+  [request]
+  (let [user (when (map? request)
+               (:auth/user request))]
+    (or (some-> (:user/id user) str trim-s)
+        (some-> (:user/email user) str trim-s str/lower-case))))
+
+(defn- principal-token-from-vars
+  [vars principal-key]
+  (when (keyword? principal-key)
+    (some-> (session-var-value vars principal-key) str trim-s)))
+
 (defn- request-with-session-defaults
   [runtime request]
   (let [service (when (map? runtime) (:session runtime))
         get-vars-invoker (session-get-vars-invoker service)
         bindings (session-request-default-bindings runtime)
-        binding-keys (->> (keys bindings)
+        memory-policy (session-memory-policy runtime)
+        intent  (some-> request :task :intent keywordish)
+        memory-read? (memory-read-enabled? memory-policy intent)
+        context-keys (context-binding-keys bindings)
+        bindings' (if memory-read?
+                    bindings
+                    (apply dissoc bindings context-keys))
+        binding-keys (->> (keys bindings')
                           (keep keywordish)
                           vec)
+        principal-isolation? (and memory-read?
+                                  (true? (:principal/isolation? memory-policy)))
+        principal-key (or (some-> (:principal/key memory-policy) keywordish)
+                          :context/principal-id)
+        lookup-keys (cond-> binding-keys
+                      (and principal-isolation?
+                           (keyword? principal-key))
+                      (conj principal-key))
         sid     (or (some-> request :session/id trim-s)
                     (some-> request :session-id trim-s))
-        intent  (some-> request :task :intent keywordish)
         opts    (cond-> {:operation :act/defaults}
                   (keyword? intent) (assoc :intent intent))]
     (if (and (map? request)
              (map? service)
              (fn? get-vars-invoker)
              sid
-             (seq binding-keys))
+             (seq lookup-keys))
       (let [vars (try
-                   (get-vars-invoker sid binding-keys opts)
+                   (get-vars-invoker sid lookup-keys opts)
                    (catch Throwable _
                      nil))]
         (if (map? vars)
-          (let [hits (count (filter #(contains? vars %) binding-keys))
-                lookups (count binding-keys)
+          (let [request-principal (principal-token-from-request request)
+                stored-principal (principal-token-from-vars vars principal-key)
+                principal-mismatch? (and principal-isolation?
+                                         (some? stored-principal)
+                                         (not= stored-principal request-principal))
+                blocked-count (if principal-mismatch?
+                                (count context-keys)
+                                0)
+                bindings'' (if principal-mismatch?
+                             (apply dissoc bindings' context-keys)
+                             bindings')
+                binding-keys' (->> (keys bindings'')
+                                   (keep keywordish)
+                                   vec)
+                hits (count (filter #(contains? vars %) binding-keys'))
+                lookups (count binding-keys')
                 misses (max 0 (- lookups hits))]
             (record-context-defaults-telemetry! runtime lookups hits misses)
-            (apply-session-var-defaults request vars bindings))
+            (record-context-principal-isolation-telemetry! runtime blocked-count)
+            (apply-session-var-defaults request vars bindings''))
           (do
             (record-context-defaults-telemetry! runtime (count binding-keys) 0 (count binding-keys))
             request)))
@@ -1656,6 +1750,17 @@
   [runtime]
   (when (map? runtime)
     (:queue/service runtime)))
+
+(defn- runtime-execution-graph-service
+  [runtime]
+  (when (map? runtime)
+    (:execution-graph/service runtime)))
+
+(defn- append-execution-graph-event!
+  [runtime event]
+  (let [service (runtime-execution-graph-service runtime)]
+    (when (execution-graph/service? service)
+      (execution-graph/append-event! service event))))
 
 (defn- queue-submit-options
   [request]
@@ -1718,11 +1823,25 @@
       (let [submit (queue/submit! service request (queue-submit-options request))]
         (cond
           (:ok? submit)
-          (queue-schema-response request
-                                 :res/job-accepted
-                                 (queue-job->accepted-payload (:job submit))
-                                 202
-                                 true)
+          (let [job (:job submit)
+                _   (append-execution-graph-event!
+                     runtime
+                     {:event/type :job/submitted
+                      :job/id (:job/id job)
+                      :run/id (:job/id job)
+                      :trace/id (some-> request :trace :id trim-s)
+                      :session/id (or (some-> request :session/id trim-s)
+                                      (some-> request :session-id trim-s))
+                      :request request
+                      :queue/class (:queue/class job)
+                      :deadline-at (:deadline-at job)
+                      :attempt (:attempt job)})
+                ]
+            (queue-schema-response request
+                                   :res/job-accepted
+                                   (queue-job->accepted-payload job)
+                                   202
+                                   true))
 
           (= :queue/full (:error submit))
           {:status 503
@@ -1795,11 +1914,22 @@
       (let [cancel (queue/cancel! service job-id reason)]
         (cond
           (:ok? cancel)
-          (queue-schema-response request
-                                 :res/job-cancel
-                                 (queue-job->cancel-payload (:job cancel) true)
-                                 200
-                                 false)
+          (let [job (:job cancel)
+                _ (append-execution-graph-event!
+                   runtime
+                   {:event/type :job/canceled
+                    :job/id (:job/id job)
+                    :run/id (:job/id job)
+                    :trace/id (some-> request :trace :id trim-s)
+                    :session/id (or (some-> request :session/id trim-s)
+                                    (some-> request :session-id trim-s))
+                    :attempt (:attempt job)
+                    :details {:reason reason}})]
+            (queue-schema-response request
+                                   :res/job-cancel
+                                   (queue-job->cancel-payload job true)
+                                   200
+                                   false))
 
           (= :queue/job-not-found (:error cancel))
           {:status 404
@@ -3345,11 +3475,10 @@
 (defn- write-act-memory-summary!
   [runtime request body]
   (let [service (when (map? runtime) (:session runtime))
-        store (when (map? service) (:store service))
         sid (or (some-> (:session/id request) trim-s)
                 (some-> (:session-id request) trim-s))
         intent (some-> request :task :intent keywordish)
-        policy (when (map? store) (memory/session-memory-policy store))
+        policy (session-memory-policy runtime)
         enabled? (and (map? policy)
                       (true? (:enabled? policy))
                       (keyword? intent)
@@ -3360,19 +3489,57 @@
         compacted (when enabled?
                     (compact-memory-text policy text))
         write-key (or (some-> (:write/key policy) keywordish)
-                      :context/summary)]
+                      :context/summary)
+        principal-isolation? (true? (:principal/isolation? policy))
+        principal-key (or (some-> (:principal/key policy) keywordish)
+                          :context/principal-id)
+        principal-token (principal-token-from-request request)
+        history-enabled? (true? (:history/enabled? policy))
+        history-key (or (some-> (:history/key policy) keywordish)
+                        :context/history)
+        history-max-items (or (positive-int (:history/max-items policy)) 8)]
     (when (and enabled?
                (keyword? write-key)
                (some? compacted)
                (fn? (:put-vars! service)))
       (try
-        (memory/put-vars! service
-                          sid
-                          {write-key compacted
-                           :context/last-intent intent
-                           :context/last-updated-at (str (java.time.Instant/now))}
-                          {:operation :act/memory-auto-write
-                           :intent intent})
+        (let [history-current (when (and history-enabled?
+                                         (keyword? history-key)
+                                         (fn? (:get-var! service)))
+                                (memory/get-var! service
+                                                 sid
+                                                 history-key
+                                                 {:operation :act/memory-auto-write
+                                                  :intent intent}))
+              history-items0 (if (sequential? history-current)
+                               (->> history-current
+                                    (keep #(some-> % str trim-s))
+                                    vec)
+                               [])
+              history-items1 (if (= compacted (last history-items0))
+                               history-items0
+                               (conj history-items0 compacted))
+              history-items' (if (pos? history-max-items)
+                               (->> history-items1
+                                    (take-last history-max-items)
+                                    vec)
+                               [])
+              vars (cond-> {write-key compacted
+                            :context/last-intent intent
+                            :context/last-updated-at (str (java.time.Instant/now))}
+                     (and principal-isolation?
+                          (keyword? principal-key)
+                          (some? principal-token))
+                     (assoc principal-key principal-token)
+                     (and history-enabled?
+                          (keyword? history-key)
+                          (seq history-items'))
+                     (assoc history-key history-items'))]
+          (memory/put-vars! service
+                            sid
+                            vars
+                            {:operation :act/memory-auto-write
+                             :intent intent}))
         (catch Throwable _
           nil)))))
 

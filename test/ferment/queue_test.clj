@@ -129,3 +129,20 @@
       (is (:ok? cancel-res))
       (is (= :canceled (get-in cancel-res [:job :job/status])))
       (is (= :queue/empty (:error start-res))))))
+
+(deftest queue-restore-recreates-inflight-job
+  (testing "restore! enqueues durable inflight job under original job id."
+    (let [time* (atom 1700000000500)
+          svc (queue/init-service {:enabled? true
+                                   :clock (test-clock time*)})
+          restored (queue/restore! svc {:job/id "job/42"
+                                        :queue/class :interactive
+                                        :request {:task {:intent :text/respond}
+                                                  :input {:prompt "hej"}}
+                                        :attempt 3})
+          poll (queue/get-job svc "job/42")]
+      (is (:ok? restored))
+      (is (:ok? poll))
+      (is (= :queued (get-in poll [:job :job/status])))
+      (is (= 3 (get-in poll [:job :attempt])))
+      (is (= :interactive (get-in poll [:job :queue/class]))))))

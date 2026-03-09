@@ -1477,6 +1477,10 @@
                     :env workflow-env
                     :max-call-attempts max-call-attempts
                     :max-fallback-hops max-fallback-hops
+                    :resume/checkpoint (when (map? (:workflow/resume-checkpoint opts))
+                                         (:workflow/resume-checkpoint opts))
+                    :on-node-state (when (fn? (:workflow/on-node-state opts))
+                                     (:workflow/on-node-state opts))
                     :debug/transcript? debug-transcript?})
              out  (emitted->out (:emitted run))]
          (assoc base-result

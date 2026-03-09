@@ -428,21 +428,37 @@
                   :session-vars/contract
                   {:memory/policy
                    {:enabled? true
+                    :read/default? false
+                    :read/by-intent {"text/respond" true
+                                     :code/patch false}
                     :write/default? true
                     :write/by-intent {"text/respond" true
                                       :code/patch false}
                     :write/key "context/summary"
                     :write/max-chars "1000"
+                    :principal/isolation? true
+                    :principal/key "context/principal-id"
+                    :history/enabled? true
+                    :history/key "context/history"
+                    :history/max-items "6"
                     :compaction/trigger-chars 900
                     :compaction/target-chars 700
                     :compaction/mode "truncate"}}})
           policy (session-store/memory-policy store)]
       (is (true? (:enabled? policy)))
+      (is (false? (:read/default? policy)))
+      (is (= true (get-in policy [:read/by-intent :text/respond])))
+      (is (= false (get-in policy [:read/by-intent :code/patch])))
       (is (true? (:write/default? policy)))
       (is (= true (get-in policy [:write/by-intent :text/respond])))
       (is (= false (get-in policy [:write/by-intent :code/patch])))
       (is (= :context/summary (:write/key policy)))
       (is (= 1000 (:write/max-chars policy)))
+      (is (true? (:principal/isolation? policy)))
+      (is (= :context/principal-id (:principal/key policy)))
+      (is (true? (:history/enabled? policy)))
+      (is (= :context/history (:history/key policy)))
+      (is (= 6 (:history/max-items policy)))
       (is (= 900 (:compaction/trigger-chars policy)))
       (is (= 700 (:compaction/target-chars policy)))
       (is (= :truncate (:compaction/mode policy))))))

@@ -264,7 +264,7 @@
                                                        (every? simple-arglist? arglists)
                                                        (distinct-arities? arglists)
                                                        (some registry-arglist? arglists))
-                                     alias-sym    (symbol "ferment.util"
+                                     alias-sym    (symbol "ferment.utils"
                                                          (if use-reg? "defalias-reg" "defalias"))
                                      alias-meta   (when (map? auto) (dissoc auto :alias/as))
                                      alias-as     (when (map? auto) (:alias/as auto))
