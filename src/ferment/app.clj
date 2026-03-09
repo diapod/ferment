@@ -30,10 +30,10 @@
 (def ^:dynamic *ns-reload-watch-dirs*             ["src" "test"])
 (def ^:dynamic *local-config*                                nil)
 
-(def ^:dynamic *resource-config-dirs* (system/profile-resource-dirs :prod))
-(def ^:dynamic *resource-admin-dirs*  (system/profile-resource-dirs :admin))
-(def ^:dynamic *resource-dev-dirs*    (system/profile-resource-dirs :dev))
-(def ^:dynamic *resource-test-dirs*   (system/profile-resource-dirs :test))
+(def ^:dynamic *resource-config-dirs*    (system/profile-resource-dirs :prod))
+(def ^:dynamic *resource-admin-dirs*     (system/profile-resource-dirs :admin))
+(def ^:dynamic *resource-dev-dirs*       (system/profile-resource-dirs :dev))
+(def ^:dynamic *resource-test-dirs*      (system/profile-resource-dirs :test))
 (def ^:dynamic *resource-test-live-dirs* (system/profile-resource-dirs :test-live))
 
 (defmacro with-config-dirs
