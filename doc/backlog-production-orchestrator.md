@@ -23,13 +23,14 @@ Reprioritized for router-first meta-goal (sync: 2026-03-09): keep the core small
      - deterministic gate artifacts (`gate-report.json`, `gate-report.md`) with blocking exit code for CI,
      - documentation of CI-ready flow in `doc/usage.md`.
 
-3. [ ] `#5` Prompt/policy versioning and controlled rollout
+3. [x] `#5` Prompt/policy versioning and controlled rollout
    - Reason: safe, reversible tuning loop for router behavior without core churn.
    - Focus now:
      - [x] protocol artifact selector foundation (`:versions`, `:rollout`, deterministic canary by `trace.id`, request override),
      - [x] artifact versioning for `prompts`, `policy/intents`, routing strategy (runtime selection for protocol + router with per-request override),
      - [x] canary rollout + one-step rollback (runtime override via admin actions),
-     - [ ] shadow rollout execution + side-by-side outcome comparison.
+     - [x] shadow rollout execution + side-by-side outcome comparison.
+   - Note: long-tail extension `#5` in the lower priority section still tracks optional A/B variants.
 
 4. [ ] `#12` Heterogeneous connectivity adapters (API + swarm-ready)
    - Reason: Ferment meta-purpose requires excellent connectivity to local, remote API, and future decentralized peers.
