@@ -6,6 +6,45 @@ Completed historical work remains in `doc/backlogs-done.md`.
 Execution for top priorities is tracked in:
 - `doc/execution-plan-q1.md` (priorities 1-3),
 - `doc/execution-plan-q2-distillation.md` (priority 11).
+Reprioritized for router-first meta-goal (sync: 2026-03-09): keep the core small, maximize routing/dispatch quality, and prioritize heterogeneous model connectivity.
+
+## Active Priority Queue (Router-first)
+
+1. [x] `#11` Distillation dataset pipeline for LoRA/QLoRA (operational close-out)
+   - Closed: 2026-03-09.
+   - Release-gate artifacts:
+     - `target/training/release-gate-20260309T163935Z`
+     - `target/training/release-gate-20260309T163935Z/reports/release-gate-summary.json`
+
+2. [x] `#6` Continuous evaluation pipeline
+   - Closed: 2026-03-09.
+   - Delivery:
+     - benchmark release gate comparator `bin/benchmark-gate` (candidate-only and baseline-vs-candidate modes),
+     - deterministic gate artifacts (`gate-report.json`, `gate-report.md`) with blocking exit code for CI,
+     - documentation of CI-ready flow in `doc/usage.md`.
+
+3. [ ] `#5` Prompt/policy versioning and controlled rollout
+   - Reason: safe, reversible tuning loop for router behavior without core churn.
+   - Focus now:
+     - [x] protocol artifact selector foundation (`:versions`, `:rollout`, deterministic canary by `trace.id`, request override),
+     - [x] artifact versioning for `prompts`, `policy/intents`, routing strategy (runtime selection for protocol + router with per-request override),
+     - canary/shadow rollout + one-step rollback.
+
+4. [ ] `#12` Heterogeneous connectivity adapters (API + swarm-ready)
+   - Reason: Ferment meta-purpose requires excellent connectivity to local, remote API, and future decentralized peers.
+   - Scope:
+     - standard capability descriptor for local/API/peer model endpoints,
+     - adapter seam in gateway/resolver (no provider coupling in core),
+     - health/auth/timeout/retry normalization per transport.
+   - Done when:
+     - one intent can route across at least two transport classes (local + remote API) by policy,
+     - telemetry clearly distinguishes transport failures from model-quality failures.
+
+5. [ ] `#4` Full runtime isolation for tools/effects
+   - Reason: required safety boundary as connectivity surface expands.
+
+6. [ ] `#8` Human-in-the-loop checkpoints
+   - Reason: operational control for high-risk side effects after isolation policies are in place.
 
 ## Priority Order
 
@@ -73,16 +112,26 @@ Execution for top priorities is tracked in:
      - memory improves multi-turn consistency without unbounded growth,
      - recall behavior is explicit and testable.
 
-6. [ ] Multi-tenant governance (`#9`)
+6. [x] Multi-tenant governance (`#9`)
    - Add per-tenant/user quotas, rate limits, and budget accounting.
    - Add per-tenant routing/policy overrides with safe defaults.
+   - Delivery status (synced: 2026-03-09):
+     - [x] tenant-aware request shaping (`:routing` defaults + budget/timeout clamps) from runtime tenancy policy,
+     - [x] pre-execution tenant/principal guardrails for rpm, concurrency, and daily billed-token budget,
+     - [x] per-request accounting in tenancy state (requests/errors/latency/billed tokens + reject reasons),
+     - [x] telemetry tenancy branch with tenant/principal filters (`/diag/telemetry?tenant=...&principal=...`),
+     - [x] audit logs enriched with `:tenant-id` and `:principal-ref`.
    - Done when:
      - token/cost/latency controls are enforced per tenant,
      - audit and telemetry are filterable by tenant/principal.
 
-7. [ ] Continuous evaluation pipeline (`#6`)
+7. [x] Continuous evaluation pipeline (`#6`)
    - Add golden task suite with latency/quality gates.
    - Add automated benchmark run as release gate.
+   - Delivery status (sync: 2026-03-09):
+     - [x] canonical golden case packs (`resources/bench/act*`) already used by `bin/benchmark-live`,
+     - [x] automated release-gate runner `bin/benchmark-gate` with deterministic pass/fail report and non-zero exit on gate failure,
+     - [x] baseline-vs-candidate regression checks for latency/quality drift (`interactive p95`, `must-failed SLA`, truncated output growth).
    - Done when:
      - config/prompt/routing changes are blocked on failing quality or latency gates,
      - baseline vs candidate reports are generated automatically.
@@ -108,7 +157,7 @@ Execution for top priorities is tracked in:
      - sensitive actions require explicit approval policy,
      - non-approved flows fail closed with clear operator feedback.
 
-11. [ ] Distillation dataset pipeline for LoRA/QLoRA (`#11`)
+11. [x] Distillation dataset pipeline for LoRA/QLoRA (`#11`)
    - Extend current replay/export flow into a durable, reproducible training-data pipeline.
    - Delivery scope:
      - persist training events in append-only storage (not only in-memory replay TTL cache),
@@ -117,17 +166,30 @@ Execution for top priorities is tracked in:
      - support deterministic dataset build (`train/valid/test` split + manifest + snapshot hash),
      - export training rows in trainer-ready format (chat template/messages and/or canonical text format),
      - add post-train evaluation suite and promotion gate criteria.
-   - Delivery status (sync: 2026-03-04):
+   - Delivery status (sync: 2026-03-09):
      - [x] durable append-only training collector + export event stream tooling,
      - [x] critic/judge labels in canonical `training.event/v1`,
      - [x] redaction/PII scrubbing before export/build,
      - [x] deterministic dataset builder with manifest/hash/idempotent incremental append,
      - [x] trainer-ready export adapters (`sft-prompt-completion`, `messages`, `chatml`),
-     - [x] offline eval runner + promotion gate CLI (`bin/eval-student`) with deterministic decision reasons.
+     - [x] offline eval runner + promotion gate CLI (`bin/eval-student`) with deterministic decision reasons,
+     - [x] release gate checklist closed with archived artifacts (`target/training/release-gate-20260309T163935Z`).
    - Done when:
      - the same input snapshot reproduces identical dataset artifacts,
      - exported datasets are directly consumable by target LoRA/QLoRA trainers,
      - promotion decision is automated by explicit quality/latency regression thresholds.
+
+12. [ ] Heterogeneous connectivity adapters (`#12`)
+   - Add transport-agnostic adapter layer for non-local model execution (HTTP API now, peer/swarm later).
+   - Delivery scope:
+     - define canonical capability transport descriptor (`:transport/type`, auth mode, timeouts, retry limits),
+     - add adapter implementations for local runtime and remote HTTP API under shared gateway contract,
+     - normalize transport-level failures into deterministic taxonomy (separate from quality/schema failures),
+     - preserve router-first core boundary (provider specifics only in adapters/modules).
+   - Done when:
+     - resolver/gateway can choose candidates across local + remote transports by policy,
+     - telemetry exposes transport class and failure class with stable counters,
+     - no provider-specific branching is added inside orchestration core flow.
 
 ## Suggested Delivery Phases
 

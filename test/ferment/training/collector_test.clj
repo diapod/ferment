@@ -52,7 +52,8 @@
 
 (deftest collector-appends-across-restart
   (testing "fs-jsonl collector keeps append-only contract across restart."
-    (let [dir (.getAbsolutePath (temp-dir!))
+    (let [^java.io.File tmp-dir (temp-dir!)
+          dir (.getAbsolutePath tmp-dir)
           cfg {:enabled? true
                :store/type :fs-jsonl
                :store/path dir
@@ -72,7 +73,8 @@
 
 (deftest collector-rotates-files-by-size
   (testing "collector rotates deterministic events-XXXXXX.jsonl files when max-size is exceeded."
-    (let [dir (.getAbsolutePath (temp-dir!))
+    (let [^java.io.File tmp-dir (temp-dir!)
+          dir (.getAbsolutePath tmp-dir)
           cfg {:enabled? true
                :store/type :fs-jsonl
                :store/path dir
@@ -90,7 +92,8 @@
 
 (deftest collector-deduplicates-by-training-event-id
   (testing "collector skips duplicate training.event/id and keeps one persisted row."
-    (let [dir (.getAbsolutePath (temp-dir!))
+    (let [^java.io.File tmp-dir (temp-dir!)
+          dir (.getAbsolutePath tmp-dir)
           cfg {:enabled? true
                :store/type :fs-jsonl
                :store/path dir

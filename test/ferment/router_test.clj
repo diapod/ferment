@@ -299,3 +299,67 @@
              (router/resolve-role runtime nil :llm/unknown :text/respond)))
       (is (= :router
              (router/resolve-role runtime nil :llm/unknown :problem/solve))))))
+
+(deftest router-config-validation-allows-versioning-keys
+  (testing "Router config accepts versioning and rollout keys."
+    (let [cfg (router/init-router
+               :ferment.router/default
+               {:routing {:intent->cap {:text/respond :llm/voice}}
+                :artifact/version :v1
+                :versions {:v1 {}
+                           :v2 {:defaults {:policy/profile :high-quality}}}
+                :rollout {:active :v1
+                          :canary {:enabled? true
+                                   :version :v2
+                                   :percent 10}}})]
+      (is (= :v1 (:artifact/version cfg)))
+      (is (= :v1 (get-in cfg [:rollout :active])))
+      (is (= :v2 (get-in cfg [:rollout :canary :version]))))))
+
+(deftest select-router-artifact-picks-request-active-or-canary-version
+  (testing "Request override has priority when known."
+    (let [cfg {:routing {:intent->cap {:text/respond :llm/voice}}
+               :defaults {:policy/profile :low-latency}
+               :versions {:v1 {}
+                          :v2 {:defaults {:policy/profile :high-quality}}}
+               :rollout {:active :v1
+                         :canary {:enabled? false
+                                  :version :v2
+                                  :percent 0}}}
+          selected (router/select-router-artifact cfg {:trace-id "t-1"
+                                                       :requested-version :v2})]
+      (is (= :v2 (:artifact/version selected)))
+      (is (= :request (:artifact/source selected)))
+      (is (= :high-quality
+             (get-in selected [:router :defaults :policy/profile])))))
+
+  (testing "Canary path is deterministic by trace id and percent."
+    (let [cfg {:routing {:intent->cap {:text/respond :llm/voice}}
+               :defaults {:policy/profile :low-latency}
+               :versions {:v1 {}
+                          :v2 {:defaults {:policy/profile :high-quality}}}
+               :rollout {:active :v1
+                         :canary {:enabled? true
+                                  :version :v2
+                                  :percent 100}}}
+          selected (router/select-router-artifact cfg {:trace-id "t-canary"})]
+      (is (= :v2 (:artifact/version selected)))
+      (is (= :canary (:artifact/source selected)))
+      (is (= :high-quality
+             (get-in selected [:router :defaults :policy/profile])))))
+
+  (testing "Active version is used when request/canary do not apply."
+    (let [cfg {:routing {:intent->cap {:text/respond :llm/voice}}
+               :defaults {:policy/profile :low-latency}
+               :versions {:v1 {}
+                          :v2 {:defaults {:policy/profile :high-quality}}}
+               :rollout {:active :v1
+                         :canary {:enabled? false
+                                  :version :v2
+                                  :percent 0}}}
+          selected (router/select-router-artifact cfg {:trace-id "t-2"
+                                                       :requested-version :missing})]
+      (is (= :v1 (:artifact/version selected)))
+      (is (= :active (:artifact/source selected)))
+      (is (= :low-latency
+             (get-in selected [:router :defaults :policy/profile]))))))

@@ -289,6 +289,13 @@
                         :temperature    0.0
                         :max-roundtrips 3}
   :effects/default     {:allowed #{:none}}
+  :artifact/version    :baseline-v1
+  :versions            {:baseline-v1 {}
+                        :canary-v1   {}}
+  :rollout             {:active :baseline-v1
+                        :canary {:enabled? false
+                                 :version :canary-v1
+                                 :percent 0}}
 
   :error/catalog {:schema/invalid     {:retryable? true}
                   :format/drift       {:retryable? true}

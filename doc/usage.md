@@ -1,5 +1,7 @@
 # Use Cases
 
+For a full configuration map (grouped by domain and keys), see `doc/config-reference.md`.
+
 ## Preparation
 
 Use this checklist before any runtime scenario.
@@ -153,6 +155,10 @@ curl -s http://127.0.0.1:12002/v1/act \
 
 Notes:
 - Optional routing flags in payload are canonical under `"routing"` as `"meta?"`, `"strict?"`, `"force?"`, and `"debug/plan?"`.
+- Optional protocol artifact override is available via `"routing"."artifact/version"` (for controlled prompt/policy canary or rollback per request).
+- Optional router artifact override is available via `"routing"."router/artifact-version"` (or `"routing"."router/version"` alias) for controlled routing-strategy canary/rollback per request.
+- Response envelope includes selected protocol artifact metadata under `"protocol/artifact-version"` and `"protocol/artifact-source"` when available.
+- Response envelope includes selected router artifact metadata under `"routing/router-artifact-version"` and `"routing/router-artifact-source"` when available.
 - Successful responses may include execution metadata like `models/used` and (for plan-based flow) `result.plan/run`.
 
 ## 4) Coding-oriented request with effects contract
@@ -460,6 +466,44 @@ Profile intent:
 - `balanced`: default runtime behavior.
 - `high-quality`: higher retry/fallback budget and stricter quality recovery.
 
+### 10.1) Multi-tenant governance (`#9`)
+
+Runtime tenancy policy can enforce tenant/principal limits and inject safe routing defaults.
+
+```edn
+:tenancy
+{:enabled? true
+ :default-tenant :tenant/default
+ :default {:limits {:requests-per-minute 120
+                    :max-concurrent-requests 16
+                    :max-tokens-per-request 1200
+                    :max-timeout-ms 20000
+                    :daily-max-billed-tokens 200000}
+           :principal/limits {:requests-per-minute 60
+                              :daily-max-billed-tokens 100000}
+           :routing/defaults {:profile :balanced
+                              :policy/profile :balanced}}
+ :tenants {:tenant/ops {:limits {:requests-per-minute 300}
+                        :routing/defaults {:profile :high-quality}}}
+ :principal->tenant {"email:ops@example.org" :tenant/ops}}
+```
+
+Request behavior:
+- tenancy may set default routing profile/policy profile,
+- `budget.max-tokens` and `timeout-ms` are clamped to tenant/principal limits,
+- pre-execution guard rejects requests that exceed rpm/concurrency/daily token budgets.
+
+Telemetry and filtering:
+
+```bash
+# full snapshot
+curl -s 'http://127.0.0.1:12002/diag/telemetry' | jq '.telemetry.tenancy'
+
+# filtered by tenant + principal
+curl -s 'http://127.0.0.1:12002/diag/telemetry?tenant=tenant/ops&principal=id:42' \
+  | jq '.telemetry.tenancy'
+```
+
 ## 11) Debug transcript and timings for multi-model flows
 
 Enable routing transcript diagnostics for `/v1/act`:
@@ -760,6 +804,31 @@ Built-in gates:
 - `text/respond` outputs must not end in truncated sentence fragments (hard gate).
 - `c3_solver_handoff` must include solver participation (`models/used` contains `llm/solver`) in `default` preset.
 - `c4->c5 context recall` must keep `MariaDB` in follow-up answer (`c5_context_turn2`; benchmark case has `routing.meta? = false` to isolate memory behavior from meta-decider).
+
+Release-gate CLI (candidate only, blocks on failing benchmark summary):
+
+```bash
+bin/benchmark-gate --no-run --candidate target/benchmarks/<candidate>/summary.json
+```
+
+Release-gate CLI with automatic baseline diff:
+
+```bash
+bin/benchmark-gate --no-run \
+  --candidate target/benchmarks/<candidate>/summary.json \
+  --baseline target/benchmarks/<baseline>/summary.json
+```
+
+Release-gate CLI with automatic benchmark run (single command for CI/job runner):
+
+```bash
+bin/benchmark-gate --preset sla --runs 3
+```
+
+`bin/benchmark-gate` writes:
+- JSON report: `<candidate-dir>/gate-report.json` (or `--out PATH`),
+- markdown summary: `<candidate-dir>/gate-report.md`,
+- non-zero exit (`3`) when gate fails.
 
 Per-case result payload (`results.json`) also includes normalized workflow timing fields:
 - `call_timings` (with `latency_ms`),

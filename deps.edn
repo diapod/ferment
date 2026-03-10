@@ -159,6 +159,7 @@
            :export-training-events {:main-opts ["-m" "ferment.training.export-events"]}
            :build-training-dataset {:main-opts ["-m" "ferment.training.dataset"]}
            :eval-student {:main-opts ["-m" "ferment.training.eval"]}
+           :benchmark-gate {:main-opts ["-m" "ferment.benchmark.gate"]}
            :pack      {:extra-deps {pack/pack.alpha {:git/url "https://github.com/juxt/pack.alpha.git"
                                                      :sha     "2769a6224bfb938e777906ea311b3daf7d2220f5"}}}
            :new       {:deps       {org.babashka/cli                {:mvn/version "0.8.67"}

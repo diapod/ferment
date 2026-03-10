@@ -91,6 +91,36 @@
      :deny/paths deny-paths
      :deny/patterns deny-patterns}))
 
+(defn- pattern->string
+  [v]
+  (cond
+    (instance? java.util.regex.Pattern v) (.pattern ^java.util.regex.Pattern v)
+    (string? v) v
+    :else (str v)))
+
+(defn- audit-safe-config
+  [cfg]
+  (let [cfg' (if (map? cfg) cfg {})
+        deny-keys (->> (or (:deny/keys cfg') [])
+                       (keep keywordish)
+                       (map str)
+                       sort
+                       vec)
+        deny-paths (->> (or (:deny/paths cfg') [])
+                        (filter sequential?)
+                        (mapv (fn [path]
+                                (->> path
+                                     (keep keywordish)
+                                     (mapv str))))
+                        (filterv seq))
+        deny-patterns (->> (or (:deny/patterns cfg') [])
+                           (mapv pattern->string))]
+    {:enabled? (true? (:enabled? cfg'))
+     :placeholder (or (trim-s (:placeholder cfg')) default-placeholder)
+     :deny/keys deny-keys
+     :deny/paths deny-paths
+     :deny/patterns deny-patterns}))
+
 (defn- redact-path
   [m path placeholder]
   (if (and (map? m) (seq path))
@@ -200,7 +230,7 @@
      (if (or (not enabled?) (not (map? event)))
        {:event event
         :audit {:enabled? false
-                :config cfg'
+                :config (audit-safe-config cfg')
                 :redacted/paths 0
                 :redacted/keys 0
                 :redacted/patterns 0}}
@@ -210,7 +240,7 @@
              (redact-value event1 deny-keys deny-patterns placeholder)]
          {:event event2
           :audit {:enabled? true
-                  :config cfg'
+                  :config (audit-safe-config cfg')
                   :redacted/paths path-count
                   :redacted/keys key-count
                   :redacted/patterns pattern-count}})))))

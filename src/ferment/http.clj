@@ -22,11 +22,13 @@
             [ferment.http.act.middleware.route :as act-middleware-route]
             [ferment.middleware.remote-ip :as remote-ip]
             [ferment.oplog :as oplog]
+            [ferment.protocol :as protocol]
             [ferment.queue :as queue]
             [ferment.roles :as roles]
             [ferment.router :as router]
             [ferment.system :as system]
             [ferment.telemetry :as telemetry]
+            [ferment.tenancy :as tenancy]
             [ferment.training.collector :as training-collector]
             [ferment.training.events :as training-events]
             [ferment.workflow :as workflow]
@@ -138,6 +140,7 @@
       (cond-> {}
         (some? (:user/id user)) (assoc :user/id (:user/id user))
         (some? (:user/email user)) (assoc :user/email (:user/email user))
+        (some? (:user/tenant-id user)) (assoc :user/tenant-id (:user/tenant-id user))
         (some? (:user/account-type user)) (assoc :user/account-type (:user/account-type user))
         (seq roles') (assoc :user/roles roles')))))
 
@@ -275,6 +278,13 @@
         strict?     (coerce-bool (:strict? routing'))
         force?      (coerce-bool (:force? routing'))
         on-error    (keywordish (:on-error routing'))
+        artifact-version (or (keywordish (:artifact/version routing'))
+                             (keywordish (:policy/version routing'))
+                             (keywordish (:policy-version routing'))
+                             (keywordish (:protocol/version routing')))
+        router-artifact-version (or (keywordish (:router/artifact-version routing'))
+                                    (keywordish (:router/version routing'))
+                                    (keywordish (:routing/version routing')))
         debug-plan? (coerce-bool (or (:debug/plan? routing')
                                      (:debug-plan? routing')
                                      (get-in routing' [:debug :plan?])))
@@ -289,6 +299,8 @@
       (some? strict?)                                 (assoc :strict? strict?)
       (some? force?)                                  (assoc :force? force?)
       (contains? #{:fail-open :fail-closed} on-error) (assoc :on-error on-error)
+      (keyword? artifact-version)                     (assoc :artifact/version artifact-version)
+      (keyword? router-artifact-version)              (assoc :router/artifact-version router-artifact-version)
       (some? debug-plan?)                             (assoc :debug/plan? debug-plan?)
       (some? debug-transcript?)                       (assoc :debug/transcript? debug-transcript?))))
 
@@ -408,7 +420,11 @@
                    :participants/max 0
                    :context/default-lookups 0
                    :context/default-hits 0
-                   :context/default-misses 0}})
+                   :context/default-misses 0}
+   :tenancy {:requests 0
+             :errors 0
+             :rejected 0
+             :billed-tokens 0}})
 
 (defn- workflow-telemetry-from-error
   [body]
@@ -653,20 +669,45 @@
   nil)
 
 (defn- telemetry-snapshot
-  [telemetry]
-  (let [state0 (if (instance? clojure.lang.IAtom telemetry)
-                 @telemetry
-                 (default-telemetry))
-        state  (telemetry/merge-counters (default-telemetry) state0)
-        count  (counter-value (get-in state [:act :latency-ms :count]))
-        sum    (double (or (get-in state [:act :latency-ms :sum]) 0.0))
-        avg    (if (pos? count) (/ sum count) 0.0)
-        state' (assoc-in state [:act :latency-ms :avg] avg)]
-    (assoc state'
-           :kpi (telemetry-kpi state')
-           :orchestration (telemetry-orchestration state')
-           :lifecycle (telemetry/lifecycle-snapshot)
-           :queue (telemetry/queue-snapshot))))
+  ([telemetry]
+   (telemetry-snapshot nil telemetry nil))
+  ([runtime telemetry filters]
+   (let [state0 (if (instance? clojure.lang.IAtom telemetry)
+                  @telemetry
+                  (default-telemetry))
+         state  (telemetry/merge-counters (default-telemetry) state0)
+         count  (counter-value (get-in state [:act :latency-ms :count]))
+         sum    (double (or (get-in state [:act :latency-ms :sum]) 0.0))
+         avg    (if (pos? count) (/ sum count) 0.0)
+         tenancy-state (when (map? runtime) (:tenancy/state runtime))
+         tenant-filter (some-> filters :tenant keywordish)
+         principal-filter (some-> filters :principal trim-s)
+         tenancy-view (tenancy/snapshot tenancy-state tenant-filter principal-filter)
+         totals-tenant (if (map? (:by-tenant tenancy-view)) (:by-tenant tenancy-view) {})
+         totals-principal (if (map? (:by-principal tenancy-view)) (:by-principal tenancy-view) {})
+         requests-total (reduce + 0 (map #(counter-value (:requests %)) (vals totals-tenant)))
+         errors-total (reduce + 0 (map #(counter-value (:errors %)) (vals totals-tenant)))
+         rejected-total (reduce + 0
+                                (map (fn [v]
+                                       (let [rej (if (map? (:rejected v)) (:rejected v) {})]
+                                         (reduce + 0 (map counter-value (vals rej)))))
+                                     (vals totals-tenant)))
+         billed-total (reduce + 0 (map #(counter-value (:billed-tokens %)) (vals totals-tenant)))
+         state' (assoc-in state [:act :latency-ms :avg] avg)]
+     (assoc state'
+            :kpi (telemetry-kpi state')
+            :orchestration (telemetry-orchestration state')
+            :lifecycle (telemetry/lifecycle-snapshot)
+            :queue (telemetry/queue-snapshot)
+            :tenancy {:requests requests-total
+                      :errors errors-total
+                      :rejected rejected-total
+                      :billed-tokens billed-total
+                      :filters (cond-> {}
+                                 (keyword? tenant-filter) (assoc :tenant tenant-filter)
+                                 (string? principal-filter) (assoc :principal principal-filter))
+                      :by-tenant totals-tenant
+                      :by-principal totals-principal}))))
 
 (defn- request-explicit-cap-id
   [request]
@@ -1407,6 +1448,18 @@
                         (map? auth-user) (assoc :auth/user auth-user))
         policy-profile (resolve-routing-policy-profile runtime resolver request intent)
         policy-profiles (resolve-routing-policy-profiles runtime resolver)
+        runtime-protocol (if (map? (:protocol runtime))
+                           (:protocol runtime)
+                           {})
+        protocol-selection (protocol/select-protocol-artifact
+                            runtime-protocol
+                            {:trace-id (get-in request [:trace :id])
+                             :requested-version (some-> request :routing :artifact/version)})
+        selected-protocol (:protocol protocol-selection)
+        selected-protocol-version (:artifact/version protocol-selection)
+        selected-protocol-source (:artifact/source protocol-selection)
+        selected-router-version (some-> (:router/artifact-version runtime) keywordish)
+        selected-router-source (some-> (:router/artifact-source runtime) keywordish)
         policy-cfg   (if (and (keyword? policy-profile)
                               (map? policy-profiles))
                        (get policy-profiles policy-profile)
@@ -1446,10 +1499,16 @@
       (contains? request :stream?)                    (assoc :stream? (boolean (:stream? request)))
       (some? (positive-int (:max-roundtrips budget))) (assoc :max-attempts (positive-int (:max-roundtrips budget)))
       (some? (positive-int (:max-tokens budget)))     (assoc :max-tokens (positive-int (:max-tokens budget)))
+      (some? (positive-int (:timeout-ms request)))    (assoc :timeout-ms (positive-int (:timeout-ms request)))
       (number? (:top-p budget))                       (assoc :top-p (double (:top-p budget)))
       (some? (:temperature budget))                   (assoc :temperature (:temperature budget))
       (map? auth-user)                                (assoc :auth/user auth-user)
       (map? (:roles runtime))                         (assoc :roles (:roles runtime))
+      (map? selected-protocol)                        (assoc :protocol selected-protocol)
+      (keyword? selected-protocol-version)            (assoc :protocol/artifact-version selected-protocol-version)
+      (keyword? selected-protocol-source)             (assoc :protocol/artifact-source selected-protocol-source)
+      (keyword? selected-router-version)              (assoc :router/artifact-version selected-router-version)
+      (keyword? selected-router-source)               (assoc :router/artifact-source selected-router-source)
       (map? policy-profiles)                          (assoc :policy/profiles policy-profiles)
       (pos-int? max-call-attempts)                    (assoc :workflow/max-calls max-call-attempts)
       (pos-int? max-fallback-hops)                    (assoc :workflow/max-fallback-hops max-fallback-hops)
@@ -1721,6 +1780,23 @@
             request)))
       request)))
 
+(defn- runtime-tenancy-config
+  [runtime]
+  (if (map? runtime)
+    (tenancy/normalize-config (:tenancy runtime))
+    (tenancy/normalize-config nil)))
+
+(defn- runtime-tenancy-state
+  [runtime]
+  (when (map? runtime)
+    (:tenancy/state runtime)))
+
+(defn- request-with-tenancy-defaults
+  [runtime request]
+  (let [cfg (runtime-tenancy-config runtime)
+        ctx (tenancy/resolve-context cfg request)]
+    (tenancy/apply-request-defaults request ctx)))
+
 (def ^:private queue-job-accepted-public-keys
   [:job/id :job/status :submitted-at :updated-at :deadline-at :queue/class :attempt])
 
@@ -1989,6 +2065,8 @@
             intent (some-> request :task :intent keywordish)
             capability (or (some-> request :task :cap/id keywordish)
                            (some-> request :cap/id keywordish))
+            tenant-id (some-> request :tenant/id keywordish)
+            principal-ref (some-> request :principal/ref trim-s)
             status (int (or (:status response) 500))
             outcome (response-outcome response)
             error-type (response-error-type response)
@@ -2007,6 +2085,10 @@
                                 :error-type error-type
                                 :latency-ms elapsed-ms
                                 :message message}
+                         (keyword? tenant-id)
+                         (assoc :tenant-id tenant-id)
+                         (string? principal-ref)
+                         (assoc :principal-ref principal-ref)
                          (some? (:user/id principal))
                          (assoc :principal-id (:user/id principal))
                          (some? (:user/email principal))
@@ -3180,8 +3262,31 @@
                               auth-session-id
                               (nil? (:session/id request0)))
                          (assoc :session/id auth-session-id))
-        request2       (apply-request-training-defaults runtime request1)]
-    (request-with-session-defaults runtime request2)))
+        request2       (apply-request-training-defaults runtime request1)
+        request3       (request-with-session-defaults runtime request2)]
+    (request-with-tenancy-defaults runtime request3)))
+
+(defn- invoke-act-select-runtime
+  [runtime request]
+  (if-not (map? runtime)
+    runtime
+    (let [router-cfg (if (map? (:router runtime))
+                       (:router runtime)
+                       nil)]
+      (if-not (map? router-cfg)
+        runtime
+        (let [selection (router/select-router-artifact
+                         router-cfg
+                         {:trace-id (get-in request [:trace :id])
+                          :requested-version (some-> request
+                                                     :routing
+                                                     :router/artifact-version)})
+              selected-router (:router selection)
+              selected-version (:artifact/version selection)
+              selected-source (:artifact/source selection)]
+          (cond-> (assoc runtime :router selected-router)
+            (keyword? selected-version) (assoc :router/artifact-version selected-version)
+            (keyword? selected-source) (assoc :router/artifact-source selected-source)))))))
 
 (defn- invoke-act-route-phase
   [runtime request accepted-mode? protocol resolver]
@@ -3417,7 +3522,30 @@
                 post-route-check
                 route-mode
                 resolver]} phase
-        cap-decision (when (and (map? request*)
+        tenancy-cfg (runtime-tenancy-config runtime)
+        tenancy-ctx (when (map? request*)
+                      (tenancy/resolve-context tenancy-cfg request*))
+        tenancy-result (when (and (map? request*)
+                                  (not accepted-mode?)
+                                  (:ok? req-check)
+                                  (:ok? post-route-check)
+                                  (not= :error route-mode)
+                                  (not= :final route-mode))
+                         (tenancy/reserve! (runtime-tenancy-state runtime)
+                                           tenancy-ctx
+                                           (System/currentTimeMillis)))
+        tenancy-failure? (and (map? tenancy-result)
+                              (false? (:ok? tenancy-result)))
+        tenancy-error-response (when tenancy-failure?
+                                 {:status 429
+                                  :body (error-envelope request*
+                                                        (or (:error tenancy-result)
+                                                            :tenant/limit-exceeded)
+                                                        "Tenant policy rejected the request."
+                                                        (:details tenancy-result)
+                                                        true)})
+        cap-decision (when (and (not tenancy-failure?)
+                                (map? request*)
                                 (:ok? req-check)
                                 (:ok? post-route-check)
                                 (not accepted-mode?)
@@ -3433,8 +3561,12 @@
                       cache-phase
                       {:cap-id cap-id
                        :cap/decision cap-decision
+                       :tenancy/context tenancy-ctx
+                       :tenancy/reservation (:reservation tenancy-result)
                        :route-telemetry routing-telemetry})
-        response (invoke-act-response runtime phase')
+        response (if (map? tenancy-error-response)
+                   tenancy-error-response
+                   (invoke-act-response runtime phase'))
         cache-store-telemetry (if (or (:cache/hit? phase')
                                      (not (cacheable-act-request? request*)))
                                 {}
@@ -3569,6 +3701,16 @@
   (let [route-decide-latency-ms (:route-decide-latency-ms phase)
         route-phase-latency-ms (:route-phase-latency-ms phase)
         route-decider-latency-ms (:route-decider-latency-ms phase)
+        protocol-selection (protocol/select-protocol-artifact
+                            (if (map? (:protocol runtime))
+                              (:protocol runtime)
+                              {})
+                            {:trace-id (get-in request* [:trace :id])
+                             :requested-version (some-> request* :routing :artifact/version)})
+        protocol-artifact-version (some-> (:artifact/version protocol-selection) keywordish)
+        protocol-artifact-source (some-> (:artifact/source protocol-selection) keywordish)
+        router-artifact-version (some-> (:router/artifact-version runtime) keywordish)
+        router-artifact-source (some-> (:router/artifact-source runtime) keywordish)
         response0   (if (and (map? response)
                              (map? (:body response)))
                       (cond-> response
@@ -3580,7 +3722,19 @@
                                   (double route-phase-latency-ms))
                         (number? route-decider-latency-ms)
                         (assoc-in [:body :routing/route-decider-latency-ms]
-                                  (double route-decider-latency-ms)))
+                                  (double route-decider-latency-ms))
+                        (keyword? protocol-artifact-version)
+                        (assoc-in [:body :protocol/artifact-version]
+                                  protocol-artifact-version)
+                        (keyword? protocol-artifact-source)
+                        (assoc-in [:body :protocol/artifact-source]
+                                  protocol-artifact-source)
+                        (keyword? router-artifact-version)
+                        (assoc-in [:body :routing/router-artifact-version]
+                                  router-artifact-version)
+                        (keyword? router-artifact-source)
+                        (assoc-in [:body :routing/router-artifact-source]
+                                  router-artifact-source))
                       response)
         response'   (attach-response-participants response0)
         response''  (if (map? (:body response'))
@@ -3675,6 +3829,7 @@
                           {:runtime runtime*
                            :payload payload
                            :act/fns {:prepare-request invoke-act-prepared-request
+                                     :select-runtime invoke-act-select-runtime
                                      :accepted-mode? response-type-accepted?
                                      :effective-resolver effective-resolver
                                      :route-phase invoke-act-route-phase
@@ -3693,6 +3848,11 @@
          cache-telemetry (:cache/telemetry phase3)
          request*        (:request* phase3)
          replay-enabled?* (replay-enabled? runtime* request*)]
+     (when (map? (:tenancy/reservation phase3))
+       (tenancy/finalize! (runtime-tenancy-state runtime*)
+                          (:tenancy/reservation phase3)
+                          response''
+                          elapsed-ms))
      (record-act-telemetry! telemetry response'' elapsed-ms route-telemetry cache-telemetry)
      (let [telemetry-after (when (and replay-enabled?*
                                       (instance? clojure.lang.IAtom telemetry))
@@ -3812,6 +3972,8 @@
                            (when (= :ok outcome) "Session request processed.")
                            "Session request failed.")
             sid        (session-id-from-payload payload)
+            tenant-id  (or (some-> payload :tenant/id keywordish)
+                           (some-> principal :user/tenant-id keywordish))
             trace-id   (some-> payload :trace :id trim-s)
             request-id (some-> payload :request/id trim-s)
             var-keys   (session-op-var-keys action payload)]
@@ -3827,6 +3989,8 @@
                                 :error-type error-type
                                 :latency-ms elapsed-ms
                                 :message message}
+                         (keyword? tenant-id)
+                         (assoc :tenant-id tenant-id)
                          (seq var-keys) (assoc :session/var-keys var-keys)
                          (some? (:user/id principal))
                          (assoc :principal-id (:user/id principal))
@@ -5264,14 +5428,22 @@
                                             "Queue job endpoint not found."))))))))
 
 (defn- telemetry-handler
-  [telemetry]
+  [runtime telemetry]
   (reify HttpHandler
     (handle [_ exchange]
       (let [method (some-> (.getRequestMethod exchange) str/upper-case)]
         (if (contains? #{"GET" "POST"} method)
-          (write-response! exchange 200 (encode-response {:ok? true
-                                                          :service :ferment.http
-                                                          :telemetry (telemetry-snapshot telemetry)}))
+          (let [query-params (parse-query-params exchange)
+                tenant-filter (or (get query-params "tenant")
+                                  (get query-params "tenant/id"))
+                principal-filter (or (get query-params "principal")
+                                     (get query-params "principal-ref"))]
+            (write-response! exchange 200 (encode-response {:ok? true
+                                                            :service :ferment.http
+                                                            :telemetry (telemetry-snapshot runtime
+                                                                                           telemetry
+                                                                                           {:tenant tenant-filter
+                                                                                            :principal principal-filter})})))
           (write-response! exchange
                            405
                            (encode-response {:ok? false
@@ -5466,6 +5638,10 @@
           training-runtime (init-training-runtime training)
           act-middleware (when (sequential? (:act/middleware cfg))
                            (vec (:act/middleware cfg)))
+          tenancy-cfg (let [runtime-cfg (if (map? (:runtime cfg)) (:runtime cfg) {})]
+                        (tenancy/normalize-config (or (:tenancy runtime-cfg)
+                                                      (:tenancy cfg))))
+          tenancy-state (atom (tenancy/default-state))
           runtime0 (let [r (if (map? (:runtime cfg)) (:runtime cfg) {})]
                      (cond-> (if (contains? r :models)
                                r
@@ -5478,6 +5654,9 @@
                        (assoc :replay replay)
                        (map? training-runtime)
                        (assoc :training training-runtime)
+                       true
+                       (assoc :tenancy tenancy-cfg
+                              :tenancy/state tenancy-state)
                        (seq act-middleware)
                        (assoc :act/middleware act-middleware)))
           runtime  (assoc runtime0
@@ -5513,7 +5692,7 @@
       (.createContext server "/v1/admin" (admin-handler runtime))
       (.createContext server "/health" (health-handler (count public-routes)))
       (.createContext server "/routes" (routes-handler public-routes))
-      (.createContext server "/diag/telemetry" (telemetry-handler telemetry-state))
+      (.createContext server "/diag/telemetry" (telemetry-handler runtime telemetry-state))
       (.setExecutor server executor)
       (.start server)
       (telemetry/record-lifecycle! :http :start {:key _k

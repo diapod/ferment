@@ -6,11 +6,20 @@
 
     ferment.router
 
-  (:require [integrant.core :as ig]
+  (:require [clojure.string :as str]
+            [integrant.core :as ig]
             [ferment.system :as system]))
 
 (def ^:private router-top-keys
-  #{:routing :profiles :policy :defaults :intent->policy-profile :policy-profiles})
+  #{:routing
+    :profiles
+    :policy
+    :defaults
+    :intent->policy-profile
+    :policy-profiles
+    :artifact/version
+    :versions
+    :rollout})
 
 (def ^:private routing-keys
   #{:intent->cap
@@ -66,6 +75,23 @@
 (defn- sorted-keys
   [xs]
   (vec (sort-by str xs)))
+
+(defn- keywordish
+  [v]
+  (cond
+    (keyword? v) v
+    (string? v) (let [s (some-> v str str/trim not-empty)]
+                  (when s
+                    (if (str/starts-with? s ":")
+                      (keyword (subs s 1))
+                      (keyword s))))
+    :else nil))
+
+(defn- deep-merge
+  [a b]
+  (if (and (map? a) (map? b))
+    (merge-with deep-merge a b)
+    b))
 
 (defn- ensure-map!
   [v path]
@@ -145,6 +171,46 @@
                      :expected :keyword
                      :value (:policy/profile defaults)})))
   defaults)
+
+(def ^:private rollout-canary-keys
+  #{:enabled? :version :percent})
+
+(def ^:private rollout-keys
+  #{:active :canary})
+
+(defn- validate-rollout-config!
+  [rollout path]
+  (ensure-keyword-map! rollout path)
+  (ensure-only-keys! rollout rollout-keys path)
+  (when (contains? rollout :active)
+    (when-not (keyword? (keywordish (:active rollout)))
+      (fail-router! "Router rollout :active must be a keyword."
+                    {:path (conj path :active)
+                     :expected :keyword
+                     :value (:active rollout)})))
+  (when (contains? rollout :canary)
+    (let [canary (:canary rollout)]
+      (ensure-keyword-map! canary (conj path :canary))
+      (ensure-only-keys! canary rollout-canary-keys (conj path :canary))
+      (when (contains? canary :enabled?)
+        (when-not (boolean? (:enabled? canary))
+          (fail-router! "Router rollout canary :enabled? must be a boolean."
+                        {:path (conj path :canary :enabled?)
+                         :expected :boolean
+                         :value (:enabled? canary)})))
+      (when (contains? canary :version)
+        (when-not (keyword? (keywordish (:version canary)))
+          (fail-router! "Router rollout canary :version must be a keyword."
+                        {:path (conj path :canary :version)
+                         :expected :keyword
+                         :value (:version canary)})))
+      (when (contains? canary :percent)
+        (let [p (:percent canary)]
+          (when-not (and (integer? p) (<= 0 p 100))
+            (fail-router! "Router rollout canary :percent must be integer in [0,100]."
+                          {:path (conj path :canary :percent)
+                           :expected :percent
+                           :value p})))))))
 
 (defn- validate-policy-profiles!
   [profiles path]
@@ -350,6 +416,23 @@
                       {:path [:policy]
                        :expected :keyword
                        :value (:policy cfg)})))
+    (when (contains? cfg :artifact/version)
+      (when-not (keyword? (keywordish (:artifact/version cfg)))
+        (fail-router! "Router top-level :artifact/version must be a keyword."
+                      {:path [:artifact/version]
+                       :expected :keyword
+                       :value (:artifact/version cfg)})))
+    (when (contains? cfg :versions)
+      (let [versions (:versions cfg)]
+        (ensure-keyword-map! versions [:versions])
+        (doseq [[version patch] versions]
+          (when-not (map? patch)
+            (fail-router! "Router version patch must be a map."
+                          {:path [:versions version]
+                           :expected :map
+                           :value patch})))))
+    (when (contains? cfg :rollout)
+      (validate-rollout-config! (:rollout cfg) [:rollout]))
     (when (contains? cfg :defaults)
       (validate-router-defaults! (:defaults cfg) [:defaults]))
     cfg))
@@ -436,6 +519,106 @@
    :context/summarize :router
    :eval/grade :router
    :text/respond :voice})
+
+(defn- normalize-version-catalog
+  [versions]
+  (if-not (map? versions)
+    {}
+    (into {}
+          (keep (fn [[version patch]]
+                  (let [v' (keywordish version)]
+                    (when (and (keyword? v')
+                               (map? patch))
+                      [v' patch]))))
+          versions)))
+
+(defn- normalize-rollout
+  [rollout]
+  (if-not (map? rollout)
+    {}
+    (let [canary (if (map? (:canary rollout))
+                   (:canary rollout)
+                   {})
+          active (keywordish (:active rollout))
+          canary-version (keywordish (:version canary))
+          percent (let [p (:percent canary)]
+                    (when (and (integer? p) (<= 0 p 100))
+                      p))]
+      {:active active
+       :canary (cond-> {}
+                 (contains? canary :enabled?) (assoc :enabled? (boolean (:enabled? canary)))
+                 (keyword? canary-version) (assoc :version canary-version)
+                 (integer? percent) (assoc :percent percent))})))
+
+(defn- trace-bucket
+  [trace-id]
+  (if (and (string? trace-id) (not (str/blank? trace-id)))
+    (mod (Math/abs (long (hash trace-id))) 100)
+    0))
+
+(defn select-router-artifact
+  "Selects router artifact/version for a request.
+
+  Input:
+  - `router`: router config map, optionally with `:versions` and `:rollout`,
+  - opts map:
+    - `:trace-id` (string) for deterministic canary bucketing,
+    - `:requested-version` (keyword|string) for explicit request override.
+
+  Output map:
+  - `:router`: selected router config map,
+  - `:artifact/version`: selected version keyword when present,
+  - `:artifact/source`: one of `:request`, `:canary`, `:active`, `:default`."
+  [router {:keys [trace-id requested-version]}]
+  (let [base-router (if (map? router) router {})
+        versions (normalize-version-catalog (:versions base-router))
+        rollout (normalize-rollout (:rollout base-router))
+        requested-version' (keywordish requested-version)
+        active-version (or (keywordish (:active rollout))
+                           (keywordish (:artifact/version base-router)))
+        canary-cfg (if (map? (:canary rollout))
+                     (:canary rollout)
+                     {})
+        canary-enabled? (true? (:enabled? canary-cfg))
+        canary-version (keywordish (:version canary-cfg))
+        canary-percent (let [p (:percent canary-cfg)]
+                         (if (and (integer? p) (<= 0 p 100))
+                           p
+                           0))
+        canary-hit? (and canary-enabled?
+                         (keyword? canary-version)
+                         (contains? versions canary-version)
+                         (> canary-percent 0)
+                         (< (trace-bucket trace-id) canary-percent))
+        [selected-version selected-source]
+        (cond
+          (and (keyword? requested-version')
+               (contains? versions requested-version'))
+          [requested-version' :request]
+
+          canary-hit?
+          [canary-version :canary]
+
+          (and (keyword? active-version)
+               (contains? versions active-version))
+          [active-version :active]
+
+          :else
+          [(or (keywordish (:artifact/version base-router))
+               (first (keys versions)))
+           :default])
+        selected-patch (when (keyword? selected-version)
+                         (get versions selected-version))
+        selected-router (if (map? selected-patch)
+                          (-> (dissoc base-router :versions :rollout :artifact/version)
+                              (deep-merge selected-patch)
+                              (assoc :artifact/version selected-version))
+                          (cond-> (dissoc base-router :versions :rollout)
+                            (keyword? selected-version)
+                            (assoc :artifact/version selected-version)))]
+    {:router selected-router
+     :artifact/version selected-version
+     :artifact/source selected-source}))
 
 (defn default-model-key-by-intent
   "Returns default model selector key for capability intent from routing config."

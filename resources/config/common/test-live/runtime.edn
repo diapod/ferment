@@ -14,5 +14,7 @@
   {:enabled? true
    :store/type :fs-ednl
    :store/path "target/runtime/execution-graph-test-live/events.ednl"
-   :max-events 50000}}}
+   :max-events 50000}
+  :tenancy
+  {:enabled? false}}}
 }

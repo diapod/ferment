@@ -41,6 +41,17 @@
    :store/type :fs-ednl
    :store/path "target/runtime/execution-graph/events.ednl"
    :max-events 200000}
+  :tenancy
+  {:enabled? false
+   :default-tenant :tenant/default
+   :default {:limits {:requests-per-minute nil
+                      :max-concurrent-requests nil
+                      :max-tokens-per-request nil
+                      :max-timeout-ms nil
+                      :daily-max-billed-tokens nil}
+             :routing/defaults {}}
+   :tenants {}
+   :principal->tenant {}}
   :oplog    #ref :ferment.logging/oplog}
 
  }

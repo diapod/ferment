@@ -17,10 +17,12 @@ Main goal:
 This document and `doc/stratification.md` are the joint operational source of truth:
 - `doc/design.md` defines architecture, modules, and development plan,
 - `doc/stratification.md` defines execution semantics (capabilities, IR, quality applicator).
+- `doc/router-charter.md` defines router-first scope guardrails (anti-cathedral constraints and PR gate).
 
 Consistency rule:
 - call/delegation semantics follow `doc/stratification.md`,
-- module boundaries and development stages follow `doc/design.md`.
+- module boundaries and development stages follow `doc/design.md`,
+- router/core growth decisions follow `doc/router-charter.md`.
 
 ## 3. Architectural Principles
 
@@ -126,6 +128,7 @@ Target buds:
   - `:prompts/:intents` (intent semantic refinements).
   Runtime composes prompts from these layers; `:intents/*/:system` is the canonical full override.
 - benchmark packs for tuning gates live in `resources/bench/act*.json` case directories (`act`, `act-low-latency`, `act-sla`), with runner `bin/benchmark-live` and artifact schema in `target/benchmarks/<timestamp>/` (single run) or `target/benchmarks/<timestamp>/run-*/` plus aggregate `summary.*` (multi-run via `--runs N`).
+- release-gate comparator `bin/benchmark-gate` evaluates candidate summary (and optional baseline diff), writes deterministic gate report (`gate-report.json`/`gate-report.md`), and exits non-zero on gate failure for CI integration.
 
 ### 6.1. Implementation Status (2026-02-22)
 

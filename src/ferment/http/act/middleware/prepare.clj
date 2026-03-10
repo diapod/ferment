@@ -25,6 +25,12 @@
                        :required k})))
     f))
 
+(defn- optional-fn
+  [fns k]
+  (let [f (get fns k)]
+    (when (fn? f)
+      f)))
+
 (defn middleware
   ([]
    (middleware nil nil))
@@ -38,20 +44,25 @@
                            prepare-request  (required-fn fns :prepare-request name)
                            accepted-mode?*  (required-fn fns :accepted-mode? name)
                            resolver*        (required-fn fns :effective-resolver name)
+                           select-runtime   (optional-fn fns :select-runtime)
                            request          (if (contains? ctx :request)
                                               (:request ctx)
                                               (prepare-request runtime payload auth))
+                           runtime'         (if (fn? select-runtime)
+                                              (select-runtime runtime request)
+                                              runtime)
                            accepted-mode?   (if (contains? ctx :accepted-mode?)
                                               (:accepted-mode? ctx)
                                               (and (map? request)
                                                    (accepted-mode?* request)))
                            protocol         (if (contains? ctx :protocol)
                                               (:protocol ctx)
-                                              (or (:protocol runtime) {}))
+                                              (or (:protocol runtime') {}))
                            resolver         (if (contains? ctx :resolver)
                                               (:resolver ctx)
-                                              (resolver* runtime))]
+                                              (resolver* runtime'))]
                        (next (merge ctx
+                                    {:runtime runtime'}
                                     {:request request
                                      :accepted-mode? accepted-mode?
                                      :protocol protocol

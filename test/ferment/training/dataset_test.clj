@@ -32,6 +32,54 @@
    :timing {:call/latency-ms (+ 10.0 n)}
    :labels {:accepted? true}})
 
+(defn- sample-replay
+  [n]
+  (let [trace-id (format "replay-%02d" n)
+        req-id (format "replay-req-%02d" n)
+        prompt (str "Wyjasnij ACID " n)]
+    {:trace/id trace-id
+     :recorded-at (format "2026-03-%02dT10:00:00Z" (inc n))
+     :request {:payload {:trace {:id trace-id}
+                         :task {:intent :text/respond}
+                         :input {:prompt prompt
+                                 :email "john@example.com"
+                                 :token "abc-secret"}}
+               :prepared {:trace {:id trace-id}
+                          :request/id req-id
+                          :task {:intent :text/respond
+                                 :requires {:out-schema :res/text}}
+                          :input {:prompt prompt
+                                  :email "john@example.com"
+                                  :token "abc-secret"}}
+               :resolved {:trace {:id trace-id}
+                          :request/id req-id
+                          :task {:intent :text/respond
+                                 :requires {:out-schema :res/text}}
+                          :input {:prompt prompt
+                                  :email "john@example.com"
+                                  :token "abc-secret"}}}
+     :routing {:mode :meta-decider
+               :routed? true
+               :cap/decision {:cap/id :llm/voice}}
+     :policy {:snapshot-id (str "policy-" n)}
+     :response {:status 200
+                :outcome :ok
+                :body {:result {:type :value
+                                :plan/run {:transcript [{:op :call
+                                                         :intent :text/respond
+                                                         :cap/id :llm/voice
+                                                         :as :voice-primary
+                                                         :attempt 1
+                                                         :candidate-index 0
+                                                         :input {:prompt prompt
+                                                                 :authorization "Bearer top.secret"}
+                                                         :result/type :value
+                                                         :out {:text (str "ACID " n " kontakt: john@example.com")}
+                                                         :latency-ms (+ 30.0 n)}]}}}}
+     :diagnostics {:execution-path {:intent :text/respond
+                                    :selected-cap/id :llm/voice}}
+     :timing {:elapsed-ms (+ 100.0 n)}}))
+
 (defn- sha256-hex
   [s]
   (let [^MessageDigest digest (MessageDigest/getInstance "SHA-256")
@@ -221,3 +269,29 @@
              (:error (ex-data ex))))
       (is (= :config-changed
              (:mode/reason (ex-data ex)))))))
+
+(deftest build-dataset-from-replay-input-is-json-serializable
+  (testing "Replay input with default redaction produces JSON-serializable dataset artifacts."
+    (let [records (mapv sample-replay (range 1 4))
+          input-dir (create-temp-dir "ferment-dataset-replay-in-")
+          out-dir (create-temp-dir "ferment-dataset-replay-out-")
+          in-path (str (io/file input-dir "replay.jsonl"))
+          _ (spit in-path
+                  (str/join
+                   "\n"
+                   (map #(json/generate-string %)
+                        records)))
+          res (dataset/build-dataset-from-input! {:in in-path
+                                                  :out-dir out-dir
+                                                  :target-format :messages})
+          events-jsonl (parse-jsonl (:out/events res))]
+      (is (= false (:skipped? res)))
+      (is (= 3 (:events/count res)))
+      (is (= 3 (count events-jsonl)))
+      (is (every? string?
+                  (mapcat #(get-in % [:redaction :audit :config :deny/patterns])
+                          events-jsonl)))
+      (is (not (str/includes? (slurp (:out/events res)) "john@example.com")))
+      (is (not (str/includes? (slurp (:out/events res)) "abc-secret")))
+      (is (not (str/includes? (slurp (:out/events res)) "top.secret")))
+      (is (str/includes? (slurp (:out/events res)) "[REDACTED]")))))

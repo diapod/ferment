@@ -1103,7 +1103,9 @@
                    request-id trace proto session-version resolver]
             :as opts}]
   (let [mode (llm-mode runtime)
-        protocol (runtime-protocol runtime)
+        protocol (or (when (map? (:protocol opts))
+                       (:protocol opts))
+                     (runtime-protocol runtime))
         parser (or result-parser
                    (when (stream-response-mode? opts)
                      default-stream-result-parser)
@@ -1245,7 +1247,7 @@
         (throw (ex-info "LLM invocation failed after retries" run))))))
 
 (defn- invoke-plan-call!
-  [runtime resolver]
+  [runtime resolver protocol]
   (fn [call-node env]
     (let [intent  (:intent call-node)
           cap-id  (or (:cap/id call-node)
@@ -1280,6 +1282,7 @@
                            :temperature temp
                            :max-attempts (:max-attempts call-node)
                            :result-parser (:result-parser call-node)
+                           :protocol protocol
                            :auth/user (:auth/user env)
                            :roles (:roles/config env)
                            :resolver resolver}))))
@@ -1297,11 +1300,11 @@
                 (judge-score-from-output score-path)))))
 
 (defn- runtime-judge-fn
-  [runtime resolver parent-opts]
-  (let [protocol (or (runtime-protocol runtime) {})]
+  [runtime resolver parent-opts protocol]
+  (let [protocol' (or protocol (runtime-protocol runtime) {})]
     (fn [call-node env result]
       (let [intent       (:intent call-node)
-            judge-cfg    (intent-judge-config protocol intent)
+            judge-cfg    (intent-judge-config protocol' intent)
             enabled?     (boolean (:enabled? judge-cfg))
             judge-intent (or (:intent judge-cfg) :eval/grade)
             judge-cap    (or (:cap/id judge-cfg)
@@ -1329,6 +1332,7 @@
                                            :judge/for-cap (:cap/id call-node)}
                                  :max-attempts max-attempts
                                  :result-parser judge-result-parser
+                                 :protocol protocol'
                                  :auth/user (:auth/user parent-opts)
                                  :roles (:roles parent-opts)
                                  :session/id (:session/id parent-opts)})
@@ -1432,9 +1436,13 @@
   ([runtime resolver opts]
    (let [effects-cfg   (runtime-effects runtime)
          check-fns     (runtime-check-fns runtime)
-         judge-fn      (runtime-judge-fn runtime resolver opts)
          debug-plan?   (true? (:debug/plan? opts))
          debug-transcript? (true? (:debug/transcript? opts))
+         protocol      (or (when (map? (:protocol opts))
+                             (:protocol opts))
+                           (runtime-protocol runtime)
+                           {})
+         judge-fn      (runtime-judge-fn runtime resolver opts protocol)
          policy-profile (or (some-> (:policy/profile opts) keywordish)
                             (some-> (get-in opts [:routing :policy/profile]) keywordish)
                             (some-> (get-in resolver [:policy/profile]) keywordish))
@@ -1446,7 +1454,6 @@
                                (positive-int-or-nil (:max-call-attempts opts)))
          max-fallback-hops (or (positive-int-or-nil (:workflow/max-fallback-hops opts))
                                (positive-int-or-nil (:max-fallback-hops opts)))
-         protocol      (or (runtime-protocol runtime) {})
          resolver'     (cond-> (if (map? resolver) resolver {})
                          (map? protocol) (assoc :protocol protocol)
                          (keyword? policy-profile) (assoc :policy/profile policy-profile)
@@ -1469,7 +1476,7 @@
              run  (workflow/execute-plan
                    {:plan plan
                     :resolver resolver'
-                    :invoke-call (invoke-plan-call! runtime resolver')
+                    :invoke-call (invoke-plan-call! runtime resolver' protocol)
                     :invoke-tool (fn [tool-node env]
                                    (tool-adapter/invoke! effects-cfg tool-node env))
                     :check-fns check-fns

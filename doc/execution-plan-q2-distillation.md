@@ -214,8 +214,12 @@ Goal: full training-data pipeline for LoRA/QLoRA, from runtime collection to pro
 
 ## Release Gate Checklist (Priority #11)
 
-- [ ] `bin/test --focus ferment.training-` suites green
-- [ ] deterministic rebuild reproduces manifest + hashes
-- [ ] redaction audit passes (no secret/PII leakage in artifacts)
-- [ ] trainer dry-run validates exported dataset format
-- [ ] eval + promotion report generated and archived for candidate model
+- [x] `bin/test --focus ferment.training.{collector,dataset,export-events,redaction,judge,eval,promotion}-test` suites green
+- [x] deterministic rebuild reproduces manifest + hashes
+- [x] redaction audit passes (no secret/PII leakage in artifacts)
+- [x] trainer dry-run validates exported dataset format
+- [x] eval + promotion report generated and archived for candidate model
+
+Latest gate run (2026-03-09):
+- artifacts: `target/training/release-gate-20260309T163935Z`
+- summary: `target/training/release-gate-20260309T163935Z/reports/release-gate-summary.json`

@@ -137,6 +137,12 @@ Main file: `resources/config/common/prod/router.edn`.
 Shape (EDN):
 ```edn
 {:routing                ref
+ :artifact/version       kw
+ :versions               {kw map …}
+ :rollout                {:active kw
+                          :canary {:enabled? boolean
+                                   :version  kw
+                                   :percent  int}}
  :intent->policy-profile {kw kw …}
  :policy-profiles
  {kw {:default {:retry {:same-cap-max int
@@ -217,8 +223,20 @@ Shape (EDN):
                           :optional [kw …]}
  :envelope/response {:required-one-of [kw …]}
  :prompts           {:default [string …]
-           :roles   {kw [string …] …}
-           :intents {kw [string …] …}}
+                      :roles   {kw [string …] …}
+                      :intents {kw [string …] …}}
+ :versions          {kw {:prompts? {:default [string …]
+                                    :roles   {kw [string …] …}
+                                    :intents {kw [string …] …}}
+                         :intents? {kw map …}
+                         :policy/default? map
+                         :policy/intents? {kw map …}}
+                     …}
+ :rollout           {:active kw
+                     :canary {:enabled? boolean
+                              :version  kw
+                              :percent  int}}
+ :artifact/version  kw
  :intents
  {kw {:in-schema        kw
       :out-schema       kw

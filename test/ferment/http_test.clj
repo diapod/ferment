@@ -5,6 +5,7 @@
             [ferment.http :as http]
             [ferment.queue :as queue]
             [ferment.telemetry :as telemetry]
+            [ferment.tenancy :as tenancy]
             [ferment.training.collector :as training-collector]))
 
 (deftest invoke-act-injects-auth-principal-into-core-options
@@ -44,6 +45,74 @@
       (is (= #{:role/operator :role/reviewer}
              (set (get-in @seen [:session/meta :user/roles]))))
       (is (= (:roles runtime) (:roles @seen))))))
+
+(deftest invoke-act-selects-protocol-artifact-version
+  (testing "invoke-act selects protocol artifact version from request routing override."
+    (let [seen (atom nil)
+          runtime {:roles {}
+                   :resolver {}
+                    :protocol {:prompts {:default "Base"}
+                               :versions {:v1 {:prompts {:default "V1"}}
+                                          :v2 {:prompts {:default "V2"}}}
+                               :rollout {:active :v1
+                                         :canary {:enabled? true
+                                                  :version :v2
+                                                  :percent 0}}}}
+          payload {:proto 1
+                   :trace {:id "t-proto-version-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :routing {:artifact/version :v2}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= :v2 (:protocol/artifact-version @seen)))
+      (is (= :request (:protocol/artifact-source @seen)))
+      (is (= "V2" (get-in @seen [:protocol :prompts :default])))
+      (is (= :v2 (get-in response [:body :protocol/artifact-version])))
+      (is (= :request (get-in response [:body :protocol/artifact-source]))))))
+
+(deftest invoke-act-selects-router-artifact-version
+  (testing "invoke-act selects router artifact version and applies selected routing policy profile."
+    (let [seen (atom nil)
+          runtime {:roles {}
+                   :protocol {}
+                   :resolver {}
+                   :router {:routing {:intent->cap {:text/respond :llm/voice}}
+                            :defaults {}
+                            :intent->policy-profile {:text/respond :low-latency}
+                            :policy-profiles {:low-latency {:limits {:call-tree/max-calls 3}}
+                                              :high-quality {:limits {:call-tree/max-calls 9}}}
+                            :versions {:v1 {}
+                                       :v2 {:intent->policy-profile {:text/respond :high-quality}}}
+                            :rollout {:active :v1
+                                      :canary {:enabled? false
+                                               :version :v2
+                                               :percent 0}}}}
+          payload {:proto 1
+                   :trace {:id "t-router-version-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :routing {:router/version :v2}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= :v2 (:router/artifact-version @seen)))
+      (is (= :request (:router/artifact-source @seen)))
+      (is (= :high-quality (:policy/profile @seen)))
+      (is (= 9 (:workflow/max-calls @seen)))
+      (is (= :v2 (get-in response [:body :routing/router-artifact-version])))
+      (is (= :request (get-in response [:body :routing/router-artifact-source]))))))
 
 (deftest invoke-act-uses-configured-middleware-chain
   (testing "invoke-act may run through configured act middleware chain compiled from data modules."
@@ -97,6 +166,103 @@
       (is (= 200 (:status response)))
       ;; resolver :caps/by-id dispatch role has precedence
       (is (= :router (:role @seen))))))
+
+(deftest invoke-act-applies-tenant-routing-and-budget-guardrails
+  (testing "Tenant defaults apply routing profile and clamp request budget/timeout."
+    (let [seen (atom nil)
+          runtime {:protocol {}
+                   :resolver {}
+                   :tenancy {:enabled? true
+                             :default {:limits {:max-tokens-per-request 64
+                                                :max-timeout-ms 4000}
+                                       :routing/defaults {:profile :low-latency
+                                                          :policy/profile :low-latency}}}
+                   :tenancy/state (atom (tenancy/default-state))}
+          payload {:proto 1
+                   :trace {:id "t-tenant-guard-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :timeout-ms 9000
+                   :budget {:max-tokens 512}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= :low-latency (:policy/profile @seen)))
+      (is (= 64 (get-in @seen [:budget :max-tokens])))
+      (is (= 4000 (:timeout-ms @seen))))))
+
+(deftest invoke-act-enforces-tenant-and-principal-rate-limits
+  (testing "Tenant and principal requests-per-minute limits are enforced before call execution."
+    (let [calls (atom 0)
+          base-runtime {:protocol {}
+                        :resolver {}
+                        :tenancy/state (atom (tenancy/default-state))
+                        :tenancy {:enabled? true
+                                  :default {:limits {:requests-per-minute 1}
+                                            :principal/limits {:requests-per-minute 1}}}}
+          payload {:proto 1
+                   :trace {:id "t-tenant-rpm-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          auth {:user {:user/id 11
+                       :user/email "u11@example.com"
+                       :user/account-type :user
+                       :user/roles #{:role/user}}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      (swap! calls inc)
+                      {:result {:type :value
+                                :out {:text "ok"}}})]
+        (let [first-resp (http/invoke-act base-runtime payload nil auth)
+              second-resp (http/invoke-act base-runtime payload nil auth)]
+          (is (= 200 (:status first-resp)))
+          (is (= 429 (:status second-resp)))
+          (is (contains? #{:tenant/rate-limit-exceeded
+                           :principal/rate-limit-exceeded}
+                         (get-in second-resp [:body :error :type])))
+          (is (= 1 @calls)))))))
+
+(deftest telemetry-snapshot-includes-tenancy-and-supports-filters
+  (testing "Telemetry snapshot exposes tenancy branch with optional tenant/principal filters."
+    (let [telemetry (atom {})
+          runtime {:protocol {}
+                   :resolver {}
+                   :tenancy/state (atom (tenancy/default-state))
+                   :tenancy {:enabled? true
+                             :default {:limits {:requests-per-minute 2}}}}
+          payload {:proto 1
+                   :trace {:id "t-tenant-telemetry-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          auth {:user {:user/id 21
+                       :user/email "u21@example.com"
+                       :user/account-type :user
+                       :user/roles #{:role/user}}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      {:result {:type :value
+                                :out {:text "ok"}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry auth))))
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry auth)))))
+      (let [snapshot (#'ferment.http/telemetry-snapshot runtime telemetry nil)
+            filtered (#'ferment.http/telemetry-snapshot runtime telemetry
+                                                        {:tenant "tenant/default"
+                                                         :principal "id:21"})]
+        (is (= 2 (get-in snapshot [:tenancy :requests])))
+        (is (= 2 (get-in snapshot [:tenancy :by-tenant :tenant/default :requests])))
+        (is (= 2 (get-in snapshot [:tenancy :by-principal "id:21" :requests])))
+        (is (= {:tenant :tenant/default
+                :principal "id:21"}
+               (get-in filtered [:tenancy :filters])))
+        (is (= [:tenant/default]
+               (-> filtered :tenancy :by-tenant keys vec)))))))
 
 (deftest invoke-act-capability-resolution-falls-back-from-explicit-near-miss
   (testing "When explicit :cap/id does not support request intent, resolver falls back to canonical intent capability."

@@ -1,5 +1,6 @@
 (ns ferment.training.redaction-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [cheshire.core :as json]
+            [clojure.test :refer [deftest is testing]]
             [ferment.training.redaction :as redaction]))
 
 (deftest redact-event-redacts-keys-paths-and-patterns-deterministically
@@ -25,7 +26,9 @@
       (is (= "Kontakt: [MASKED]" (get-in event [:call :out :text])))
       (is (= 1 (:redacted/paths audit)))
       (is (= 2 (:redacted/keys audit)))
-      (is (= 2 (:redacted/patterns audit))))))
+      (is (= 2 (:redacted/patterns audit)))
+      (is (every? string? (get-in audit [:config :deny/patterns])))
+      (is (string? (json/generate-string audit))))))
 
 (deftest redact-event-disabled-is-noop
   (testing "Disabled redaction preserves event payload and reports disabled audit."
