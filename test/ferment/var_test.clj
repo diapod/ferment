@@ -116,6 +116,7 @@
   (testing "Each capability is a separate key, has contract metadata, and aggregate still exists."
     (let [cfg (read-edn-with-integrant-readers "resources/config/common/prod/capabilities.edn")
           cap-keys #{:ferment.caps.registry/llm-voice
+                     :ferment.caps.registry/llm-voice-remote
                      :ferment.caps.registry/llm-code
                      :ferment.caps.registry/llm-solver
                      :ferment.caps.registry/llm-solver-text
@@ -136,7 +137,7 @@
                            (contains? cap :io/in-schema)
                            (contains? cap :io/out-schema))))
                   cap-keys))
-      (is (= 7 (count refs)))
+      (is (= 8 (count refs)))
       (is (= cap-keys (set refs))))))
 
 (deftest resolver-config-references-flat-capabilities
@@ -149,6 +150,7 @@
                                               {:caps caps})]
       (is (map? default))
       (is (= #{:ferment.caps.registry/llm-voice
+               :ferment.caps.registry/llm-voice-remote
                :ferment.caps.registry/llm-code
                :ferment.caps.registry/llm-solver
                :ferment.caps.registry/llm-solver-text

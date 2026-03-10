@@ -2140,6 +2140,37 @@
         (is (= 1 (get-in snapshot [:kpi :failure-taxonomy :by-domain :schema])))
         (is (= 1 (get-in snapshot [:kpi :failure-taxonomy :by-domain :runtime])))))))
 
+(deftest telemetry-snapshot-separates-transport-failures
+  (testing "Runtime invoke failures are counted by transport class and failure class."
+    (let [runtime {:protocol {}
+                   :resolver {}}
+          telemetry (atom {})
+          payload {:proto 1
+                   :trace {:id "t-transport-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      (throw (ex-info
+                              "runtime invoke failed"
+                              {:error :runtime-invoke-failed
+                               :cap-id :llm/voice
+                               :intent :text/respond
+                               :model-key :ferment.model/voice
+                               :transport/class :remote-http
+                               :transport/failure-class :connectivity
+                               :transport/error :invoke-http-failed})))]
+        (is (= 502
+               (:status (http/invoke-act runtime payload telemetry nil)))))
+      (let [snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= 1 (get-in snapshot [:act :transport :failures])))
+        (is (= 1 (get-in snapshot [:act :transport :by-class :connectivity])))
+        (is (= 1 (get-in snapshot [:act :transport :by-transport :remote-http])))
+        (is (= 1 (get-in snapshot [:act :transport :by-error :invoke-http-failed])))
+        (is (= 1 (get-in snapshot [:orchestration :transport/failure-trend :failures])))
+        (is (= 1 (get-in snapshot [:orchestration :transport/failure-trend :by-class :connectivity])))))))
+
 (deftest telemetry-snapshot-includes-must-failed-from-error-details
   (testing "Strict fail-closed errors contribute workflow must-failed telemetry."
     (let [routing {:intent->cap {:route/decide :llm/meta

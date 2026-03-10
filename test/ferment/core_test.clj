@@ -155,6 +155,35 @@
         (is (= 4321 (get-in @called [:payload :timeout-ms])))
         (is (= "s-42" (get-in @called [:opts :session/id])))))))
 
+(deftest model-generate-classifies-transport-failures
+  (testing "Runtime invoke failure exposes deterministic transport class in ex-data."
+    (let [runtime {:resolver {:caps/by-id {:llm/solver {:cap/id :llm/solver
+                                                        :dispatch/model-key :ferment.model/solver
+                                                        :transport/type :remote-http}}}
+                   :models {:ferment.model/solver {:id "solver-selected"
+                                                   :runtime {:invoke/http {:url "http://127.0.0.1:18080/v1/chat/completions"}}}}}
+          err (with-redefs [model/invoke-model!
+                            (fn [_runtime _model-k _payload _opts]
+                              {:ok? false
+                               :error :invoke-failed
+                               :details {:error :invoke-http-failed}})]
+                (try
+                  (core/ollama-generate!
+                   {:runtime runtime
+                    :resolver (:resolver runtime)
+                    :cap-id :llm/solver
+                    :intent :problem/solve
+                    :prompt "hej"
+                    :mode :live})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e
+                    (ex-data e))))]
+      (is (= :runtime-invoke-failed (:error err)))
+      (is (= :remote-http (:transport/class err)))
+      (is (= :connectivity (:transport/failure-class err)))
+      (is (= :invoke-http-failed (:transport/error err)))
+      (is (= :remote-http (get-in err [:transport/descriptor :transport/type]))))))
+
 (deftest invoke-capability-forwards-budget-generation-overrides
   (testing "invoke-capability! forwards budget :max-tokens/:top-p and timeout into runtime invoke payload."
     (let [seen (atom nil)]

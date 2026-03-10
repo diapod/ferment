@@ -190,6 +190,7 @@ Main file: `resources/config/common/prod/capabilities.edn`.
 Shape (EDN):
 ```edn
 {:intent->cap               {kw kw …}
+ :intent->candidates        {kw [kw …] …}
  :intent->default-model-key {kw kw …}
  :cap->role                 {kw kw …}
  :intent->default-role      {kw kw …}
@@ -198,6 +199,8 @@ Shape (EDN):
                              :fallback-max int}
  :gateway {:strategy         kw
            :intent->strategy {kw kw …}
+           :transport-order  [kw …]
+           :intent->transport-order {kw [kw …] …}
            :ema-alpha        number
            :hedging          {:enabled?         boolean
                               :intent->enabled? {kw boolean …}
@@ -294,6 +297,11 @@ Shape (EDN):
  :cap/version         string
  :cap/cost            {:latency-ms ms}
  :cap/limits          {:timeout-ms ms}
+ :transport/type      kw
+ :transport/auth      kw
+ :transport/timeout-ms ms?
+ :transport/retry     {:max int
+                       :backoff-ms ms}
  :cap/tags            #{kw …}
  :cap/intents         #{kw …}
  :cap/can-produce     #{kw …}
@@ -385,6 +393,10 @@ Shape (EDN):
  :invoke/http {:base-url     string|ref
                :endpoint     string|ref
                :model        string|ref
+               :headers?     {string string|ref …}
+               :timeout-ms?  ms
+               :retries?     int
+               :retry-ms?    ms
                :temperature? number
                :top-p?       number
                :max-tokens?  int}

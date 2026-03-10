@@ -161,6 +161,41 @@ Notes:
 - Response envelope includes selected router artifact metadata under `"routing/router-artifact-version"` and `"routing/router-artifact-source"` when available.
 - Successful responses may include execution metadata like `models/used` and (for plan-based flow) `result.plan/run`.
 
+### Mixed transport canary pack (local + remote API for `text/respond`)
+
+The production router config ships a reference canary artifact `:canary-v1` that adds
+`intent->candidates` for `:text/respond` and sets gateway transport preference to
+`[:remote-http :local-runtime]`, so effective candidate priority is:
+1. `:llm/voice-remote` (remote HTTP adapter)
+2. `:llm/voice` (local runtime)
+3. `:llm/solver-text` (text fallback)
+
+Use it per request without changing baseline rollout:
+
+```bash
+curl -s http://127.0.0.1:12002/v1/act \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "proto": 1,
+    "trace": {"id": "mixed-transport-demo-1"},
+    "task": {"intent": "text/respond"},
+    "routing": {
+      "router/version": "canary-v1",
+      "profile": "mixed-transport",
+      "meta?": true,
+      "debug/transcript?": true
+    },
+    "input": {"prompt": "Explain ACID briefly and give one example."}
+  }'
+```
+
+Remote endpoint defaults are configurable via:
+- `FERMENT_MODEL_VOICE_REMOTE_BASE_URL`
+- `FERMENT_MODEL_VOICE_REMOTE_ENDPOINT`
+
+By default they point to local voice runtime, so operators can validate policy wiring
+first and then switch to an external API endpoint in environment overlays.
+
 ## 4) Coding-oriented request with effects contract
 
 Use this when the request should declare effect needs and completion criteria.

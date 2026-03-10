@@ -28,6 +28,21 @@
 (def ^:private default-cap-tags
   #{})
 
+(def ^:private default-transport-type
+  :local-runtime)
+
+(def ^:private default-transport-auth
+  :none)
+
+(def ^:private transport-types
+  #{:local-runtime :remote-http :peer})
+
+(def ^:private transport-auth-modes
+  #{:none :bearer :basic :api-key :mtls :session :custom})
+
+(def ^:private transport-retry-keys
+  #{:max :backoff-ms})
+
 (defn- keyword-set
   [v]
   (cond
@@ -43,6 +58,17 @@
       (and (sequential? v)
            (not (map? v))
            (every? keyword? v))))
+
+(defn- keywordish
+  [v]
+  (cond
+    (keyword? v) v
+    (string? v) (let [s (some-> v str str/trim not-empty)]
+                  (when s
+                    (if (str/starts-with? s ":")
+                      (keyword (subs s 1))
+                      (keyword s))))
+    :else nil))
 
 (defn- nonblank-string?
   [v]
@@ -61,6 +87,43 @@
                       (not (neg? (double v)))))
                m)))
 
+(defn- nonneg-int
+  [v]
+  (let [n (cond
+            (int? v) v
+            (integer? v) (int v)
+            :else nil)]
+    (when (and (int? n) (<= 0 n))
+      n)))
+
+(defn- normalize-transport-retry
+  [v]
+  (let [m (if (map? v) v {})
+        max' (nonneg-int (:max m))
+        backoff-ms' (nonneg-int (:backoff-ms m))]
+    (cond-> {}
+      (int? max') (assoc :max max')
+      (int? backoff-ms') (assoc :backoff-ms backoff-ms'))))
+
+(defn- normalize-transport
+  [cap-config limits]
+  (let [transport (if (map? (:transport cap-config)) (:transport cap-config) {})
+        type' (or (keywordish (:transport/type cap-config))
+                  (keywordish (:type transport))
+                  default-transport-type)
+        auth' (or (keywordish (:transport/auth cap-config))
+                  (keywordish (:auth transport))
+                  default-transport-auth)
+        timeout-ms' (or (nonneg-int (:transport/timeout-ms cap-config))
+                        (nonneg-int (:timeout-ms transport))
+                        (nonneg-int (:timeout-ms limits)))
+        retry' (or (some-> (:transport/retry cap-config) normalize-transport-retry)
+                   (some-> (:retry transport) normalize-transport-retry))]
+    (cond-> {:transport/type type'
+             :transport/auth auth'}
+      (int? timeout-ms') (assoc :transport/timeout-ms timeout-ms')
+      (and (map? retry') (seq retry')) (assoc :transport/retry retry'))))
+
 (defn normalize-capability-metadata
   "Normalizes capability metadata fields to sets of keywords."
   [cap-config]
@@ -77,15 +140,22 @@
         cost        (let [v (normalize-kv-map (:cap/cost cap-config))]
                       (if (seq v) v default-cap-cost))
         limits      (let [v (normalize-kv-map (:cap/limits cap-config))]
-                      (if (seq v) v default-cap-limits))]
-    (assoc cap-config
-           :cap/intents intents
-           :cap/can-produce can-produce
-           :cap/effects-allowed effects
-           :cap/tags tags
-           :cap/version version
-           :cap/cost cost
-           :cap/limits limits)))
+                      (if (seq v) v default-cap-limits))
+        transport   (normalize-transport cap-config limits)]
+    (cond-> (assoc cap-config
+                   :cap/intents intents
+                   :cap/can-produce can-produce
+                   :cap/effects-allowed effects
+                   :cap/tags tags
+                   :cap/version version
+                   :cap/cost cost
+                   :cap/limits limits
+                   :transport/type (:transport/type transport)
+                   :transport/auth (:transport/auth transport))
+      (contains? transport :transport/timeout-ms)
+      (assoc :transport/timeout-ms (:transport/timeout-ms transport))
+      (contains? transport :transport/retry)
+      (assoc :transport/retry (:transport/retry transport)))))
 
 (defn- ensure-required-capability-metadata!
   [cap-key cap-config]
@@ -117,6 +187,25 @@
                  (and (contains? cap-config :cap/limits)
                       (not (nonneg-number-map? (:cap/limits cap-config))))
                  (conj :cap/limits)
+                 (and (contains? cap-config :transport/type)
+                      (not (contains? transport-types (:transport/type cap-config))))
+                 (conj :transport/type)
+                 (and (contains? cap-config :transport/auth)
+                      (not (contains? transport-auth-modes (:transport/auth cap-config))))
+                 (conj :transport/auth)
+                 (and (contains? cap-config :transport/timeout-ms)
+                      (not (int? (nonneg-int (:transport/timeout-ms cap-config)))))
+                 (conj :transport/timeout-ms)
+                 (and (contains? cap-config :transport/retry)
+                      (not (map? (:transport/retry cap-config))))
+                 (conj :transport/retry)
+                 (and (map? (:transport/retry cap-config))
+                      (seq (remove transport-retry-keys (keys (:transport/retry cap-config)))))
+                 (conj :transport/retry)
+                 (and (map? (:transport/retry cap-config))
+                      (some (fn [[_ v]] (not (int? (nonneg-int v))))
+                            (:transport/retry cap-config)))
+                 (conj :transport/retry)
                  (not (keyword? (:io/in-schema cap-config)))
                  (conj :io/in-schema)
                  (not (keyword? (:io/out-schema cap-config)))
@@ -161,10 +250,11 @@
   Useful when one capability needs custom parsing before runtime usage."
   [cap-key cap-config]
   (if (map? cap-config)
-    (do
-      (ensure-required-capability-metadata! cap-key cap-config)
-      (validate-extended-capability-metadata! cap-key cap-config)
-      (normalize-capability-metadata cap-config))
+    (let [normalized (do
+                       (ensure-required-capability-metadata! cap-key cap-config)
+                       (normalize-capability-metadata cap-config))]
+      (validate-extended-capability-metadata! cap-key normalized)
+      normalized)
     cap-config))
 
 (defn stop-capability-value

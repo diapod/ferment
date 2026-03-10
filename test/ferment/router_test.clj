@@ -62,7 +62,14 @@
          (router/init-router
           :ferment.router/default
           {:routing {:intent->cap {:problem/solve :llm/solver}
-                     :switch-on :eval/low-score}})))))
+                     :switch-on :eval/low-score}})))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"collection entries must be keywords"
+         (router/init-router
+          :ferment.router/default
+          {:routing {:intent->cap {:text/respond :llm/voice}
+                     :intent->candidates {:text/respond [:llm/voice "llm/solver"]}}})))))
 
 (deftest router-config-validation-validates-routing-retry-policy
   (testing "Router :routing/:retry accepts non-negative ints and rejects invalid values with actionable path."
@@ -106,6 +113,8 @@
               {:routing {:intent->cap {:problem/solve :llm/solver}
                          :gateway {:strategy :latency-first
                                    :intent->strategy {:problem/solve :quality-first}
+                                   :transport-order [:remote-http :local-runtime]
+                                   :intent->transport-order {:text/respond [:remote-http :local-runtime]}
                                    :ema-alpha 0.25
                                    :circuit-breaker {:enabled? true
                                                      :min-samples 5
@@ -116,7 +125,9 @@
                                              :max-probes 2
                                              :delay-ms 5}}}})]
       (is (= :latency-first (get-in ok [:routing :gateway :strategy])))
-      (is (= :quality-first (get-in ok [:routing :gateway :intent->strategy :problem/solve]))))
+      (is (= :quality-first (get-in ok [:routing :gateway :intent->strategy :problem/solve])))
+      (is (= [:remote-http :local-runtime]
+             (get-in ok [:routing :gateway :transport-order]))))
     (let [err (try
                 (router/init-router
                  :ferment.router/default
@@ -148,7 +159,18 @@
                 (catch clojure.lang.ExceptionInfo e
                   (ex-data e)))]
       (is (= :router/invalid-config (:error err)))
-      (is (= [:routing :gateway :hedging :max-probes] (:path err))))))
+      (is (= [:routing :gateway :hedging :max-probes] (:path err))))
+    (let [err (try
+                (router/init-router
+                 :ferment.router/default
+                 {:routing {:intent->cap {:problem/solve :llm/solver}
+                            :gateway {:strategy :latency-first
+                                      :intent->transport-order {:text/respond [:remote-http "local-runtime"]}}}})
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (ex-data e)))]
+      (is (= :router/invalid-config (:error err)))
+      (is (= [:routing :gateway :intent->transport-order :text/respond] (:path err))))))
 
 (deftest router-config-validation-validates-defaults
   (testing "Router branch validates :defaults for meta/strict/force/on-error."
@@ -402,3 +424,41 @@
       (is (= true (:shadow/applied? selected)))
       (is (= :v2 (:artifact/version selected)))
       (is (= :request (:artifact/source selected))))))
+
+(deftest select-router-artifact-applies-mixed-transport-canary-pack
+  (testing "Canary artifact patch may inject mixed local+remote candidates for one intent without mutating baseline."
+    (let [cfg {:routing {:intent->cap {:text/respond :llm/voice}
+                         :gateway {:transport-order [:local-runtime :remote-http]}}
+               :profiles {:default {:meta? true
+                                    :strict? false
+                                    :force? false
+                                    :on-error :fail-open
+                                    :policy/profile :balanced}}
+               :versions {:baseline-v1 {}
+                          :canary-v1 {:routing {:intent->candidates {:text/respond [:llm/voice
+                                                                                    :llm/voice-remote
+                                                                                    :llm/solver-text]}
+                                                :gateway {:intent->transport-order {:text/respond [:remote-http
+                                                                                                   :local-runtime]}}}
+                                      :policy-profiles {:balanced {:intents {:text/respond {:fallback [:llm/voice-remote
+                                                                                                :llm/solver-text]}}}}
+                                      :profiles {:mixed-transport {:meta? true
+                                                                   :strict? false
+                                                                   :force? false
+                                                                   :on-error :fail-open
+                                                                   :policy/profile :balanced}}}}
+               :rollout {:active :baseline-v1
+                         :canary {:enabled? true
+                                  :version :canary-v1
+                                  :percent 100}}}
+          selected (router/select-router-artifact cfg {:trace-id "t-mixed-transport"})]
+      (is (= :canary-v1 (:artifact/version selected)))
+      (is (= :canary (:artifact/source selected)))
+      (is (= [:llm/voice :llm/voice-remote :llm/solver-text]
+             (get-in selected [:router :routing :intent->candidates :text/respond])))
+      (is (= [:remote-http :local-runtime]
+             (get-in selected [:router :routing :gateway :intent->transport-order :text/respond])))
+      (is (= [:llm/voice-remote :llm/solver-text]
+             (get-in selected [:router :policy-profiles :balanced :intents :text/respond :fallback])))
+      (is (= :balanced
+             (get-in selected [:router :profiles :mixed-transport :policy/profile]))))))

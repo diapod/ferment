@@ -416,11 +416,12 @@
 
 (deftest resolve-capability-decision-near-miss-reasons
   (testing "Near-miss suite reports deterministic rejection reasons for schema/effects/result-type mismatches."
-    (let [resolver {:routing {:intent->cap {:text/respond :llm/voice}}
+      (let [resolver {:routing {:intent->cap {:text/respond :llm/voice}}
                     :caps/by-id {:llm/voice {:cap/id :llm/voice
                                              :cap/intents #{:text/respond}
                                              :cap/can-produce #{:value}
                                              :cap/effects-allowed #{:none}
+                                             :transport/type :local-runtime
                                              :io/in-schema :req/text
                                              :io/out-schema :res/text}}}
           cases [{:name :schema-mismatch
@@ -437,7 +438,12 @@
                   :node {:intent :text/respond
                          :dispatch {:candidates [:llm/voice]}
                          :requires {:result/type :plan}}
-                  :reason :result-type/not-supported}]]
+                  :reason :result-type/not-supported}
+                 {:name :transport-mismatch
+                  :node {:intent :text/respond
+                         :dispatch {:candidates [:llm/voice]}
+                         :requires {:transport/type :remote-http}}
+                  :reason :requires/transport-mismatch}]]
       (doseq [{:keys [name node reason]} cases]
         (let [decision (workflow/resolve-capability-decision resolver node)]
           (is (nil? (:cap/id decision)) (str "expected nil cap for " name))
@@ -475,6 +481,32 @@
                                                                                   :llm/solver-text]}})]
       (is (= :llm/solver-text (:cap/id decision)))
       (is (= [:llm/solver-text :llm/voice] (:candidates decision)))
+      (is (empty? (:rejected-candidates decision))))))
+
+(deftest resolve-capability-decision-prefers-transport-order
+  (testing "Gateway transport order may prioritize remote/local transport class for one intent."
+    (let [resolver {:routing {:intent->cap {:text/respond :llm/voice-local}
+                              :intent->candidates {:text/respond [:llm/voice-local
+                                                                   :llm/voice-remote]}
+                              :gateway {:strategy :latency-first
+                                        :intent->transport-order {:text/respond [:remote-http
+                                                                                 :local-runtime]}}}
+                    :caps/by-id {:llm/voice-local {:cap/id :llm/voice-local
+                                                   :cap/intents #{:text/respond}
+                                                   :cap/can-produce #{:value}
+                                                   :cap/effects-allowed #{:none}
+                                                   :transport/type :local-runtime
+                                                   :cap/cost {:latency-ms 300}}
+                                 :llm/voice-remote {:cap/id :llm/voice-remote
+                                                    :cap/intents #{:text/respond}
+                                                    :cap/can-produce #{:value}
+                                                    :cap/effects-allowed #{:none}
+                                                    :transport/type :remote-http
+                                                    :cap/cost {:latency-ms 900}}}}
+          decision (workflow/resolve-capability-decision resolver
+                                                         {:intent :text/respond})]
+      (is (= :llm/voice-remote (:cap/id decision)))
+      (is (= [:llm/voice-remote :llm/voice-local] (:candidates decision)))
       (is (empty? (:rejected-candidates decision))))))
 
 (deftest resolve-capability-decision-quarantines-open-circuit-candidate

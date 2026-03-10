@@ -34,6 +34,24 @@
     (keyword? v) #{v}
     :else #{}))
 
+(defn- keyword-vec
+  [v]
+  (let [->kw (fn [x]
+               (cond
+                 (keyword? x) x
+                 (string? x) (let [s (some-> x str str/trim not-empty)]
+                               (when s
+                                 (if (str/starts-with? s ":")
+                                   (keyword (subs s 1))
+                                   (keyword s))))
+                 :else nil))]
+    (cond
+      (vector? v) (vec (keep ->kw v))
+      (set? v) (vec (sort (keep ->kw v)))
+      (sequential? v) (vec (keep ->kw v))
+      (keyword? v) [v]
+      :else [])))
+
 (defn- keywordish
   [v]
   (cond
@@ -272,6 +290,17 @@
         (every? cap-tags required-tags))
       true)))
 
+(defn- cap-transport-type
+  [cap]
+  (or (keywordish (:transport/type cap))
+      (keywordish (get-in cap [:transport :type]))))
+
+(defn- cap-matches-required-transport?
+  [cap requires]
+  (let [required-transport (keywordish (:transport/type requires))]
+    (or (not (keyword? required-transport))
+        (= required-transport (cap-transport-type cap)))))
+
 (defn- candidate-verdict
   [resolver node cap-id]
   (if-not (map? (:caps/by-id resolver))
@@ -327,6 +356,13 @@
          :required-tags (keyword-set (:cap/tags requires))
          :cap-tags (keyword-set (:cap/tags cap))}
 
+        (not (cap-matches-required-transport? cap requires))
+        {:ok? false
+         :cap/id cap-id
+         :reason :requires/transport-mismatch
+         :required-transport (keywordish (:transport/type requires))
+         :cap-transport (cap-transport-type cap)}
+
         :else
         {:ok? true
          :cap/id cap-id}))))
@@ -353,6 +389,18 @@
     (when (contains? gateway-strategies strategy)
       strategy)))
 
+(defn- gateway-transport-order
+  [resolver intent]
+  (let [cfg (gateway-config resolver)
+        by-intent (if (map? (:intent->transport-order cfg))
+                    (:intent->transport-order cfg)
+                    {})
+        intent-order (keyword-vec (get by-intent intent))
+        default-order (keyword-vec (:transport-order cfg))]
+    (if (seq intent-order)
+      intent-order
+      default-order)))
+
 (defn- gateway-health-registry
   [resolver]
   (let [registry (:gateway/model-health resolver)]
@@ -364,6 +412,21 @@
   (or (some-> (get-in resolver [:caps/by-id cap-id]) :dispatch/model-key keywordish)
       (some-> (get-in resolver [:routing :cap->model-key cap-id]) keywordish)
       cap-id))
+
+(defn- gateway-cap-transport-type
+  [resolver cap-id]
+  (or (some-> (get-in resolver [:caps/by-id cap-id]) :transport/type keywordish)
+      (some-> (get-in resolver [:caps/by-id cap-id]) :transport :type keywordish)
+      :local-runtime))
+
+(defn- gateway-transport-rank
+  [transport-order transport-type]
+  (if (seq transport-order)
+    (let [idx (.indexOf ^java.util.List (vec transport-order) transport-type)]
+      (if (neg? idx)
+        (count transport-order)
+        idx))
+    0))
 
 (defn- gateway-cap-latency-ms
   [resolver cap-id]
@@ -423,6 +486,7 @@
 (defn- gateway-order-candidates
   [resolver node candidates]
   (let [strategy (gateway-strategy resolver (:intent node))
+        transport-order (gateway-transport-order resolver (:intent node))
         health* (gateway-health-registry resolver)
         now-ms (System/currentTimeMillis)
         breaker-cfg (gateway-breaker-config resolver)
@@ -446,6 +510,8 @@
                             quality-score (if (number? (:quality/ema stats))
                                             (double (:quality/ema stats))
                                             0.5)
+                            transport-type (gateway-cap-transport-type resolver cap-id)
+                            transport-rank (gateway-transport-rank transport-order transport-type)
                             cost (gateway-cap-cost resolver cap-id)
                             breaker-open? (and breaker-enabled?
                                                (>= calls (long (:min-samples breaker-cfg)))
@@ -453,6 +519,8 @@
                         {:idx idx
                          :cap/id cap-id
                          :model-key model-k
+                         :transport/type transport-type
+                         :transport/rank transport-rank
                          :calls calls
                          :error-rate error-rate
                          :latency-ms latency-ms
@@ -464,22 +532,25 @@
             use-active? (and breaker-enabled? (seq active))
             selected (if use-active? active (vec ranked))
             ordered (->> selected
-                         (sort-by (fn [{:keys [idx latency-ms error-rate quality-score cost]}]
-                                    (gateway-candidate-score strategy
-                                                             idx
-                                                             latency-ms
-                                                             error-rate
-                                                             quality-score
-                                                             cost)))
+                         (sort-by (fn [{:keys [idx latency-ms error-rate quality-score cost]
+                                        :as entry}]
+                                    (into [(long (or (:transport/rank entry) 0))]
+                                          (gateway-candidate-score strategy
+                                                                   idx
+                                                                   latency-ms
+                                                                   error-rate
+                                                                   quality-score
+                                                                   cost))))
                          (mapv :cap/id))
             rejected (if use-active?
                        (->> ranked
-                            (filter :breaker/open?)
-                            (mapv (fn [entry]
-                                    (let [cap-id (:cap/id entry)]
+                           (filter :breaker/open?)
+                           (mapv (fn [entry]
+                                   (let [cap-id (:cap/id entry)]
                                       {:cap/id cap-id
                                        :reason :gateway/circuit-open
-                                       :model-key (:model-key entry)}))))
+                                       :model-key (:model-key entry)
+                                       :transport/type (:transport/type entry)}))))
                        [])]
         [ordered rejected]))))
 
@@ -489,6 +560,7 @@
         policy (effective-intent-policy resolver protocol (:intent node))
         explicit (:cap/id node)
         listed   (vec (or (get-in node [:dispatch :candidates]) []))
+        routed-candidates (keyword-vec (get-in resolver [:routing :intent->candidates (:intent node)]))
         routed   (some-> (get-in resolver [:routing :intent->cap (:intent node)]) vector)
         policy-fallback (vec (or (:fallback policy) []))
         routing-fallback (vec (or (get-in resolver [:routing :fallback]) []))
@@ -496,6 +568,7 @@
         (cond
           (keyword? explicit) [explicit]
           (seq listed) listed
+          (seq routed-candidates) routed-candidates
           (seq routed) routed
           :else [])
         candidates

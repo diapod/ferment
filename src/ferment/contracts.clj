@@ -24,7 +24,8 @@
     :result/type
     :cap/kind
     :cap/tags
-    :effects/allowed})
+    :effects/allowed
+    :transport/type})
 
 (defn- trim-s
   [v]
@@ -408,14 +409,16 @@
           result-type (keywordish (:result/type requires))
           cap-kind (keywordish (:cap/kind requires))
           cap-tags (keyword-set (:cap/tags requires))
-          effects-allowed (keyword-set (:effects/allowed requires))]
+          effects-allowed (keyword-set (:effects/allowed requires))
+          transport-type (keywordish (:transport/type requires))]
       (cond-> {}
         (keyword? in-schema) (assoc :in-schema in-schema)
         (keyword? out-schema) (assoc :out-schema out-schema)
         (keyword? result-type) (assoc :result/type result-type)
         (keyword? cap-kind) (assoc :cap/kind cap-kind)
         (seq cap-tags) (assoc :cap/tags cap-tags)
-        (seq effects-allowed) (assoc :effects/allowed effects-allowed)))))
+        (seq effects-allowed) (assoc :effects/allowed effects-allowed)
+        (keyword? transport-type) (assoc :transport/type transport-type)))))
 
 (defn effective-in-schema
   "Returns effective input schema key for request intent, optionally overridden by `:requires`."
@@ -460,6 +463,9 @@
       (and (contains? requires :effects/allowed)
            (not (keyword-coll-input? (:effects/allowed requires))))
       {:ok? false :reason :requires/effects-not-keywords}
+      (and (contains? requires :transport/type)
+           (not (keyword? (:transport/type normalized))))
+      {:ok? false :reason :requires/transport-type-not-keyword}
       :else
       {:ok? true})))
 

@@ -1860,17 +1860,20 @@
 
 (derive :ferment.model.id/solver ::selector)
 (derive :ferment.model.id/voice  ::selector)
+(derive :ferment.model.id/voice-api ::selector)
 (derive :ferment.model.id/coding ::selector)
 (derive :ferment.model.id/meta   ::selector)
 
 (derive ::model-entry :ferment.system/value)
 (derive :ferment.model/solver ::model-entry)
 (derive :ferment.model/voice  ::model-entry)
+(derive :ferment.model/voice-api ::model-entry)
 (derive :ferment.model/coding ::model-entry)
 (derive :ferment.model/meta   ::model-entry)
 
 (derive :ferment.model.runtime/solver ::runtime-worker)
 (derive :ferment.model.runtime/voice  ::runtime-worker)
+(derive :ferment.model.runtime/voice-api ::runtime-worker)
 (derive :ferment.model.runtime/coding ::runtime-worker)
 (derive :ferment.model.runtime/meta   ::runtime-worker)
 

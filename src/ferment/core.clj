@@ -676,6 +676,25 @@
         (when (string? (:stdout result)) (:stdout result))
         (when (string? (:stderr result)) (:stderr result)))))
 
+(defn- runtime-invoke-failure-details
+  [runtime resolver cap-id intent model-k session-id invoke-response]
+  (let [descriptor (model-adapter/transport-descriptor runtime resolver cap-id intent)
+        failure-info (model-adapter/invoke-failure-info runtime resolver cap-id intent invoke-response)]
+    (cond-> {:error :runtime-invoke-failed
+             :cap-id cap-id
+             :intent intent
+             :model-key model-k
+             :session/id session-id
+             :invoke-response invoke-response}
+      (map? descriptor)
+      (assoc :transport/descriptor descriptor)
+      (keyword? (:transport/class failure-info))
+      (assoc :transport/class (:transport/class failure-info))
+      (keyword? (:transport/failure-class failure-info))
+      (assoc :transport/failure-class (:transport/failure-class failure-info))
+      (keyword? (:transport/error failure-info))
+      (assoc :transport/error (:transport/error failure-info)))))
+
 (defn- run-model-command!
   [{:keys [command prompt env workdir prompt-via prompt-arg]}]
   (let [cmd0        (vec (map str command))
@@ -721,12 +740,13 @@
         (and (map? invoke-response)
              (= false (:ok? invoke-response)))
         (throw (ex-info "Model runtime invoke failed."
-                        {:error :runtime-invoke-failed
-                         :cap-id cap-id
-                         :intent intent
-                         :model-key model-k
-                         :session/id session-id
-                         :invoke-response invoke-response}))
+                        (runtime-invoke-failure-details runtime
+                                                        resolver
+                                                        cap-id
+                                                        intent
+                                                        model-k
+                                                        session-id
+                                                        invoke-response)))
 
         (some? invoke-response)
         {:response (or invoke-text "")

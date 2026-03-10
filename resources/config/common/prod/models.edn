@@ -63,6 +63,30 @@
  {:id      #ref :ferment.model.id/voice
   :runtime #ref :ferment.model.runtime/voice}
 
+ :ferment.model.id/voice-api
+ {:profile     #ref :ferment.model.defaults/profile
+  :type        :HTTP
+  :id/default  "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
+  :id/mini     "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
+  :id/fallback "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"}
+
+ :ferment.model.runtime/voice-api
+ {:defaults #ref :ferment.model.defaults/runtime
+  :invoke/http {:base-url #ref :ferment.env/ferment.model.voice.remote.base.url
+                :endpoint #ref :ferment.env/ferment.model.voice.remote.endpoint
+                :model    #ref :ferment.model.id/voice-api
+                :temperature 0.0
+                :max-tokens 384
+                :timeout-ms 12000
+                :retries 1
+                :retry-ms 200}
+  :http     {:enabled? true :endpoint "voice-remote/responses"}
+  :name     "voice remote api runtime"}
+
+ :ferment.model/voice-api
+ {:id      #ref :ferment.model.id/voice-api
+  :runtime #ref :ferment.model.runtime/voice-api}
+
  :ferment.model.id/coding
  {:profile     #ref :ferment.model.defaults/profile
   :type        :MLX
@@ -121,6 +145,7 @@
  {:ferment.model/coding #ref :ferment.model/coding
   :ferment.model/meta   #ref :ferment.model/meta
   :ferment.model/solver #ref :ferment.model/solver
-  :ferment.model/voice  #ref :ferment.model/voice}
+  :ferment.model/voice  #ref :ferment.model/voice
+  :ferment.model/voice-api #ref :ferment.model/voice-api}
 
  }

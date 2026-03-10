@@ -4,7 +4,13 @@
   {:routing  #ref :ferment.caps/routing
   :artifact/version :baseline-v1
   :versions {:baseline-v1 {}
-             :canary-v1 {}}
+             :canary-v1 {:routing {:intent->candidates {:text/respond [:llm/voice
+                                                                       :llm/voice-remote
+                                                                       :llm/solver-text]}
+                                    :gateway {:intent->transport-order {:text/respond [:remote-http
+                                                                                        :local-runtime]}}}
+                         :policy-profiles {:balanced {:intents {:text/respond {:fallback [:llm/voice-remote
+                                                                                           :llm/solver-text]}}}}}}
   :rollout {:active :baseline-v1
             :canary {:enabled? false
                      :version :canary-v1
@@ -76,21 +82,26 @@
                            :done {:score-min 0.90}}}
     :limits {:call-tree/max-calls 10
              :call-tree/max-fallback-hops 4}}}
-  :profiles {:default      {:meta? true
-                            :strict? false
-                            :force? false
-                            :on-error :fail-open
-                            :policy/profile :balanced}
-             :low-latency  {:meta? false
-                            :strict? false
-                            :force? false
-                            :on-error :fail-open
-                            :policy/profile :low-latency}
-             :strict-meta  {:meta? true
-                            :strict? true
-                            :force? true
-                            :on-error :fail-closed
-                            :policy/profile :high-quality}}
+  :profiles {:default         {:meta? true
+                               :strict? false
+                               :force? false
+                               :on-error :fail-open
+                               :policy/profile :balanced}
+             :low-latency     {:meta? false
+                               :strict? false
+                               :force? false
+                               :on-error :fail-open
+                               :policy/profile :low-latency}
+             :strict-meta     {:meta? true
+                               :strict? true
+                               :force? true
+                               :on-error :fail-closed
+                               :policy/profile :high-quality}
+             :mixed-transport {:meta? true
+                               :strict? false
+                               :force? false
+                               :on-error :fail-open
+                               :policy/profile :balanced}}
   :defaults {:meta? false
              :strict? false
              :force? false

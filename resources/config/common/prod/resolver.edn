@@ -2,6 +2,7 @@
 
  :ferment.resolver/default
  {:caps     [#ref :ferment.caps.registry/llm-voice
+             #ref :ferment.caps.registry/llm-voice-remote
              #ref :ferment.caps.registry/llm-code
              #ref :ferment.caps.registry/llm-solver
              #ref :ferment.caps.registry/llm-solver-text

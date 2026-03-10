@@ -23,6 +23,7 @@
 
 (def ^:private routing-keys
   #{:intent->cap
+    :intent->candidates
     :cap->model-key
     :intent->default-model-key
     :cap->role
@@ -44,6 +45,8 @@
 (def ^:private gateway-keys
   #{:strategy
     :intent->strategy
+    :transport-order
+    :intent->transport-order
     :ema-alpha
     :circuit-breaker
     :hedging})
@@ -121,6 +124,8 @@
                      :allowed (sorted-keys allowed)
                      :unknown (sorted-keys unknown)}))))
 
+(declare validate-keyword-coll!)
+
 (defn- validate-keyword->keyword-map!
   [m path]
   (ensure-keyword-map! m path)
@@ -130,6 +135,12 @@
                     {:path (conj path k)
                      :expected :keyword
                      :value v}))))
+
+(defn- validate-keyword->keyword-coll-map!
+  [m path]
+  (ensure-keyword-map! m path)
+  (doseq [[k v] m]
+    (validate-keyword-coll! v (conj path k))))
 
 (defn- validate-keyword-coll!
   [v path]
@@ -292,6 +303,12 @@
                       {:path (conj path :intent->strategy intent)
                        :expected gateway-strategies
                        :value strategy}))))
+  (when (contains? gateway :transport-order)
+    (validate-keyword-coll! (:transport-order gateway)
+                            (conj path :transport-order)))
+  (when (contains? gateway :intent->transport-order)
+    (validate-keyword->keyword-coll-map! (:intent->transport-order gateway)
+                                         (conj path :intent->transport-order)))
   (when (contains? gateway :ema-alpha)
     (let [v (:ema-alpha gateway)]
       (when-not (and (number? v)
@@ -360,6 +377,9 @@
                         {:path [:routing :intent->cap]
                          :required true}))
         (validate-keyword->keyword-map! (:intent->cap routing) [:routing :intent->cap])
+        (when (contains? routing :intent->candidates)
+          (validate-keyword->keyword-coll-map! (:intent->candidates routing)
+                                               [:routing :intent->candidates]))
         (when (contains? routing :cap->model-key)
           (validate-keyword->keyword-map! (:cap->model-key routing)
                                           [:routing :cap->model-key]))

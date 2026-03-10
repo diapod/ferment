@@ -9,6 +9,7 @@
 ;; Per-capability keys are configuration-oriented and inherit lifecycle from
 ;; :ferment.caps/entry handlers defined in `ferment.caps`.
 (derive ::llm-voice :ferment.caps/entry)
+(derive ::llm-voice-remote :ferment.caps/entry)
 (derive ::llm-code  :ferment.caps/entry)
 (derive ::llm-solver :ferment.caps/entry)
 (derive ::llm-solver-text :ferment.caps/entry)

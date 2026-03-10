@@ -7,6 +7,8 @@
   :cap/version         "2026.02"
   :cap/cost            {:latency-ms 1200}
   :cap/limits          {:timeout-ms 15000}
+  :transport/type      :local-runtime
+  :transport/auth      :none
   :cap/tags            #{:voice :polish}
   :cap/intents         #{:text/respond}
   :cap/can-produce     #{:value}
@@ -17,12 +19,35 @@
   :io/out-schema       :res/text
   :dispatch/tag        :voice}
 
+ :ferment.caps.registry/llm-voice-remote
+ {:cap/id              :llm/voice-remote
+  :cap/kind            :llm
+  :cap/version         "2026.02"
+  :cap/cost            {:latency-ms 1600}
+  :cap/limits          {:timeout-ms 15000}
+  :transport/type      :remote-http
+  :transport/auth      :none
+  :transport/timeout-ms 12000
+  :transport/retry     {:max 1
+                        :backoff-ms 200}
+  :cap/tags            #{:voice :remote :api}
+  :cap/intents         #{:text/respond}
+  :cap/can-produce     #{:value}
+  :cap/effects-allowed #{:none}
+  :dispatch/role       :voice
+  :dispatch/model-key  :ferment.model/voice-api
+  :io/in-schema        :req/text
+  :io/out-schema       :res/text
+  :dispatch/tag        :voice-remote}
+
  :ferment.caps.registry/llm-code
  {:cap/id              :llm/code
   :cap/kind            :llm
   :cap/version         "2026.02"
   :cap/cost            {:latency-ms 1800}
   :cap/limits          {:timeout-ms 30000}
+  :transport/type      :local-runtime
+  :transport/auth      :none
   :cap/tags            #{:code :clojure}
   :cap/intents         #{:code/generate :code/patch :code/explain :code/review}
   :cap/can-produce     #{:value :plan}
@@ -39,6 +64,8 @@
   :cap/version         "2026.02"
   :cap/cost            {:latency-ms 1500}
   :cap/limits          {:timeout-ms 20000}
+  :transport/type      :local-runtime
+  :transport/auth      :none
   :cap/tags            #{:solver :general}
   :cap/intents         #{:problem/solve}
   :cap/can-produce     #{:value :plan}
@@ -55,6 +82,8 @@
   :cap/version         "2026.02"
   :cap/cost            {:latency-ms 1500}
   :cap/limits          {:timeout-ms 20000}
+  :transport/type      :local-runtime
+  :transport/auth      :none
   :cap/tags            #{:solver :fallback :text}
   :cap/intents         #{:text/respond}
   :cap/can-produce     #{:value}
@@ -71,6 +100,8 @@
   :cap/version         "2026.02"
   :cap/cost            {:latency-ms 900}
   :cap/limits          {:timeout-ms 12000}
+  :transport/type      :local-runtime
+  :transport/auth      :none
   :cap/tags            #{:router :meta}
   :cap/intents         #{:route/decide :context/summarize}
   :cap/can-produce     #{:value :plan}
@@ -87,6 +118,8 @@
   :cap/version         "2026.02"
   :cap/cost            {:latency-ms 900}
   :cap/limits          {:timeout-ms 12000}
+  :transport/type      :local-runtime
+  :transport/auth      :none
   :cap/tags            #{:judge :quality}
   :cap/intents         #{:eval/grade}
   :cap/can-produce     #{:value}
@@ -103,6 +136,8 @@
   :cap/version         "2026.02"
   :cap/cost            {:latency-ms 1}
   :cap/limits          {:timeout-ms 1000}
+  :transport/type      :local-runtime
+  :transport/auth      :none
   :cap/tags            #{:mock :test}
   :cap/intents         #{:route/decide :context/summarize :text/respond
                          :problem/solve
@@ -120,6 +155,7 @@
 
  :ferment.caps/registry
  [#ref :ferment.caps.registry/llm-voice
+  #ref :ferment.caps.registry/llm-voice-remote
   #ref :ferment.caps.registry/llm-code
   #ref :ferment.caps.registry/llm-solver
   #ref :ferment.caps.registry/llm-solver-text
@@ -153,6 +189,7 @@
                               :llm/meta        :router
                               :llm/judge       :router
                               :llm/voice       :voice
+                              :llm/voice-remote :voice
                               :llm/mock        :router}
   :intent->default-role      {:route/decide      :router
                               :context/summarize :router

@@ -417,6 +417,10 @@
                             :cap/resolve-hit       0
                             :cap/resolve-miss      0
                             :cap/reject-reasons    {}}
+              :transport   {:failures     0
+                            :by-class     {}
+                            :by-transport {}
+                            :by-error     {}}
               :latency-ms  {:count 0
                             :sum   0.0
                             :max   0.0}}
@@ -470,6 +474,31 @@
       (assoc :participants/requests 1
              :participants/total n
              :participants/max n))))
+
+(defn- transport-failure-metrics-from-response
+  [body]
+  (let [error-type (or (get-in body [:error :type])
+                       (get-in body [:result :error :type]))
+        details (or (when (map? (get-in body [:error :details]))
+                      (get-in body [:error :details]))
+                    (when (map? (get-in body [:result :error :details]))
+                      (get-in body [:result :error :details]))
+                    (when (map? (get-in body [:error :details :outcome :details]))
+                      (get-in body [:error :details :outcome :details])))
+        transport-class (some-> details :transport/class keywordish)
+        failure-class (some-> details :transport/failure-class keywordish)
+        transport-error (some-> details :transport/error keywordish)]
+    (cond-> {}
+      (or (= :runtime/invoke-failed error-type)
+          (keyword? failure-class)
+          (keyword? transport-error))
+      (assoc :failures 1)
+      (keyword? failure-class)
+      (assoc :by-class {failure-class 1})
+      (keyword? transport-class)
+      (assoc :by-transport {transport-class 1})
+      (keyword? transport-error)
+      (assoc :by-error {transport-error 1}))))
 
 (defn- telemetry-error-type
   [body]
@@ -599,6 +628,9 @@
         routing (if (map? (get-in state [:act :routing]))
                   (get-in state [:act :routing])
                   {})
+        transport (if (map? (get-in state [:act :transport]))
+                    (get-in state [:act :transport])
+                    {})
         participants-requests (counter-value (:participants/requests orchestration))
         participants-total (counter-value (:participants/total orchestration))
         participants-max (counter-value (:participants/max orchestration))
@@ -616,7 +648,12 @@
         shadow-attempt' (counter-value (:route/shadow-attempt routing))
         shadow-match' (counter-value (:route/shadow-match routing))
         shadow-mismatch' (counter-value (:route/shadow-mismatch routing))
-        shadow-error' (counter-value (:route/shadow-error routing))]
+        shadow-error' (counter-value (:route/shadow-error routing))
+        transport-failures (counter-value (:failures transport))
+        transport-by-class (normalize-counter-map (:by-class transport))
+        transport-by-transport (normalize-counter-map (:by-transport transport))
+        transport-by-error (normalize-counter-map (:by-error transport))
+        total-requests (counter-value (get-in state [:act :requests]))]
     {:participants/diversity {:value (safe-rate participants-total participants-requests)
                               :participants/total participants-total
                               :participants/requests participants-requests
@@ -644,6 +681,13 @@
                            :lookups context-lookups
                            :hits context-hits
                            :misses context-misses}
+     :transport/failure-trend
+     {:value (safe-rate transport-failures total-requests)
+      :failures transport-failures
+      :requests total-requests
+      :by-class transport-by-class
+      :by-transport transport-by-transport
+      :by-error transport-by-error}
      :context/principal-isolation
      {:blocked context-principal-blocked}}))
 
@@ -660,6 +704,7 @@
            err-k  (telemetry-error-type body)
            wf-telemetry (get-in body [:result :plan/run :telemetry])
            wf-error-telemetry (workflow-telemetry-from-error body)
+           transport-failure-metrics (transport-failure-metrics-from-response body)
            orchestration-telemetry (orchestration-telemetry-from-response body)]
        (swap! telemetry
               (fn [state]
@@ -680,6 +725,8 @@
                       (update-in [:act :routing] telemetry/merge-counters routing-telemetry))
                     (cond-> (map? cache-telemetry)
                       (update-in [:act :cache] telemetry/merge-counters cache-telemetry))
+                    (cond-> (map? transport-failure-metrics)
+                      (update-in [:act :transport] telemetry/merge-counters transport-failure-metrics))
                     (cond-> (map? orchestration-telemetry)
                       (update :orchestration telemetry/merge-counters orchestration-telemetry)))))))))
 
@@ -3047,13 +3094,20 @@
 (defn- compact-outcome
   [outcome]
   (when (map? outcome)
-    (let [done-eval (compact-done-eval (:done/eval outcome))]
+    (let [done-eval (compact-done-eval (:done/eval outcome))
+          details0 (if (map? (:details outcome)) (:details outcome) {})
+          transport-descriptor (when (map? (:transport/descriptor details0))
+                                 (:transport/descriptor details0))]
       (cond-> {}
         (contains? outcome :ok?) (assoc :ok? (boolean (:ok? outcome)))
         (keyword? (:failure/type outcome)) (assoc :failure/type (:failure/type outcome))
         (contains? outcome :failure/recover?) (assoc :failure/recover? (boolean (:failure/recover? outcome)))
         (keyword? (:cap/id outcome)) (assoc :cap/id (:cap/id outcome))
         (number? (:attempt outcome)) (assoc :attempt (long (:attempt outcome)))
+        (keyword? (:transport/class details0)) (assoc :transport/class (:transport/class details0))
+        (keyword? (:transport/failure-class details0)) (assoc :transport/failure-class (:transport/failure-class details0))
+        (keyword? (:transport/error details0)) (assoc :transport/error (:transport/error details0))
+        (map? transport-descriptor) (assoc :transport/descriptor transport-descriptor)
         (map? done-eval) (assoc :done/eval done-eval)))))
 
 (defn- compact-route-node
@@ -3074,6 +3128,7 @@
       (keyword? (:reason entry)) (assoc :reason (:reason entry))
       (keyword? (:intent entry)) (assoc :intent (:intent entry))
       (keyword? (:result/type entry)) (assoc :result/type (:result/type entry))
+      (keyword? (:transport/type entry)) (assoc :transport/type (:transport/type entry))
       (keyword? (:required-kind entry)) (assoc :required-kind (:required-kind entry))
       (keyword? (:cap-kind entry)) (assoc :cap-kind (:cap-kind entry)))))
 
@@ -3093,6 +3148,10 @@
       (keyword? (:error data')) (assoc :error (:error data'))
       (keyword? (:reason data')) (assoc :reason (:reason data'))
       (keyword? (:failure/type data')) (assoc :failure/type (:failure/type data'))
+      (keyword? (:transport/class data')) (assoc :transport/class (:transport/class data'))
+      (keyword? (:transport/failure-class data')) (assoc :transport/failure-class (:transport/failure-class data'))
+      (keyword? (:transport/error data')) (assoc :transport/error (:transport/error data'))
+      (map? (:transport/descriptor data')) (assoc :transport/descriptor (:transport/descriptor data'))
       (number? (:attempts data')) (assoc :attempts (long (:attempts data')))
       (map? last-check) (assoc :last-check last-check)
       (map? outcome) (assoc :outcome outcome)
@@ -3544,7 +3603,16 @@
                                (select-keys data [:tool/id :known-tools]))}
 
       (let [invoke-response (:invoke-response data)
-            details' (merge (select-keys data [:error :reason :cap-id :intent :model-key :session/id])
+            details' (merge (select-keys data [:error
+                                               :reason
+                                               :cap-id
+                                               :intent
+                                               :model-key
+                                               :session/id
+                                               :transport/class
+                                               :transport/failure-class
+                                               :transport/error
+                                               :transport/descriptor])
                             (when (map? invoke-response)
                               (select-keys invoke-response [:error :message :details])))]
         {:status 502

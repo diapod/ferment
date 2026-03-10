@@ -34,6 +34,12 @@ Reprioritized for router-first meta-goal (sync: 2026-03-09): keep the core small
 
 4. [ ] `#12` Heterogeneous connectivity adapters (API + swarm-ready)
    - Reason: Ferment meta-purpose requires excellent connectivity to local, remote API, and future decentralized peers.
+   - Progress (sync: 2026-03-10):
+     - [x] canonical transport descriptor in capabilities (`:transport/type`, `:transport/auth`, `:transport/timeout-ms`, `:transport/retry`),
+     - [x] routing supports intent-level multi-candidate dispatch (`:intent->candidates`) and gateway transport preference (`:transport-order`, `:intent->transport-order`),
+     - [x] transport-level failure taxonomy exported in `/diag/telemetry` (`:act/:transport`, orchestration transport trend),
+     - [x] remote API adapter profile + end-to-end live policy pack (local+remote in one intent),
+     - [ ] peer/swarm adapter contract.
    - Scope:
      - standard capability descriptor for local/API/peer model endpoints,
      - adapter seam in gateway/resolver (no provider coupling in core),
@@ -182,10 +188,16 @@ Reprioritized for router-first meta-goal (sync: 2026-03-09): keep the core small
      - promotion decision is automated by explicit quality/latency regression thresholds.
 
 12. [ ] Heterogeneous connectivity adapters (`#12`)
-   - Add transport-agnostic adapter layer for non-local model execution (HTTP API now, peer/swarm later).
-   - Delivery scope:
-     - define canonical capability transport descriptor (`:transport/type`, auth mode, timeouts, retry limits),
-     - add adapter implementations for local runtime and remote HTTP API under shared gateway contract,
+  - Add transport-agnostic adapter layer for non-local model execution (HTTP API now, peer/swarm later).
+  - Delivery status (sync: 2026-03-10):
+    - [x] canonical capability transport descriptor + validation in caps entry hooks,
+    - [x] adapter-level transport descriptor/failure classifier (`ferment.adapters.model`) used by core invoke path,
+    - [x] deterministic transport failure telemetry (`by-class`, `by-transport`, `by-error`),
+    - [x] gateway transport-priority ordering and intent-level candidate list support,
+    - [x] reference remote API profile and policy examples for mixed transport intent.
+  - Delivery scope:
+    - define canonical capability transport descriptor (`:transport/type`, auth mode, timeouts, retry limits),
+    - add adapter implementations for local runtime and remote HTTP API under shared gateway contract,
      - normalize transport-level failures into deterministic taxonomy (separate from quality/schema failures),
      - preserve router-first core boundary (provider specifics only in adapters/modules).
    - Done when:
