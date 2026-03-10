@@ -24,6 +24,7 @@
             [ferment.oplog :as oplog]
             [ferment.protocol :as protocol]
             [ferment.queue :as queue]
+            [ferment.runtime :as runtime-svc]
             [ferment.roles :as roles]
             [ferment.router :as router]
             [ferment.system :as system]
@@ -731,11 +732,22 @@
       (keyword? explicit-cap) (assoc :requested-cap/id explicit-cap)
       (keyword? routed-cap) (assoc :routed-cap/id routed-cap))))
 
+(defn- runtime-protocol-config
+  [runtime]
+  (runtime-svc/artifact-config runtime :protocol))
+
+(defn- runtime-router-config
+  [runtime]
+  (runtime-svc/artifact-config runtime :router))
+
 (defn- effective-resolver
   [runtime]
   (let [resolver   (or (:resolver runtime) {})
-        routing    (router/resolver-routing runtime resolver)
-        router-cfg (if (map? (:router runtime)) (:router runtime) {})]
+        runtime'   (if (map? runtime)
+                     (assoc runtime :router (runtime-router-config runtime))
+                     runtime)
+        routing    (router/resolver-routing runtime' resolver)
+        router-cfg (if (map? (:router runtime')) (:router runtime') {})]
     (cond-> resolver
       (map? routing)                   (assoc :routing routing)
       (contains? router-cfg :profiles) (assoc :profiles (:profiles router-cfg))
@@ -1448,9 +1460,7 @@
                         (map? auth-user) (assoc :auth/user auth-user))
         policy-profile (resolve-routing-policy-profile runtime resolver request intent)
         policy-profiles (resolve-routing-policy-profiles runtime resolver)
-        runtime-protocol (if (map? (:protocol runtime))
-                           (:protocol runtime)
-                           {})
+        runtime-protocol (runtime-protocol-config runtime)
         protocol-selection (protocol/select-protocol-artifact
                             runtime-protocol
                             {:trace-id (get-in request [:trace :id])
@@ -3270,9 +3280,8 @@
   [runtime request]
   (if-not (map? runtime)
     runtime
-    (let [router-cfg (if (map? (:router runtime))
-                       (:router runtime)
-                       nil)]
+    (let [router-cfg (runtime-router-config runtime)
+          protocol-cfg (runtime-protocol-config runtime)]
       (if-not (map? router-cfg)
         runtime
         (let [selection (router/select-router-artifact
@@ -3284,7 +3293,9 @@
               selected-router (:router selection)
               selected-version (:artifact/version selection)
               selected-source (:artifact/source selection)]
-          (cond-> (assoc runtime :router selected-router)
+          (cond-> (assoc runtime
+                         :router selected-router
+                         :protocol protocol-cfg)
             (keyword? selected-version) (assoc :router/artifact-version selected-version)
             (keyword? selected-source) (assoc :router/artifact-source selected-source)))))))
 
@@ -3702,9 +3713,7 @@
         route-phase-latency-ms (:route-phase-latency-ms phase)
         route-decider-latency-ms (:route-decider-latency-ms phase)
         protocol-selection (protocol/select-protocol-artifact
-                            (if (map? (:protocol runtime))
-                              (:protocol runtime)
-                              {})
+                            (runtime-protocol-config runtime)
                             {:trace-id (get-in request* [:trace :id])
                              :requested-version (some-> request* :routing :artifact/version)})
         protocol-artifact-version (some-> (:artifact/version protocol-selection) keywordish)
@@ -4280,7 +4289,9 @@
     :admin/list-known-roles
     :admin/migrate-db
     :admin/rollback-db
-    :admin/reset-login-attempts})
+    :admin/reset-login-attempts
+    :admin/get-artifact-rollout
+    :admin/set-artifact-rollout})
 
 (defn- normalize-admin-action
   [v]
@@ -4320,6 +4331,7 @@
       :role/in-use            409
       :auth/not-configured    500
       :db/not-configured      500
+      :runtime/not-configured 500
       400)))
 
 (defn- invoke-admin-action
@@ -4333,7 +4345,13 @@
         role       (or (some-> (:role params) keywordish)
                        (some-> (:user/role params) keywordish))
         account-type (or (some-> (:account-type params) keywordish)
-                         (some-> (:user/account-type params) keywordish))]
+                         (some-> (:user/account-type params) keywordish))
+        artifact   (or (some-> (:artifact params) keywordish)
+                       (some-> (:target params) keywordish))
+        active     (or (:active params)
+                       (:artifact/version params))
+        canary     (if (map? (:canary params)) (:canary params) nil)
+        clear?     (coerce-bool (:clear? params))]
     (case action
       :admin/create-user
       (if (and email password)
@@ -4422,6 +4440,17 @@
         {:ok? false
          :error :input/invalid
          :message "Missing required selector: :selector or :id or :email."})
+
+      :admin/get-artifact-rollout
+      (runtime-svc/get-artifact-rollout runtime artifact)
+
+      :admin/set-artifact-rollout
+      (runtime-svc/set-artifact-rollout!
+       runtime
+       {:artifact artifact
+        :active active
+        :canary canary
+        :clear? clear?})
 
       :admin/migrate-db
       (let [opts (if (map? (:opts params)) (:opts params) nil)]

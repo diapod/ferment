@@ -1036,6 +1036,121 @@
         (finally
           (fhttp/stop-http :ferment.http/default server-state))))))
 
+(deftest http-v1-admin-allows-artifact-rollout-actions
+  (testing "/v1/admin delegates runtime artifact rollout get/set actions for admin role."
+    (let [port (free-port)
+          runtime {:models {}
+                   :artifact/overrides (atom {})
+                   :protocol {:versions {:baseline-v1 {}
+                                         :canary-v1 {}}
+                              :rollout {:active :baseline-v1}}
+                   :router {:versions {:baseline-v1 {}
+                                       :canary-v1 {}}
+                            :rollout {:active :baseline-v1}}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:manager #{:role/admin}}
+                           :operations {:admin/get-artifact-rollout {:any #{:role/admin}}
+                                        :admin/set-artifact-rollout {:any #{:role/admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :manager}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (with-redefs-fn
+          {#'ferment.http/parse-basic-credentials
+           (fn [_exchange]
+             {:login "admin@example.com"
+              :password "secret"})
+           #'ferment.http/report-auth!
+           (fn [& _] nil)
+           #'ferment.auth.user/authenticate-password
+           (fn [_source login _password _account-type _opts]
+             {:ok? true
+              :user {:user/id 17
+                     :user/email login
+                     :user/account-type :manager}})}
+          (fn []
+            (let [set-resp (http-post-json url {:action "admin/set-artifact-rollout"
+                                                :artifact "protocol"
+                                                :active "canary-v1"
+                                                :canary {:enabled? true
+                                                         :version "baseline-v1"
+                                                         :percent 25}})
+                  set-body (json/parse-string (:body set-resp) true)
+                  get-resp (http-post-json url {:action "admin/get-artifact-rollout"
+                                                :artifact :protocol})
+                  get-body (json/parse-string (:body get-resp) true)
+                  all-resp (http-post-json url {:action "admin/get-artifact-rollout"})
+                  all-body (json/parse-string (:body all-resp) true)]
+              (is (= 200 (:status set-resp)))
+              (is (= true (:ok? set-body)))
+              (is (= "admin/set-artifact-rollout" (:action set-body)))
+              (is (re-find #"canary-v1$" (str (get-in set-body [:override :active]))))
+              (is (= 25 (get-in set-body [:override :canary :percent])))
+
+              (is (= 200 (:status get-resp)))
+              (is (= true (:ok? get-body)))
+              (is (= "admin/get-artifact-rollout" (:action get-body)))
+              (is (re-find #"protocol$" (str (:artifact get-body))))
+              (is (re-find #"canary-v1$" (str (get-in get-body [:override :active]))))
+
+              (is (= 200 (:status all-resp)))
+              (is (= true (:ok? all-body)))
+              (is (map? (:overrides all-body)))
+              (is (re-find #"canary-v1$"
+                           (str (get-in all-body [:overrides :protocol :active])))))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
+(deftest http-v1-admin-artifact-rollout-reports-runtime-not-configured
+  (testing "/v1/admin returns 500 runtime/not-configured when runtime has no artifact override state."
+    (let [port (free-port)
+          runtime {:models {}
+                   :protocol {:versions {:baseline-v1 {}
+                                         :canary-v1 {}}}
+                   :roles {:enabled? true
+                           :authorize-default? false
+                           :account-type->roles {:manager #{:role/admin}}
+                           :operations {:admin/set-artifact-rollout {:any #{:role/admin}}}}
+                   :auth {:enabled? true
+                          :source :auth/source
+                          :account-type :manager}}
+          server-state (fhttp/init-http :ferment.http/default
+                                        {:host "127.0.0.1"
+                                         :port port
+                                         :runtime runtime})
+          url (str "http://127.0.0.1:" port "/v1/admin")]
+      (try
+        (with-redefs-fn
+          {#'ferment.http/parse-basic-credentials
+           (fn [_exchange]
+             {:login "admin@example.com"
+              :password "secret"})
+           #'ferment.http/report-auth!
+           (fn [& _] nil)
+           #'ferment.auth.user/authenticate-password
+           (fn [_source login _password _account-type _opts]
+             {:ok? true
+              :user {:user/id 18
+                     :user/email login
+                     :user/account-type :manager}})}
+          (fn []
+            (let [resp (http-post-json url {:action "admin/set-artifact-rollout"
+                                            :artifact :protocol
+                                            :active :canary-v1})
+                  body (json/parse-string (:body resp) true)]
+              (is (= 500 (:status resp)))
+              (is (= false (:ok? body)))
+              (is (= "runtime/not-configured" (:error body)))
+              (is (= "admin/set-artifact-rollout" (:action body))))))
+        (finally
+          (fhttp/stop-http :ferment.http/default server-state))))))
+
 (deftest http-v1-act-collects-telemetry-and-exposes-diag-endpoint
   (testing "HTTP bridge aggregates telemetry for /v1/act and exposes it via /diag/telemetry."
     (let [port (free-port)

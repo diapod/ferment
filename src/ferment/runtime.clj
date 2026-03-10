@@ -122,23 +122,193 @@
     (string? v) (some-> v trim-s keyword)
     :else nil))
 
+(defn- boolish
+  [v]
+  (cond
+    (true? v) true
+    (false? v) false
+    (string? v) (let [s (str/lower-case (or (trim-s v) ""))]
+                  (cond
+                    (#{"true" "1" "yes" "y" "on"} s) true
+                    (#{"false" "0" "no" "n" "off"} s) false
+                    :else nil))
+    :else nil))
+
 (defn- instant->ms
   [v]
   (try
     (.toEpochMilli (Instant/parse (str v)))
     (catch Throwable _ nil)))
 
+(declare artifact-config)
+
 (defn- runtime-protocol
   [runtime]
-  (if (map? (:protocol runtime))
-    (:protocol runtime)
-    {}))
+  (artifact-config runtime :protocol))
 
 (defn- runtime-resolver
   [runtime]
   (if (map? (:resolver runtime))
     (:resolver runtime)
     {}))
+
+(def ^:private supported-artifact-keys
+  #{:protocol :router})
+
+(defn artifact-overrides-state
+  "Returns runtime artifact overrides atom, if available."
+  [runtime]
+  (let [state (when (map? runtime) (:artifact/overrides runtime))]
+    (when (instance? clojure.lang.IAtom state)
+      state)))
+
+(defn artifact-overrides
+  "Returns current artifact rollout overrides map from runtime."
+  [runtime]
+  (if-some [state (artifact-overrides-state runtime)]
+    (let [v @state]
+      (if (map? v) v {}))
+    {}))
+
+(defn artifact-config
+  "Returns runtime artifact config (`:protocol` or `:router`) with applied rollout overrides."
+  [runtime artifact]
+  (let [artifact' (keywordish artifact)
+        cfg (if (and (map? runtime)
+                     (keyword? artifact')
+                     (map? (get runtime artifact')))
+              (get runtime artifact')
+              {})
+        override (when (keyword? artifact')
+                   (get (artifact-overrides runtime) artifact'))
+        active' (some-> override :active keywordish)
+        canary' (if (map? (:canary override))
+                  (:canary override)
+                  nil)]
+    (cond-> cfg
+      (keyword? active') (assoc-in [:rollout :active] active')
+      (map? canary') (assoc-in [:rollout :canary] canary'))))
+
+(defn get-artifact-rollout
+  "Returns current rollout override state for artifact(s).
+
+  Input:
+  - `artifact`: optional `:protocol` or `:router`.
+
+  Output:
+  - `{:ok? true :overrides <map>}` for all artifacts,
+  - `{:ok? true :artifact <kw> :override <map|nil>}` for single artifact."
+  ([runtime]
+   (get-artifact-rollout runtime nil))
+  ([runtime artifact]
+   (let [artifact' (some-> artifact keywordish)]
+     (cond
+       (and (some? artifact')
+            (not (contains? supported-artifact-keys artifact')))
+       {:ok? false
+        :error :input/invalid
+        :message "Unsupported artifact key. Expected :protocol or :router."
+        :details {:artifact artifact'}}
+
+       (and (some? artifact')
+            (contains? supported-artifact-keys artifact'))
+       {:ok? true
+        :artifact artifact'
+        :override (get (artifact-overrides runtime) artifact')}
+
+       :else
+       {:ok? true
+        :overrides (artifact-overrides runtime)}))))
+
+(defn set-artifact-rollout!
+  "Sets or clears runtime rollout override for a selected artifact.
+
+  Params map keys:
+  - `:artifact` (required): `:protocol` or `:router`,
+  - `:active` (optional): active version keyword/string,
+  - `:canary` (optional): `{ :enabled? bool, :version kw, :percent int }`,
+  - `:clear?` (optional): when true, removes override for artifact.
+
+  Returns operation result map (`:ok?` + details)."
+  [runtime {:keys [artifact active canary clear?]}]
+  (let [artifact' (some-> artifact keywordish)
+        state (artifact-overrides-state runtime)
+        clear?' (true? (boolish clear?))]
+    (cond
+      (not (contains? supported-artifact-keys artifact'))
+      {:ok? false
+       :error :input/invalid
+       :message "Unsupported artifact key. Expected :protocol or :router."
+       :details {:artifact artifact}}
+
+      (nil? state)
+      {:ok? false
+       :error :runtime/not-configured
+       :message "Runtime artifact override state is not available."}
+
+      :else
+      (let [base-cfg (artifact-config runtime artifact')
+            known-versions (if (map? (:versions base-cfg))
+                             (set (keys (:versions base-cfg)))
+                             #{})
+            active' (some-> active keywordish)
+            canary-map (if (map? canary) canary {})
+            canary-enabled? (boolish (:enabled? canary-map))
+            canary-version (some-> (:version canary-map) keywordish)
+            canary-percent (:percent canary-map)
+            canary' (cond-> {}
+                      (some? canary-enabled?) (assoc :enabled? canary-enabled?)
+                      (keyword? canary-version) (assoc :version canary-version)
+                      (integer? canary-percent) (assoc :percent canary-percent))
+            invalid-active? (and (keyword? active')
+                                 (seq known-versions)
+                                 (not (contains? known-versions active')))
+            invalid-canary-version? (and (keyword? canary-version)
+                                         (seq known-versions)
+                                         (not (contains? known-versions canary-version)))
+            invalid-canary-percent? (and (contains? canary-map :percent)
+                                         (not (and (integer? canary-percent)
+                                                   (<= 0 canary-percent 100))))]
+        (cond
+          invalid-active?
+          {:ok? false
+           :error :input/invalid
+           :message "Active artifact version is not defined in config versions."
+           :details {:artifact artifact'
+                     :active active'
+                     :known-versions (vec (sort known-versions))}}
+
+          invalid-canary-version?
+          {:ok? false
+           :error :input/invalid
+           :message "Canary artifact version is not defined in config versions."
+           :details {:artifact artifact'
+                     :canary/version canary-version
+                     :known-versions (vec (sort known-versions))}}
+
+          invalid-canary-percent?
+          {:ok? false
+           :error :input/invalid
+           :message "Canary percent must be integer in [0,100]."
+           :details {:artifact artifact'
+                     :canary/percent canary-percent}}
+
+          :else
+          (let [next-override (cond-> {}
+                                (keyword? active') (assoc :active active')
+                                (seq canary') (assoc :canary canary'))
+                overrides (swap! state
+                                 (fn [current]
+                                   (let [current' (if (map? current) current {})]
+                                     (if clear?'
+                                       (dissoc current' artifact')
+                                       (assoc current' artifact' next-override)))))
+                effective (get overrides artifact')]
+            {:ok? true
+             :artifact artifact'
+             :override effective
+             :overrides overrides
+             :cleared? (if clear?' true false)}))))))
 
 (defn- request-explicit-cap-id
   [request]
@@ -632,6 +802,7 @@
                           :queue/service queue-service
                           :execution-graph (execution-graph/config execution-graph-service)
                           :execution-graph/service execution-graph-service
+                          :artifact/overrides (atom {})
                           :gateway/model-health gateway-health
                           :ferment.model.session/workers (atom {})
                           :ferment.model.session/last-id-by-model (atom {})

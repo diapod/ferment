@@ -28,7 +28,8 @@ Reprioritized for router-first meta-goal (sync: 2026-03-09): keep the core small
    - Focus now:
      - [x] protocol artifact selector foundation (`:versions`, `:rollout`, deterministic canary by `trace.id`, request override),
      - [x] artifact versioning for `prompts`, `policy/intents`, routing strategy (runtime selection for protocol + router with per-request override),
-     - canary/shadow rollout + one-step rollback.
+     - [x] canary rollout + one-step rollback (runtime override via admin actions),
+     - [ ] shadow rollout execution + side-by-side outcome comparison.
 
 4. [ ] `#12` Heterogeneous connectivity adapters (API + swarm-ready)
    - Reason: Ferment meta-purpose requires excellent connectivity to local, remote API, and future decentralized peers.

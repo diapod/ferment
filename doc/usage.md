@@ -408,6 +408,34 @@ curl -s http://127.0.0.1:12002/v1/admin \
   -d '{"action":"admin/migrate-db"}'
 ```
 
+Runtime artifact rollout can be inspected and changed without restart:
+
+```bash
+curl -s http://127.0.0.1:12002/v1/admin \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": "admin/set-artifact-rollout",
+    "artifact": "router",
+    "active": "canary-v1",
+    "canary": {"enabled?": true, "version": "baseline-v1", "percent": 25}
+  }'
+```
+
+```bash
+curl -s http://127.0.0.1:12002/v1/admin \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": "admin/get-artifact-rollout",
+    "artifact": "router"
+  }'
+```
+
+`admin/set-artifact-rollout` supports:
+- `artifact`: `protocol` or `router` (required),
+- `active`: active version key (optional),
+- `canary`: `{"enabled?": bool, "version": <version>, "percent": 0..100}` (optional),
+- `clear?`: `true` removes override for selected artifact (optional).
+
 ## 8) Direct model runtime endpoints (HTTP to worker bridge)
 
 Each model runtime can expose its own endpoint when `:http {:enabled? true ...}` is set in model runtime config.

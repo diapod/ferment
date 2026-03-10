@@ -28,6 +28,8 @@
                         :admin/delete-role          {:any #{:role/admin}}
                         :admin/list-known-roles     {:any #{:role/admin}}
                         :admin/reset-login-attempts {:any #{:role/admin}}
+                        :admin/get-artifact-rollout {:any #{:role/admin}}
+                        :admin/set-artifact-rollout {:any #{:role/admin}}
                         :admin/migrate-db           {:any #{:role/admin}}
                         :admin/rollback-db          {:any #{:role/admin}}}
   :effects             {:none        {:any #{:role/anonymous :role/user :role/operator :role/admin}}

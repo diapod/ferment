@@ -241,3 +241,45 @@
         (is (= 1 (get-in restored [:job :request :workflow/resume-checkpoint :next-index])))
         (finally
           (runtime/stop-runtime :ferment.runtime/default state))))))
+
+(deftest artifact-rollout-overrides-are-mutable-and-validated
+  (testing "Runtime artifact rollout helpers set/get/clear overrides with version validation."
+    (let [runtime-state {:artifact/overrides (atom {})
+                         :protocol {:versions {:baseline-v1 {}
+                                               :canary-v1 {}}
+                                    :rollout {:active :baseline-v1}}
+                         :router {:versions {:baseline-v1 {}
+                                             :canary-v1 {}}
+                                  :rollout {:active :baseline-v1}}}
+          set-ok (runtime/set-artifact-rollout!
+                  runtime-state
+                  {:artifact :protocol
+                   :active :canary-v1
+                   :canary {:enabled? true
+                            :version :baseline-v1
+                            :percent 20}})
+          get-one (runtime/get-artifact-rollout runtime-state :protocol)
+          get-all (runtime/get-artifact-rollout runtime-state)
+          effective (runtime/artifact-config runtime-state :protocol)
+          cleared (runtime/set-artifact-rollout!
+                   runtime-state
+                   {:artifact :protocol
+                    :clear? true})
+          invalid-version (runtime/set-artifact-rollout!
+                           runtime-state
+                           {:artifact :router
+                            :active :unknown-v9})]
+      (is (= true (:ok? set-ok)))
+      (is (= :canary-v1 (get-in set-ok [:override :active])))
+      (is (= true (get-in set-ok [:override :canary :enabled?])))
+      (is (= :protocol (:artifact get-one)))
+      (is (= :canary-v1 (get-in get-one [:override :active])))
+      (is (= :canary-v1 (get-in get-all [:overrides :protocol :active])))
+      (is (= :canary-v1 (get-in effective [:rollout :active])))
+      (is (= 20 (get-in effective [:rollout :canary :percent])))
+      (is (= true (:ok? cleared)))
+      (is (= true (:cleared? cleared)))
+      (is (nil? (get-in (runtime/get-artifact-rollout runtime-state :protocol)
+                        [:override :active])))
+      (is (= false (:ok? invalid-version)))
+      (is (= :input/invalid (:error invalid-version))))))
