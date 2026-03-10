@@ -70,9 +70,16 @@
     (let [canary (if (map? (:canary rollout))
                    (:canary rollout)
                    {})
+          shadow (if (map? (:shadow rollout))
+                   (:shadow rollout)
+                   {})
           percent (cond
                     (int? (:percent canary)) (:percent canary)
                     (integer? (:percent canary)) (int (:percent canary))
+                    :else nil)
+          shadow-percent (cond
+                           (int? (:percent shadow)) (:percent shadow)
+                           (integer? (:percent shadow)) (int (:percent shadow))
                     :else nil)]
       (cond-> rollout
         (keyword? (keywordish (:active rollout)))
@@ -84,7 +91,15 @@
                  (contains? canary :enabled?) (update :enabled? boolean)
                  (keyword? (keywordish (:version canary)))
                  (assoc :version (keywordish (:version canary)))
-                 (int? percent) (assoc :percent (max 0 (min 100 percent)))))))))
+                 (int? percent) (assoc :percent (max 0 (min 100 percent)))))
+
+        (map? (:shadow rollout))
+        (assoc :shadow
+               (cond-> shadow
+                 (contains? shadow :enabled?) (update :enabled? boolean)
+                 (keyword? (keywordish (:version shadow)))
+                 (assoc :version (keywordish (:version shadow)))
+                 (int? shadow-percent) (assoc :percent (max 0 (min 100 shadow-percent))))))))))
 
 (defn- normalize-version-catalog
   [versions]
@@ -185,6 +200,63 @@
     {:protocol selected-protocol
      :artifact/version selected-version
      :artifact/source selected-source}))
+
+(defn select-protocol-shadow-artifact
+  "Selects optional shadow protocol artifact/version for side-by-side evaluation.
+
+  Output:
+  - `:protocol`: selected shadow protocol map or nil,
+  - `:artifact/version`: selected version keyword or nil,
+  - `:artifact/source`: one of `:request`, `:shadow`, `:disabled`,
+  - `:shadow/enabled?`: shadow is enabled by config or explicit request override,
+  - `:shadow/applied?`: concrete shadow artifact was selected."
+  [protocol {:keys [trace-id requested-version]}]
+  (let [base-protocol (if (map? protocol) protocol {})
+        versions (if (map? (:versions base-protocol))
+                   (:versions base-protocol)
+                   {})
+        rollout (if (map? (:rollout base-protocol))
+                  (:rollout base-protocol)
+                  {})
+        requested-version' (keywordish requested-version)
+        shadow-cfg (if (map? (:shadow rollout))
+                     (:shadow rollout)
+                     {})
+        shadow-enabled? (true? (:enabled? shadow-cfg))
+        shadow-version (keywordish (:version shadow-cfg))
+        shadow-percent (let [n (:percent shadow-cfg)]
+                         (if (integer? n) (max 0 (min 100 (int n))) 0))
+        bucket (trace-bucket trace-id)
+        shadow-hit? (and shadow-enabled?
+                         (keyword? shadow-version)
+                         (contains? versions shadow-version)
+                         (int? bucket)
+                         (< bucket shadow-percent))
+        [selected-version selected-source]
+        (cond
+          (and (keyword? requested-version')
+               (contains? versions requested-version'))
+          [requested-version' :request]
+
+          shadow-hit?
+          [shadow-version :shadow]
+
+          :else
+          [nil :disabled])
+        selected-patch (when (keyword? selected-version)
+                         (get versions selected-version))
+        selected-protocol (when (keyword? selected-version)
+                            (if (map? selected-patch)
+                              (-> (dissoc base-protocol :versions :rollout :artifact/version)
+                                  (deep-merge selected-patch)
+                                  (assoc :artifact/version selected-version))
+                              (assoc (dissoc base-protocol :versions :rollout)
+                                     :artifact/version selected-version)))]
+    {:protocol selected-protocol
+     :artifact/version selected-version
+     :artifact/source selected-source
+     :shadow/enabled? (or shadow-enabled? (keyword? requested-version'))
+     :shadow/applied? (keyword? selected-version)}))
 
 (defn normalize-protocol
   "Applies lightweight defaults to protocol config."

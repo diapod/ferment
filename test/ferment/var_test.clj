@@ -1080,7 +1080,10 @@
                                                 :active "canary-v1"
                                                 :canary {:enabled? true
                                                          :version "baseline-v1"
-                                                         :percent 25}})
+                                                         :percent 25}
+                                                :shadow {:enabled? true
+                                                         :version "canary-v1"
+                                                         :percent 10}})
                   set-body (json/parse-string (:body set-resp) true)
                   get-resp (http-post-json url {:action "admin/get-artifact-rollout"
                                                 :artifact :protocol})
@@ -1092,6 +1095,7 @@
               (is (= "admin/set-artifact-rollout" (:action set-body)))
               (is (re-find #"canary-v1$" (str (get-in set-body [:override :active]))))
               (is (= 25 (get-in set-body [:override :canary :percent])))
+              (is (= 10 (get-in set-body [:override :shadow :percent])))
 
               (is (= 200 (:status get-resp)))
               (is (= true (:ok? get-body)))

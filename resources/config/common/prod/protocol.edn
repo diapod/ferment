@@ -295,6 +295,9 @@
   :rollout             {:active :baseline-v1
                         :canary {:enabled? false
                                  :version :canary-v1
+                                 :percent 0}
+                        :shadow {:enabled? false
+                                 :version :canary-v1
                                  :percent 0}}
 
   :error/catalog {:schema/invalid     {:retryable? true}

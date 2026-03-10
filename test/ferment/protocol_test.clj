@@ -44,7 +44,10 @@
                :rollout {:active "v1"
                          :canary {:enabled? true
                                   :version ":v2"
-                                  :percent 15}}}
+                                  :percent 15}
+                         :shadow {:enabled? true
+                                  :version "v2"
+                                  :percent 10}}}
           normalized (protocol/normalize-protocol cfg)]
       (is (= "Base prompt" (get-in normalized [:prompts :default])))
       (is (= "V1 prompt" (get-in normalized [:versions :v1 :prompts :default])))
@@ -52,7 +55,9 @@
       (is (= "V2 prompt" (get-in normalized [:versions :v2 :prompts :default])))
       (is (= :v1 (get-in normalized [:rollout :active])))
       (is (= :v2 (get-in normalized [:rollout :canary :version])))
-      (is (= 15 (get-in normalized [:rollout :canary :percent]))))))
+      (is (= 15 (get-in normalized [:rollout :canary :percent])))
+      (is (= :v2 (get-in normalized [:rollout :shadow :version])))
+      (is (= 10 (get-in normalized [:rollout :shadow :percent]))))))
 
 (deftest select-protocol-artifact-picks-request-active-or-canary-version
   (testing "Explicit request version wins when present."
@@ -92,3 +97,34 @@
       (is (= :v1 (:artifact/version selected)))
       (is (= :active (:artifact/source selected)))
       (is (= "V1" (get-in selected [:protocol :prompts :default]))))))
+
+(deftest select-protocol-shadow-artifact-selects-shadow-variant
+  (testing "Shadow protocol is selected when enabled and bucket matches."
+    (let [cfg (protocol/normalize-protocol
+               {:prompts {:default "Base"}
+                :versions {:v1 {:prompts {:default "V1"}}
+                           :v2 {:prompts {:default "V2"}}}
+                :rollout {:active :v1
+                          :shadow {:enabled? true :version :v2 :percent 100}}})
+          selected (protocol/select-protocol-shadow-artifact cfg {:trace-id "proto-shadow"})]
+      (is (= true (:shadow/enabled? selected)))
+      (is (= true (:shadow/applied? selected)))
+      (is (= :v2 (:artifact/version selected)))
+      (is (= :shadow (:artifact/source selected)))
+      (is (= "V2" (get-in selected [:protocol :prompts :default])))))
+
+  (testing "Shadow request override has priority when present."
+    (let [cfg (protocol/normalize-protocol
+               {:prompts {:default "Base"}
+                :versions {:v1 {:prompts {:default "V1"}}
+                           :v2 {:prompts {:default "V2"}}}
+                :rollout {:active :v1
+                          :shadow {:enabled? false :version :v2 :percent 0}}})
+          selected (protocol/select-protocol-shadow-artifact
+                    cfg
+                    {:trace-id "proto-shadow-req"
+                     :requested-version :v2})]
+      (is (= true (:shadow/enabled? selected)))
+      (is (= true (:shadow/applied? selected)))
+      (is (= :v2 (:artifact/version selected)))
+      (is (= :request (:artifact/source selected))))))

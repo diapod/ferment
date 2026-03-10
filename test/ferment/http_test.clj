@@ -114,6 +114,43 @@
       (is (= :v2 (get-in response [:body :routing/router-artifact-version])))
       (is (= :request (get-in response [:body :routing/router-artifact-source]))))))
 
+(deftest invoke-act-emits-shadow-rollout-metadata-and-comparison
+  (testing "When shadow rollout is enabled, response contains selected shadow artifacts and side-by-side routing comparison."
+    (let [runtime {:roles {}
+                   :resolver {}
+                   :protocol {:prompts {:default "Base"}
+                              :versions {:v1 {:prompts {:default "V1"}}
+                                         :v2 {:prompts {:default "V2"}}}
+                              :rollout {:active :v1
+                                        :shadow {:enabled? true
+                                                 :version :v2
+                                                 :percent 100}}}
+                   :router {:routing {:intent->cap {:text/respond :llm/voice}}
+                            :versions {:v1 {}
+                                       :v2 {}}
+                            :rollout {:active :v1
+                                      :shadow {:enabled? true
+                                               :version :v2
+                                               :percent 100}}}}
+          payload {:proto 1
+                   :trace {:id "t-shadow-rollout-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver _opts]
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (http/invoke-act runtime payload nil nil))]
+      (is (= 200 (:status response)))
+      (is (= :v2 (get-in response [:body :routing/router-shadow-artifact-version])))
+      (is (= :shadow (get-in response [:body :routing/router-shadow-artifact-source])))
+      (is (= true (get-in response [:body :routing/router-shadow-enabled?])))
+      (is (= true (get-in response [:body :routing/router-shadow-attempted?])))
+      (is (boolean? (get-in response [:body :routing/router-shadow-match?])))
+      (is (= :v2 (get-in response [:body :protocol/shadow-artifact-version])))
+      (is (= :shadow (get-in response [:body :protocol/shadow-artifact-source]))))))
+
 (deftest invoke-act-uses-configured-middleware-chain
   (testing "invoke-act may run through configured act middleware chain compiled from data modules."
     (let [called (atom 0)

@@ -184,10 +184,14 @@
         active' (some-> override :active keywordish)
         canary' (if (map? (:canary override))
                   (:canary override)
+                  nil)
+        shadow' (if (map? (:shadow override))
+                  (:shadow override)
                   nil)]
     (cond-> cfg
       (keyword? active') (assoc-in [:rollout :active] active')
-      (map? canary') (assoc-in [:rollout :canary] canary'))))
+      (map? canary') (assoc-in [:rollout :canary] canary')
+      (map? shadow') (assoc-in [:rollout :shadow] shadow'))))
 
 (defn get-artifact-rollout
   "Returns current rollout override state for artifact(s).
@@ -227,10 +231,11 @@
   - `:artifact` (required): `:protocol` or `:router`,
   - `:active` (optional): active version keyword/string,
   - `:canary` (optional): `{ :enabled? bool, :version kw, :percent int }`,
+  - `:shadow` (optional): `{ :enabled? bool, :version kw, :percent int }`,
   - `:clear?` (optional): when true, removes override for artifact.
 
   Returns operation result map (`:ok?` + details)."
-  [runtime {:keys [artifact active canary clear?]}]
+  [runtime {:keys [artifact active canary shadow clear?]}]
   (let [artifact' (some-> artifact keywordish)
         state (artifact-overrides-state runtime)
         clear?' (true? (boolish clear?))]
@@ -260,6 +265,14 @@
                       (some? canary-enabled?) (assoc :enabled? canary-enabled?)
                       (keyword? canary-version) (assoc :version canary-version)
                       (integer? canary-percent) (assoc :percent canary-percent))
+            shadow-map (if (map? shadow) shadow {})
+            shadow-enabled? (boolish (:enabled? shadow-map))
+            shadow-version (some-> (:version shadow-map) keywordish)
+            shadow-percent (:percent shadow-map)
+            shadow' (cond-> {}
+                      (some? shadow-enabled?) (assoc :enabled? shadow-enabled?)
+                      (keyword? shadow-version) (assoc :version shadow-version)
+                      (integer? shadow-percent) (assoc :percent shadow-percent))
             invalid-active? (and (keyword? active')
                                  (seq known-versions)
                                  (not (contains? known-versions active')))
@@ -268,7 +281,13 @@
                                          (not (contains? known-versions canary-version)))
             invalid-canary-percent? (and (contains? canary-map :percent)
                                          (not (and (integer? canary-percent)
-                                                   (<= 0 canary-percent 100))))]
+                                                   (<= 0 canary-percent 100))))
+            invalid-shadow-version? (and (keyword? shadow-version)
+                                         (seq known-versions)
+                                         (not (contains? known-versions shadow-version)))
+            invalid-shadow-percent? (and (contains? shadow-map :percent)
+                                         (not (and (integer? shadow-percent)
+                                                   (<= 0 shadow-percent 100))))]
         (cond
           invalid-active?
           {:ok? false
@@ -293,10 +312,26 @@
            :details {:artifact artifact'
                      :canary/percent canary-percent}}
 
+          invalid-shadow-version?
+          {:ok? false
+           :error :input/invalid
+           :message "Shadow artifact version is not defined in config versions."
+           :details {:artifact artifact'
+                     :shadow/version shadow-version
+                     :known-versions (vec (sort known-versions))}}
+
+          invalid-shadow-percent?
+          {:ok? false
+           :error :input/invalid
+           :message "Shadow percent must be integer in [0,100]."
+           :details {:artifact artifact'
+                     :shadow/percent shadow-percent}}
+
           :else
           (let [next-override (cond-> {}
                                 (keyword? active') (assoc :active active')
-                                (seq canary') (assoc :canary canary'))
+                                (seq canary') (assoc :canary canary')
+                                (seq shadow') (assoc :shadow shadow'))
                 overrides (swap! state
                                  (fn [current]
                                    (let [current' (if (map? current) current {})]

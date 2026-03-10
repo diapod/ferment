@@ -257,7 +257,10 @@
                    :active :canary-v1
                    :canary {:enabled? true
                             :version :baseline-v1
-                            :percent 20}})
+                            :percent 20}
+                   :shadow {:enabled? true
+                            :version :canary-v1
+                            :percent 15}})
           get-one (runtime/get-artifact-rollout runtime-state :protocol)
           get-all (runtime/get-artifact-rollout runtime-state)
           effective (runtime/artifact-config runtime-state :protocol)
@@ -277,6 +280,7 @@
       (is (= :canary-v1 (get-in get-all [:overrides :protocol :active])))
       (is (= :canary-v1 (get-in effective [:rollout :active])))
       (is (= 20 (get-in effective [:rollout :canary :percent])))
+      (is (= 15 (get-in effective [:rollout :shadow :percent])))
       (is (= true (:ok? cleared)))
       (is (= true (:cleared? cleared)))
       (is (nil? (get-in (runtime/get-artifact-rollout runtime-state :protocol)

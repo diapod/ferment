@@ -142,6 +142,9 @@ Shape (EDN):
  :rollout                {:active kw
                           :canary {:enabled? boolean
                                    :version  kw
+                                   :percent  int}
+                          :shadow {:enabled? boolean
+                                   :version  kw
                                    :percent  int}}
  :intent->policy-profile {kw kw …}
  :policy-profiles
@@ -234,6 +237,9 @@ Shape (EDN):
                      …}
  :rollout           {:active kw
                      :canary {:enabled? boolean
+                              :version  kw
+                              :percent  int}
+                     :shadow {:enabled? boolean
                               :version  kw
                               :percent  int}}
  :artifact/version  kw

@@ -283,9 +283,16 @@
                              (keywordish (:policy/version routing'))
                              (keywordish (:policy-version routing'))
                              (keywordish (:protocol/version routing')))
+        shadow-artifact-version (or (keywordish (:shadow/artifact-version routing'))
+                                    (keywordish (:shadow/version routing'))
+                                    (keywordish (:protocol/shadow-version routing'))
+                                    (keywordish (:policy/shadow-version routing')))
         router-artifact-version (or (keywordish (:router/artifact-version routing'))
                                     (keywordish (:router/version routing'))
                                     (keywordish (:routing/version routing')))
+        router-shadow-artifact-version (or (keywordish (:router/shadow-artifact-version routing'))
+                                           (keywordish (:router/shadow-version routing'))
+                                           (keywordish (:routing/shadow-version routing')))
         debug-plan? (coerce-bool (or (:debug/plan? routing')
                                      (:debug-plan? routing')
                                      (get-in routing' [:debug :plan?])))
@@ -301,7 +308,9 @@
       (some? force?)                                  (assoc :force? force?)
       (contains? #{:fail-open :fail-closed} on-error) (assoc :on-error on-error)
       (keyword? artifact-version)                     (assoc :artifact/version artifact-version)
+      (keyword? shadow-artifact-version)              (assoc :shadow/artifact-version shadow-artifact-version)
       (keyword? router-artifact-version)              (assoc :router/artifact-version router-artifact-version)
+      (keyword? router-shadow-artifact-version)       (assoc :router/shadow-artifact-version router-shadow-artifact-version)
       (some? debug-plan?)                             (assoc :debug/plan? debug-plan?)
       (some? debug-transcript?)                       (assoc :debug/transcript? debug-transcript?))))
 
@@ -399,6 +408,11 @@
                             :route/fail-open       0
                             :route/fail-closed     0
                             :route/strict          0
+                            :route/shadow-enabled  0
+                            :route/shadow-attempt  0
+                            :route/shadow-match    0
+                            :route/shadow-mismatch 0
+                            :route/shadow-error    0
                             :cap/resolve-attempt   0
                             :cap/resolve-hit       0
                             :cap/resolve-miss      0
@@ -597,7 +611,12 @@
         final' (counter-value (:route/decide-final routing))
         fail-open' (counter-value (:route/fail-open routing))
         fail-closed' (counter-value (:route/fail-closed routing))
-        strict' (counter-value (:route/strict routing))]
+        strict' (counter-value (:route/strict routing))
+        shadow-enabled' (counter-value (:route/shadow-enabled routing))
+        shadow-attempt' (counter-value (:route/shadow-attempt routing))
+        shadow-match' (counter-value (:route/shadow-match routing))
+        shadow-mismatch' (counter-value (:route/shadow-mismatch routing))
+        shadow-error' (counter-value (:route/shadow-error routing))]
     {:participants/diversity {:value (safe-rate participants-total participants-requests)
                               :participants/total participants-total
                               :participants/requests participants-requests
@@ -610,11 +629,17 @@
       :route/fail-open fail-open'
       :route/fail-closed fail-closed'
       :route/strict strict'
+      :route/shadow-enabled shadow-enabled'
+      :route/shadow-attempt shadow-attempt'
+      :route/shadow-match shadow-match'
+      :route/shadow-mismatch shadow-mismatch'
+      :route/shadow-error shadow-error'
       :continue-rate (safe-rate continue' route-total)
       :final-rate (safe-rate final' route-total)
       :fail-open-rate (safe-rate fail-open' route-total)
       :fail-closed-rate (safe-rate fail-closed' route-total)
-      :strict-rate (safe-rate strict' route-total)}
+      :strict-rate (safe-rate strict' route-total)
+      :shadow-match-rate (safe-rate shadow-match' shadow-attempt')}
      :context/hit-utility {:value (safe-rate context-hits context-lookups)
                            :lookups context-lookups
                            :hits context-hits
@@ -3280,24 +3305,96 @@
   [runtime request]
   (if-not (map? runtime)
     runtime
-    (let [router-cfg (runtime-router-config runtime)
-          protocol-cfg (runtime-protocol-config runtime)]
-      (if-not (map? router-cfg)
-        runtime
-        (let [selection (router/select-router-artifact
-                         router-cfg
-                         {:trace-id (get-in request [:trace :id])
-                          :requested-version (some-> request
-                                                     :routing
-                                                     :router/artifact-version)})
-              selected-router (:router selection)
-              selected-version (:artifact/version selection)
-              selected-source (:artifact/source selection)]
-          (cond-> (assoc runtime
-                         :router selected-router
-                         :protocol protocol-cfg)
-            (keyword? selected-version) (assoc :router/artifact-version selected-version)
-            (keyword? selected-source) (assoc :router/artifact-source selected-source)))))))
+    (let [trace-id (get-in request [:trace :id])
+          requested-router-version (some-> request :routing :router/artifact-version)
+          requested-router-shadow-version (some-> request :routing :router/shadow-artifact-version)
+          requested-protocol-version (some-> request :routing :artifact/version)
+          requested-protocol-shadow-version (some-> request :routing :shadow/artifact-version)
+          router-cfg (runtime-router-config runtime)
+          protocol-cfg (runtime-protocol-config runtime)
+          router-selection (if (map? router-cfg)
+                             (router/select-router-artifact
+                              router-cfg
+                              {:trace-id trace-id
+                               :requested-version requested-router-version})
+                             nil)
+          protocol-selection (if (map? protocol-cfg)
+                               (protocol/select-protocol-artifact
+                                protocol-cfg
+                                {:trace-id trace-id
+                                 :requested-version requested-protocol-version})
+                               nil)
+          router-shadow-selection (if (map? router-cfg)
+                                    (router/select-router-shadow-artifact
+                                     router-cfg
+                                     {:trace-id trace-id
+                                      :requested-version requested-router-shadow-version})
+                                    nil)
+          protocol-shadow-selection (if (map? protocol-cfg)
+                                      (protocol/select-protocol-shadow-artifact
+                                       protocol-cfg
+                                       {:trace-id trace-id
+                                        :requested-version requested-protocol-shadow-version})
+                                      nil)
+          selected-router (:router router-selection)
+          selected-router-version (some-> router-selection :artifact/version keywordish)
+          selected-router-source (some-> router-selection :artifact/source keywordish)
+          selected-protocol (:protocol protocol-selection)
+          selected-protocol-version (some-> protocol-selection :artifact/version keywordish)
+          selected-protocol-source (some-> protocol-selection :artifact/source keywordish)
+          shadow-router (:router router-shadow-selection)
+          shadow-router-version (some-> router-shadow-selection :artifact/version keywordish)
+          shadow-router-source (some-> router-shadow-selection :artifact/source keywordish)
+          shadow-router-enabled? (true? (:shadow/enabled? router-shadow-selection))
+          shadow-router-applied? (and (true? (:shadow/applied? router-shadow-selection))
+                                      (map? shadow-router))
+          shadow-protocol-version (some-> protocol-shadow-selection :artifact/version keywordish)
+          shadow-protocol-source (some-> protocol-shadow-selection :artifact/source keywordish)
+          shadow-protocol-enabled? (true? (:shadow/enabled? protocol-shadow-selection))
+          shadow-protocol-applied? (true? (:shadow/applied? protocol-shadow-selection))]
+      (cond-> runtime
+        (map? selected-router) (assoc :router selected-router)
+        (map? selected-protocol) (assoc :protocol selected-protocol)
+        (keyword? selected-router-version) (assoc :router/artifact-version selected-router-version)
+        (keyword? selected-router-source) (assoc :router/artifact-source selected-router-source)
+        (keyword? selected-protocol-version) (assoc :protocol/artifact-version selected-protocol-version)
+        (keyword? selected-protocol-source) (assoc :protocol/artifact-source selected-protocol-source)
+        shadow-router-enabled? (assoc :router/shadow-enabled? true)
+        shadow-router-applied? (assoc :router/shadow shadow-router
+                                      :router/shadow-applied? true)
+        (keyword? shadow-router-version) (assoc :router/shadow-artifact-version shadow-router-version)
+        (keyword? shadow-router-source) (assoc :router/shadow-artifact-source shadow-router-source)
+        shadow-protocol-enabled? (assoc :protocol/shadow-enabled? true)
+        shadow-protocol-applied? (assoc :protocol/shadow-applied? true)
+        (keyword? shadow-protocol-version) (assoc :protocol/shadow-artifact-version shadow-protocol-version)
+        (keyword? shadow-protocol-source) (assoc :protocol/shadow-artifact-source shadow-protocol-source)))))
+
+(defn- routing-signature
+  [mode request]
+  (let [request' (if (map? request) request {})
+        intent (some-> request' :task :intent keywordish)
+        cap-id (or (some-> request' :task :cap/id keywordish)
+                   (some-> request' :routing :decision :cap/id keywordish)
+                   (some-> request' :routing :decision :selected keywordish))
+        candidate0 (some-> request'
+                           :routing
+                           :decision
+                           :candidates
+                           first
+                           keywordish)]
+    (cond-> {:mode (or (keywordish mode) :none)}
+      (keyword? intent) (assoc :intent intent)
+      (keyword? cap-id) (assoc :cap/id cap-id)
+      (keyword? candidate0) (assoc :candidate candidate0))))
+
+(defn- shadow-routing-telemetry-counters
+  [shadow-enabled? shadow-attempted? shadow-match? shadow-mode]
+  (cond-> {}
+    shadow-enabled? (update :route/shadow-enabled (fnil inc 0))
+    shadow-attempted? (update :route/shadow-attempt (fnil inc 0))
+    (and shadow-attempted? (true? shadow-match?)) (update :route/shadow-match (fnil inc 0))
+    (and shadow-attempted? (false? shadow-match?)) (update :route/shadow-mismatch (fnil inc 0))
+    (and shadow-attempted? (= :error shadow-mode)) (update :route/shadow-error (fnil inc 0))))
 
 (defn- invoke-act-route-phase
   [runtime request accepted-mode? protocol resolver]
@@ -3320,21 +3417,59 @@
         route-mode       (or (:mode meta-step) :none)
         request*         (or (:request meta-step) request)
         routed?          (not= request request*)
+        shadow-enabled?  (true? (:router/shadow-enabled? runtime))
+        shadow-applied?  (and shadow-enabled?
+                              (true? (:router/shadow-applied? runtime))
+                              (map? (:router/shadow runtime)))
+        [shadow-meta-step shadow-route-phase-latency-ms]
+        (if (and shadow-applied?
+                 (:ok? req-check)
+                 (not accepted-mode?))
+          (let [runtime-shadow (cond-> (assoc runtime :router (:router/shadow runtime))
+                                 (keyword? (:router/shadow-artifact-version runtime))
+                                 (assoc :router/artifact-version (:router/shadow-artifact-version runtime))
+                                 (keyword? (:router/shadow-artifact-source runtime))
+                                 (assoc :router/artifact-source (:router/shadow-artifact-source runtime)))
+                resolver-shadow (effective-resolver runtime-shadow)
+                started-at (now-nanos)
+                step (maybe-apply-meta-routing runtime-shadow resolver-shadow request)]
+            [step (nanos->millis started-at)])
+          [nil nil])
+        shadow-route-mode (or (:mode shadow-meta-step) :none)
+        shadow-request* (or (:request shadow-meta-step) request)
+        primary-signature (routing-signature route-mode request*)
+        shadow-signature (when (map? shadow-meta-step)
+                           (routing-signature shadow-route-mode shadow-request*))
+        shadow-match? (when (map? shadow-signature)
+                        (= primary-signature shadow-signature))
         post-route-check (cond
                            (not (:ok? req-check)) req-check
                            (#{:error :final} route-mode) {:ok? true}
                            routed? (contracts/validate-request protocol request*)
-                           :else req-check)]
+                           :else req-check)
+        route-telemetry (telemetry/merge-counters
+                         (routing-telemetry-counters meta-step)
+                         (shadow-routing-telemetry-counters shadow-enabled?
+                                                            (map? shadow-meta-step)
+                                                            shadow-match?
+                                                            shadow-route-mode))]
     {:req-check req-check
      :meta-step meta-step
      :route-mode route-mode
      :request* request*
      :routed? routed?
+     :routing/shadow-enabled? shadow-enabled?
+     :routing/shadow-attempted? (map? shadow-meta-step)
+     :routing/shadow-match? shadow-match?
+     :routing/shadow-route-mode shadow-route-mode
+     :routing/shadow-primary-signature primary-signature
+     :routing/shadow-candidate-signature shadow-signature
+     :routing/shadow-route-phase-latency-ms shadow-route-phase-latency-ms
      :route-decide-latency-ms route-decider-latency-ms
      :route-phase-latency-ms route-phase-latency-ms
      :route-decider-latency-ms route-decider-latency-ms
      :post-route-check post-route-check
-     :route-telemetry (routing-telemetry-counters meta-step)}))
+     :route-telemetry route-telemetry}))
 
 (defn- invoke-act-capability-error-response
   [request* ^clojure.lang.ExceptionInfo e]
@@ -3712,14 +3847,32 @@
   (let [route-decide-latency-ms (:route-decide-latency-ms phase)
         route-phase-latency-ms (:route-phase-latency-ms phase)
         route-decider-latency-ms (:route-decider-latency-ms phase)
+        routing-shadow-enabled? (true? (:routing/shadow-enabled? phase))
+        routing-shadow-attempted? (true? (:routing/shadow-attempted? phase))
+        routing-shadow-match? (:routing/shadow-match? phase)
+        routing-shadow-route-mode (some-> (:routing/shadow-route-mode phase) keywordish)
+        routing-shadow-primary-signature (if (map? (:routing/shadow-primary-signature phase))
+                                           (:routing/shadow-primary-signature phase)
+                                           nil)
+        routing-shadow-candidate-signature (if (map? (:routing/shadow-candidate-signature phase))
+                                             (:routing/shadow-candidate-signature phase)
+                                             nil)
+        routing-shadow-route-phase-latency-ms (:routing/shadow-route-phase-latency-ms phase)
         protocol-selection (protocol/select-protocol-artifact
                             (runtime-protocol-config runtime)
                             {:trace-id (get-in request* [:trace :id])
                              :requested-version (some-> request* :routing :artifact/version)})
         protocol-artifact-version (some-> (:artifact/version protocol-selection) keywordish)
         protocol-artifact-source (some-> (:artifact/source protocol-selection) keywordish)
+        protocol-shadow-artifact-version (some-> runtime :protocol/shadow-artifact-version keywordish)
+        protocol-shadow-artifact-source (some-> runtime :protocol/shadow-artifact-source keywordish)
+        protocol-shadow-match? (when (and (keyword? protocol-shadow-artifact-version)
+                                          (keyword? protocol-artifact-version))
+                                 (= protocol-shadow-artifact-version protocol-artifact-version))
         router-artifact-version (some-> (:router/artifact-version runtime) keywordish)
         router-artifact-source (some-> (:router/artifact-source runtime) keywordish)
+        router-shadow-artifact-version (some-> runtime :router/shadow-artifact-version keywordish)
+        router-shadow-artifact-source (some-> runtime :router/shadow-artifact-source keywordish)
         response0   (if (and (map? response)
                              (map? (:body response)))
                       (cond-> response
@@ -3743,7 +3896,37 @@
                                   router-artifact-version)
                         (keyword? router-artifact-source)
                         (assoc-in [:body :routing/router-artifact-source]
-                                  router-artifact-source))
+                                  router-artifact-source)
+                        routing-shadow-enabled?
+                        (assoc-in [:body :routing/router-shadow-enabled?] true)
+                        routing-shadow-attempted?
+                        (assoc-in [:body :routing/router-shadow-attempted?] true)
+                        (boolean? routing-shadow-match?)
+                        (assoc-in [:body :routing/router-shadow-match?] routing-shadow-match?)
+                        (keyword? routing-shadow-route-mode)
+                        (assoc-in [:body :routing/router-shadow-route-mode] routing-shadow-route-mode)
+                        (map? routing-shadow-primary-signature)
+                        (assoc-in [:body :routing/router-shadow-primary-signature] routing-shadow-primary-signature)
+                        (map? routing-shadow-candidate-signature)
+                        (assoc-in [:body :routing/router-shadow-candidate-signature] routing-shadow-candidate-signature)
+                        (number? routing-shadow-route-phase-latency-ms)
+                        (assoc-in [:body :routing/router-shadow-route-phase-latency-ms]
+                                  (double routing-shadow-route-phase-latency-ms))
+                        (keyword? router-shadow-artifact-version)
+                        (assoc-in [:body :routing/router-shadow-artifact-version]
+                                  router-shadow-artifact-version)
+                        (keyword? router-shadow-artifact-source)
+                        (assoc-in [:body :routing/router-shadow-artifact-source]
+                                  router-shadow-artifact-source)
+                        (keyword? protocol-shadow-artifact-version)
+                        (assoc-in [:body :protocol/shadow-artifact-version]
+                                  protocol-shadow-artifact-version)
+                        (keyword? protocol-shadow-artifact-source)
+                        (assoc-in [:body :protocol/shadow-artifact-source]
+                                  protocol-shadow-artifact-source)
+                        (boolean? protocol-shadow-match?)
+                        (assoc-in [:body :protocol/shadow-match?]
+                                  protocol-shadow-match?))
                       response)
         response'   (attach-response-participants response0)
         response''  (if (map? (:body response'))
@@ -4351,6 +4534,7 @@
         active     (or (:active params)
                        (:artifact/version params))
         canary     (if (map? (:canary params)) (:canary params) nil)
+        shadow     (if (map? (:shadow params)) (:shadow params) nil)
         clear?     (coerce-bool (:clear? params))]
     (case action
       :admin/create-user
@@ -4450,6 +4634,7 @@
        {:artifact artifact
         :active active
         :canary canary
+        :shadow shadow
         :clear? clear?})
 
       :admin/migrate-db

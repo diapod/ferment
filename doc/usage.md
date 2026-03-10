@@ -434,6 +434,7 @@ curl -s http://127.0.0.1:12002/v1/admin \
 - `artifact`: `protocol` or `router` (required),
 - `active`: active version key (optional),
 - `canary`: `{"enabled?": bool, "version": <version>, "percent": 0..100}` (optional),
+- `shadow`: `{"enabled?": bool, "version": <version>, "percent": 0..100}` (optional),
 - `clear?`: `true` removes override for selected artifact (optional).
 
 ## 8) Direct model runtime endpoints (HTTP to worker bridge)

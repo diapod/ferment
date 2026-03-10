@@ -176,7 +176,31 @@
   #{:enabled? :version :percent})
 
 (def ^:private rollout-keys
-  #{:active :canary})
+  #{:active :canary :shadow})
+
+(defn- validate-rollout-variant!
+  [variant name path]
+  (ensure-keyword-map! variant (conj path name))
+  (ensure-only-keys! variant rollout-canary-keys (conj path name))
+  (when (contains? variant :enabled?)
+    (when-not (boolean? (:enabled? variant))
+      (fail-router! "Router rollout variant :enabled? must be a boolean."
+                    {:path (conj path name :enabled?)
+                     :expected :boolean
+                     :value (:enabled? variant)})))
+  (when (contains? variant :version)
+    (when-not (keyword? (keywordish (:version variant)))
+      (fail-router! "Router rollout variant :version must be a keyword."
+                    {:path (conj path name :version)
+                     :expected :keyword
+                     :value (:version variant)})))
+  (when (contains? variant :percent)
+    (let [p (:percent variant)]
+      (when-not (and (integer? p) (<= 0 p 100))
+        (fail-router! "Router rollout variant :percent must be integer in [0,100]."
+                      {:path (conj path name :percent)
+                       :expected :percent
+                       :value p})))))
 
 (defn- validate-rollout-config!
   [rollout path]
@@ -189,28 +213,9 @@
                      :expected :keyword
                      :value (:active rollout)})))
   (when (contains? rollout :canary)
-    (let [canary (:canary rollout)]
-      (ensure-keyword-map! canary (conj path :canary))
-      (ensure-only-keys! canary rollout-canary-keys (conj path :canary))
-      (when (contains? canary :enabled?)
-        (when-not (boolean? (:enabled? canary))
-          (fail-router! "Router rollout canary :enabled? must be a boolean."
-                        {:path (conj path :canary :enabled?)
-                         :expected :boolean
-                         :value (:enabled? canary)})))
-      (when (contains? canary :version)
-        (when-not (keyword? (keywordish (:version canary)))
-          (fail-router! "Router rollout canary :version must be a keyword."
-                        {:path (conj path :canary :version)
-                         :expected :keyword
-                         :value (:version canary)})))
-      (when (contains? canary :percent)
-        (let [p (:percent canary)]
-          (when-not (and (integer? p) (<= 0 p 100))
-            (fail-router! "Router rollout canary :percent must be integer in [0,100]."
-                          {:path (conj path :canary :percent)
-                           :expected :percent
-                           :value p})))))))
+    (validate-rollout-variant! (:canary rollout) :canary path))
+  (when (contains? rollout :shadow)
+    (validate-rollout-variant! (:shadow rollout) :shadow path)))
 
 (defn- validate-policy-profiles!
   [profiles path]
@@ -539,21 +544,32 @@
     (let [canary (if (map? (:canary rollout))
                    (:canary rollout)
                    {})
+          shadow (if (map? (:shadow rollout))
+                   (:shadow rollout)
+                   {})
           active (keywordish (:active rollout))
           canary-version (keywordish (:version canary))
+          shadow-version (keywordish (:version shadow))
           percent (let [p (:percent canary)]
                     (when (and (integer? p) (<= 0 p 100))
-                      p))]
+                      p))
+          shadow-percent (let [p (:percent shadow)]
+                           (when (and (integer? p) (<= 0 p 100))
+                             p))]
       {:active active
        :canary (cond-> {}
                  (contains? canary :enabled?) (assoc :enabled? (boolean (:enabled? canary)))
                  (keyword? canary-version) (assoc :version canary-version)
-                 (integer? percent) (assoc :percent percent))})))
+                 (integer? percent) (assoc :percent percent))
+       :shadow (cond-> {}
+                 (contains? shadow :enabled?) (assoc :enabled? (boolean (:enabled? shadow)))
+                 (keyword? shadow-version) (assoc :version shadow-version)
+                 (integer? shadow-percent) (assoc :percent shadow-percent))})))
 
 (defn- trace-bucket
   [trace-id]
   (if (and (string? trace-id) (not (str/blank? trace-id)))
-    (mod (Math/abs (long (hash trace-id))) 100)
+    (mod (bit-and (int (hash trace-id)) 0x7fffffff) 100)
     0))
 
 (defn select-router-artifact
@@ -619,6 +635,60 @@
     {:router selected-router
      :artifact/version selected-version
      :artifact/source selected-source}))
+
+(defn select-router-shadow-artifact
+  "Selects optional shadow router artifact/version for side-by-side evaluation.
+
+  Output:
+  - `:router`: selected shadow router config map or nil,
+  - `:artifact/version`: selected version keyword or nil,
+  - `:artifact/source`: one of `:request`, `:shadow`, `:disabled`,
+  - `:shadow/enabled?`: shadow is enabled by config or explicit request override,
+  - `:shadow/applied?`: concrete shadow artifact was selected."
+  [router {:keys [trace-id requested-version]}]
+  (let [base-router (if (map? router) router {})
+        versions (normalize-version-catalog (:versions base-router))
+        rollout (normalize-rollout (:rollout base-router))
+        requested-version' (keywordish requested-version)
+        shadow-cfg (if (map? (:shadow rollout))
+                     (:shadow rollout)
+                     {})
+        shadow-enabled? (true? (:enabled? shadow-cfg))
+        shadow-version (keywordish (:version shadow-cfg))
+        shadow-percent (let [p (:percent shadow-cfg)]
+                         (if (and (integer? p) (<= 0 p 100))
+                           p
+                           0))
+        shadow-hit? (and shadow-enabled?
+                         (keyword? shadow-version)
+                         (contains? versions shadow-version)
+                         (> shadow-percent 0)
+                         (< (trace-bucket trace-id) shadow-percent))
+        [selected-version selected-source]
+        (cond
+          (and (keyword? requested-version')
+               (contains? versions requested-version'))
+          [requested-version' :request]
+
+          shadow-hit?
+          [shadow-version :shadow]
+
+          :else
+          [nil :disabled])
+        selected-patch (when (keyword? selected-version)
+                         (get versions selected-version))
+        selected-router (when (keyword? selected-version)
+                          (if (map? selected-patch)
+                            (-> (dissoc base-router :versions :rollout :artifact/version)
+                                (deep-merge selected-patch)
+                                (assoc :artifact/version selected-version))
+                            (-> (dissoc base-router :versions :rollout)
+                                (assoc :artifact/version selected-version))))]
+    {:router selected-router
+     :artifact/version selected-version
+     :artifact/source selected-source
+     :shadow/enabled? (or shadow-enabled? (keyword? requested-version'))
+     :shadow/applied? (keyword? selected-version)}))
 
 (defn default-model-key-by-intent
   "Returns default model selector key for capability intent from routing config."
