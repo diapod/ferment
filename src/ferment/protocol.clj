@@ -80,7 +80,7 @@
           shadow-percent (cond
                            (int? (:percent shadow)) (:percent shadow)
                            (integer? (:percent shadow)) (int (:percent shadow))
-                    :else nil)]
+                           :else nil)]
       (cond-> rollout
         (keyword? (keywordish (:active rollout)))
         (assoc :active (keywordish (:active rollout)))
@@ -99,7 +99,7 @@
                  (contains? shadow :enabled?) (update :enabled? boolean)
                  (keyword? (keywordish (:version shadow)))
                  (assoc :version (keywordish (:version shadow)))
-                 (int? shadow-percent) (assoc :percent (max 0 (min 100 shadow-percent))))))))))
+                 (int? shadow-percent) (assoc :percent (max 0 (min 100 shadow-percent)))))))))
 
 (defn- normalize-version-catalog
   [versions]
