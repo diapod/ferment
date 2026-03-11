@@ -53,6 +53,82 @@ Shape (EDN):
 kw ; for example :UTC
 ```
 
+### External Secrets ENV Overlay
+
+Purpose: provide secret values outside the repository while keeping config visibility through `#ref`.
+
+Load order for ENV values in `read-configs`:
+1. resource env files (`resources/config/**.env`),
+2. optional local env file passed as `local-file`,
+3. external secret env files from secrets directory (highest priority).
+
+Secrets directory resolution priority:
+1. `::ferment.system/config-sources/:secrets-dir`,
+2. JVM property `-Dferment.secrets.dir=...`,
+3. env var `FERMENT_SECRETS_DIR`,
+4. default `~/.ferment/secrets`.
+
+External files loaded from secrets dir:
+- `providers.env` first (if present),
+- then other `*.env` files in lexical filename order.
+
+Shape (EDN, internal `::config-sources` map):
+```edn
+{:local-file       string?
+ :resource-dirs    [string …]
+ :resource-files?  [string …]
+ :secrets-dir?     string
+ :secret-env-files? [string …]}
+```
+
+### Override-Sensitive Composite Branches
+
+Purpose: identify config branches where later overlays often provide partial deltas and therefore need explicit review after changing prod defaults.
+
+Practical rule:
+- treat these branches as `override-sensitive`;
+- when adding a new nested key in `prod`, review matching overlays in `dev`, `test-live`, and `local/*`;
+- prefer smoke tests that assert the merged profile still contains required sub-branches.
+- for collection-valued leaves under these branches, prefer metadata-driven merge semantics (`^:replace`, `^:prepend`, `^:displace`) instead of custom merge code.
+
+Highest-risk branches in current layout:
+- `:ferment.model.runtime/*/:invoke/http`
+- `:ferment.model.runtime/*/:command`
+- `:ferment.http/default/:training`
+- `:ferment.runtime/default/:queue`
+- `:ferment.runtime/default/:execution-graph`
+- `:ferment.runtime/default/:tenancy`
+- `:ferment.protocol/default/:intents`
+- `:ferment.protocol/default/:policy/default`
+- `:ferment.protocol/default/:policy/intents`
+- `:ferment.router/default/:defaults`
+
+Representative files to review together:
+- `resources/config/common/prod/models.edn`
+- `resources/config/local/prod/antrophic.edn`
+- `resources/config/common/prod/http.edn`
+- `resources/config/common/test-live/training.edn`
+- `resources/config/common/prod/runtime.edn`
+- `resources/config/common/dev/runtime.edn`
+- `resources/config/common/test-live/runtime.edn`
+- `resources/config/common/prod/protocol.edn`
+- `resources/config/common/dev/protocol.edn`
+- `resources/config/common/test-live/protocol.edn`
+- `resources/config/common/test-live/models.edn`
+- `resources/config/common/prod/router.edn`
+- `resources/config/common/dev/router.edn`
+- `resources/config/common/test-live/router.edn`
+
+Targeted deep-merge exceptions:
+- current project policy keeps default merge semantics unchanged;
+- for new config work, prefer explicit overlays plus regression tests over implicit deep-merge;
+- Ferment already gets recursive map merge through `maailma`/`meta-merge`; the common source of surprises is collection semantics, not map semantics;
+- consider a targeted deep-merge exception only when a branch is:
+  - structurally stable,
+  - operator-facing,
+  - repeatedly edited as partial deltas across profiles,
+  - and losing sibling keys would be surprising or dangerous.
+
 ## Runtime Core
 
 ### `:ferment.runtime/default`
@@ -249,7 +325,8 @@ Shape (EDN):
  :intents
  {kw {:in-schema        kw
       :out-schema       kw
-      :constraints      {:max-chars      int}
+      :constraints      {:max-chars      int
+                         :style/emoji?   (:reject|:strip)}
       :budget           {:max-tokens     int
                          :max-roundtrips int
                          :temperature    number}
@@ -282,6 +359,15 @@ Shape (EDN):
  :result/types        [kw …]
  :retry/max-attempts  int}
 ```
+
+Semantics:
+- `:policy/default/:checks`, `:checks/hard`, and `:checks/soft` are inherited by `:policy/intents` with set-union semantics.
+- The same protocol quality policy applies to workflow call nodes and direct `invoke-capability!` calls.
+- Direct invoke retries use intent policy checks; workflow-managed call nodes additionally honor per-node `:dispatch` overrides.
+- `:intents/:text/respond/:constraints/:style/emoji` controls remote voice output handling:
+  - `:reject` (default) keeps strict no-emoji enforcement.
+  - `:strip` removes emoji in parser output for `:llm/voice-remote` before quality evaluation.
+- Provider-derived failure types available for `:switch-on` include `:provider/max-tokens` and `:provider/context-window-exceeded`; `:provider/refusal` is classified but should normally remain terminal.
 
 ## Capabilities and Models
 
@@ -392,8 +478,16 @@ Shape (EDN):
  :command     [string|ref …]
  :invoke/http {:base-url     string|ref
                :endpoint     string|ref
+               :provider/id? kw
                :model        string|ref
                :headers?     {string string|ref …}
+               :headers/by-provider? {kw {string string|ref …} …}
+               :request-params? map
+               :request-params/by-provider? {kw map …}
+               :response-fields? {kw response-field-spec …}
+               :response-fields/by-provider? {kw {kw response-field-spec …} …}
+               :response-header-fields? {kw response-field-spec …}
+               :response-header-fields/by-provider? {kw {kw response-field-spec …} …}
                :timeout-ms?  ms
                :retries?     int
                :retry-ms?    ms
@@ -404,6 +498,39 @@ Shape (EDN):
                :endpoint string}
  :name        string}
 ```
+
+Provider notes for `:invoke/http/:provider/id`:
+- `:openai-compatible` (default): OpenAI-compatible chat/completions parsing.
+- `:anthropic-messages`: Anthropic Messages API request/response mapping.
+
+Header notes:
+- `:headers` are always applied.
+- `:headers/by-provider` applies only for active `:provider/id`.
+- blank values are ignored at request build time.
+
+Request params notes:
+- `:request-params` is an open pass-through map merged into provider request body.
+- `:request-params/by-provider` is merged first for active provider, then `:request-params` is merged on top (global override wins).
+- no whitelist is enforced (unknown keys are forwarded as-is).
+- map keys may be keywords or strings; request payload map keys are serialized to JSON string keys recursively.
+
+Response field notes:
+- `:response-fields/by-provider` is merged first for active provider, then `:response-fields` is merged on top (global override wins).
+- mapped fields are extracted from successful provider JSON responses and merged into runtime `:out`.
+- mapping values are open specs:
+  - path shorthand: `[:usage :input_tokens]`
+  - full spec: `{:path [...], :default any, :transform symbol-or-vector}`
+- `:transform` may be:
+  - `some.ns/fn` => called as `(some.ns/fn value)`
+  - `[some.ns/fn arg1 arg2 ...]` => called as `(some.ns/fn arg1 arg2 ... value)`
+- if `:path` is omitted in full spec, the whole provider response map is passed to `:transform`.
+- fields resolving to `nil` are omitted from runtime `:out`.
+
+Response header field notes:
+- `:response-header-fields/by-provider` is merged first for active provider, then `:response-header-fields` is merged on top.
+- header mappings use the same `response-field-spec` forms as response body mappings.
+- response headers are normalized to lowercase string keys before extraction.
+- provider rate-limit metadata should prefer normalized nested maps such as `:provider/rate-limit`.
 
 ### `:ferment.model/*`
 

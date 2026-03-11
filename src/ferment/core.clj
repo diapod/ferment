@@ -48,7 +48,13 @@
   (or (some-> (runtime-config runtime) :effects)
       {}))
 
-(declare input->prompt find-text llm-profile judge-score-from-output)
+(declare input->prompt
+         find-text
+         llm-profile
+         judge-score-from-output
+         direct-invoke-quality-check-fn
+         workflow-managed-truncation-check-fn
+         apply-provider-cooldown!)
 
 (defn- protocol-default
   [protocol k fallback]
@@ -319,11 +325,55 @@
 (def ^:private uncertain-answer-pattern
   #"(?i)\b(i don'?t know|not sure|uncertain|cannot determine|nie wiem|nie jestem pew|brak danych|trudno powiedzie[ćc])\b")
 
+(def ^:private markdown-heading-pattern
+  #"(?m)^\s{0,3}#{1,6}\s+")
+
+(def ^:private emoji-char-pattern
+  #"(?:[\x{1F1E6}-\x{1F1FF}]|[\x{1F300}-\x{1FAFF}]|[\x{2600}-\x{27BF}])")
+
+(defn- strip-emojis
+  [s]
+  (some-> (or s "")
+          (str/replace emoji-char-pattern "")))
+
+(defn- emoji-count
+  [s]
+  (count (re-seq emoji-char-pattern (str (or s "")))))
+
 (defn- sentence-count
   [s]
   (if (string? s)
     (count (re-seq #"[.!?…]+" s))
     0))
+
+(defn- result-text
+  [result]
+  (let [out (contracts/result-out-of result)]
+    (or (when (string? (:text out)) (:text out))
+        (when (string? (:content out)) (:content out))
+        (when (string? out) out)
+        "")))
+
+(defn- remote-voice-style-target?
+  [call-node]
+  (and (= :text/respond (keywordish (:intent call-node)))
+       (= :llm/voice-remote (keywordish (:cap/id call-node)))))
+
+(defn- remote-voice-style-request?
+  [request]
+  (and (= :text/respond (some-> request :task :intent keywordish))
+       (= :llm/voice-remote (some-> request :cap/id keywordish))))
+
+(defn- request-emoji-style
+  [request]
+  (or (some-> (get-in request [:constraints :style/emoji]) keywordish)
+      (some-> (get-in request [:constraints :emoji/style]) keywordish)
+      :reject))
+
+(defn- request-strip-emojis?
+  [request]
+  (and (remote-voice-style-request? request)
+       (= :strip (request-emoji-style request))))
 
 (defn- sufficient-detail?
   [call-node _env result]
@@ -331,11 +381,7 @@
     (if (not= :text/respond intent)
       true
       (let [prompt (some-> (get-in call-node [:input :prompt]) str str/trim)
-            out (contracts/result-out-of result)
-            text (or (when (string? (:text out)) (:text out))
-                     (when (string? (:content out)) (:content out))
-                     (when (string? out) out)
-                     "")
+            text (result-text result)
             text' (str/trim text)
             asks-example? (and (string? prompt)
                                (boolean (re-find prompt-needs-example-pattern prompt)))
@@ -359,11 +405,7 @@
   (let [intent (keywordish (:intent call-node))]
     (if (not (contains? #{:problem/solve :text/respond} intent))
       true
-      (let [out (contracts/result-out-of result)
-            text (or (when (string? (:text out)) (:text out))
-                     (when (string? (:content out)) (:content out))
-                     (when (string? out) out)
-                     "")
+      (let [text (result-text result)
             text' (str/trim text)
             concise-arithmetic? (and (= :text/respond intent)
                                      (or (boolean (re-matches concise-arithmetic-answer-pattern text'))
@@ -371,6 +413,20 @@
         (and (not (str/blank? text'))
              (or concise-arithmetic?
                  (boolean (re-matches sentence-end-pattern text'))))))))
+
+(defn- no-markdown-heading?
+  [call-node _env result]
+  (if-not (remote-voice-style-target? call-node)
+    true
+    (let [text (str/trim (result-text result))]
+      (not (boolean (re-find markdown-heading-pattern text))))))
+
+(defn- no-emoji?
+  [call-node _env result]
+  (if-not (remote-voice-style-target? call-node)
+    true
+    (let [text (result-text result)]
+      (not (boolean (re-find emoji-char-pattern text))))))
 
 (defn- schema-valid?
   [protocol call-node result]
@@ -387,7 +443,9 @@
    :fact-question-grounded fact-question-grounded?
    :no-list-expansion no-list-expansion?
    :sufficient-detail sufficient-detail?
-   :no-truncated-ending no-truncated-ending?})
+   :no-truncated-ending no-truncated-ending?
+   :no-markdown-heading no-markdown-heading?
+   :no-emoji no-emoji?})
 
 (def ^:private default-check-descriptors
   {:schema-valid :builtin/schema-valid
@@ -398,7 +456,9 @@
    :fact-question-grounded :builtin/fact-question-grounded
    :sufficient-detail :builtin/sufficient-detail
    :no-list-expansion :builtin/no-list-expansion
-   :no-truncated-ending :builtin/no-truncated-ending})
+   :no-truncated-ending :builtin/no-truncated-ending
+   :no-markdown-heading :builtin/no-markdown-heading
+   :no-emoji :builtin/no-emoji})
 
 (defn- resolve-check-descriptor
   [protocol descriptor]
@@ -416,6 +476,8 @@
     (= descriptor :builtin/sufficient-detail) sufficient-detail?
     (= descriptor :builtin/no-list-expansion) no-list-expansion?
     (= descriptor :builtin/no-truncated-ending) no-truncated-ending?
+    (= descriptor :builtin/no-markdown-heading) no-markdown-heading?
+    (= descriptor :builtin/no-emoji) no-emoji?
     (keyword? descriptor) (get builtin-check-fns descriptor)
     (ifn? descriptor) descriptor
     :else nil))
@@ -676,6 +738,25 @@
         (when (string? (:stdout result)) (:stdout result))
         (when (string? (:stderr result)) (:stderr result)))))
 
+(defn- provider-result-out
+  [raw]
+  (let [raw'            (if (and (map? raw)
+                                 (map? (:raw raw)))
+                          (:raw raw)
+                          raw)
+        invoke-response (when (map? raw') (:invoke-response raw'))
+        result         (when (map? invoke-response) (:result invoke-response))]
+    (if (map? result)
+      (reduce-kv (fn [acc k v]
+                   (if (and (keyword? k)
+                            (= "provider" (namespace k))
+                            (some? v))
+                     (assoc acc k v)
+                     acc))
+                 {}
+                 result)
+      {})))
+
 (defn- runtime-invoke-failure-details
   [runtime resolver cap-id intent model-k session-id invoke-response]
   (let [descriptor (model-adapter/transport-descriptor runtime resolver cap-id intent)
@@ -717,8 +798,8 @@
     {:response text
      :raw (assoc res :command cmd)}))
 
-(defn ollama-generate!
-  "Model generator (HF/MLX command backend, mock-aware)."
+(defn invoke-model-generate!
+  "Unified model generation invoke across mock, runtime-backed, and command-backed transports."
   [{:keys [runtime resolver cap-id intent model prompt system mode session-id
            max-tokens top-p timeout-ms]}]
   (if (= :mock mode)
@@ -953,7 +1034,7 @@
       (str/replace #"\n{3,}" "\n\n")
       str/trim))
 
-(defn- parse-model-text
+(defn- parse-model-text+meta
   [text request]
   (let [cleaned  (sanitize-model-text text)
         raw      (some-> text str str/trim not-empty)
@@ -981,17 +1062,30 @@
 
       :else
       cleaned)
+        strip-emojis? (request-strip-emojis? request)
+        stripped-count (if strip-emojis?
+                         (emoji-count text0)
+                         0)
+        text0 (if strip-emojis?
+                (strip-emojis text0)
+                text0)
         text1 (if (= :text/respond intent)
                 (normalize-list-format text0)
                 text0)
         max-chars (if (= :text/respond intent)
                     (or (request-max-chars request)
                         default-text-respond-max-chars)
-                    (request-max-chars request))]
-    (-> (if (= :text/respond intent)
-          (clamp-text-respond-max-chars text1 max-chars)
-          (clamp-max-chars text1 max-chars))
-        str/trim)))
+                    (request-max-chars request))
+        final-text (-> (if (= :text/respond intent)
+                         (clamp-text-respond-max-chars text1 max-chars)
+                         (clamp-max-chars text1 max-chars))
+                       str/trim)]
+    (cond-> {:text final-text}
+      (pos? stripped-count) (assoc :provider/emoji-stripped-count stripped-count))))
+
+(defn- parse-model-text
+  [text request]
+  (:text (parse-model-text+meta text request)))
 
 (defn- tool-call-output?
   [text]
@@ -1017,13 +1111,17 @@
         parsed-text (when (map? parsed-map)
                       (or (some-> (:text parsed-map) str)
                           (some-> (:content parsed-map) str)))
-        final-text (parse-model-text (or parsed-text text) request)]
+        parsed-final (parse-model-text+meta (or parsed-text text) request)
+        final-text (:text parsed-final)
+        emoji-stripped-count (:provider/emoji-stripped-count parsed-final)]
     (cond-> {:text final-text}
-      (keyword? status) (assoc :answer/status status))))
+      (keyword? status) (assoc :answer/status status)
+      (pos-int? emoji-stripped-count) (assoc :provider/emoji-stripped-count emoji-stripped-count))))
 
 (defn- default-result-parser
-  [text {:keys [request mode]}]
-  (let [out (parsed-text-out text request)]
+  [text {:keys [request mode raw]}]
+  (let [out (merge (provider-result-out raw)
+                   (parsed-text-out text request))]
     {:proto  1
      :trace  (:trace request)
      :result {:type  :value
@@ -1031,14 +1129,16 @@
               :usage {:mode mode}}}))
 
 (defn- default-stream-result-parser
-  [text {:keys [request mode]}]
-  (let [text' (parse-model-text text request)]
+  [text {:keys [request mode raw]}]
+  (let [text'  (parse-model-text text request)
+        extras (provider-result-out raw)]
     {:proto 1
      :trace (:trace request)
      :result {:type :stream
-              :stream [{:seq 0
-                        :event :delta
-                        :text text'}
+              :stream [(cond-> {:seq 0
+                                :event :delta
+                                :text text'}
+                         (seq extras) (merge extras))
                        {:seq 1
                         :event :done}]
               :usage {:mode mode}}}))
@@ -1111,6 +1211,112 @@
     (nil? input) ""
     :else (str input)))
 
+(def ^:private continuation-instruction-en
+  (str "Continue the previous answer from the exact cutoff point, in the same language. "
+       "Use plain prose only: no markdown headers, no lists, no tables. "
+       "Write at most 2 short sentences, avoid repetition, and finish with a period. "
+       "Return only the continuation text."))
+
+(defn- continuation-seed-text
+  [partial-text]
+  (let [s (some-> partial-text str sanitize-model-text str/trim not-empty)]
+    (when s
+      (subs s (max 0 (- (count s) 450))))))
+
+(defn- direct-continuation-prompt
+  [original-prompt partial-text]
+  (str continuation-instruction-en
+       "\n\nOriginal request:\n"
+       (or (some-> original-prompt str not-empty) "")
+       "\n\nLast partial fragment:\n"
+       (or (continuation-seed-text partial-text) "")))
+
+(defn- stitch-continuation-text
+  [partial-text continuation-text]
+  (let [head (or (some-> partial-text str not-empty) "")
+        tail (some-> continuation-text str sanitize-model-text str/trim not-empty)]
+    (cond
+      (str/blank? head) (or tail "")
+      (str/blank? tail) head
+      (or (str/ends-with? head "\n")
+          (str/starts-with? tail "\n")
+          (re-find #"(?:\s|\(|\[|\{)$" head)
+          (re-find #"^(?:[,.;:!?%]|\)|\]|\})" tail)
+          (re-find #"^(?:[-*#>]|\\d+[.)])" tail))
+      (str head tail)
+      :else
+      (str head " " tail))))
+
+(defn- merge-provider-usage
+  [left right]
+  (cond
+    (and (map? left) (map? right))
+    (merge-with merge-provider-usage left right)
+
+    (and (number? left) (number? right))
+    (+ left right)
+
+    (nil? right)
+    left
+
+    :else
+    right))
+
+(defn- merged-continuation-result
+  [previous-partial-text previous-generated next-generated]
+  (let [combined-text (stitch-continuation-text previous-partial-text
+                                                (:response next-generated))
+        previous-usage (get-in previous-generated [:raw :invoke-response :result :provider/usage])
+        next-usage (get-in next-generated [:raw :invoke-response :result :provider/usage])
+        combined-usage (merge-provider-usage previous-usage next-usage)]
+    (cond-> (assoc next-generated :response combined-text)
+      (map? combined-usage)
+      (assoc-in [:raw :invoke-response :result :provider/usage] combined-usage))))
+
+(defn- continuation-candidate-state
+  [request result check attempt max-attempts last-generated]
+  (let [intent (get-in request [:task :intent])
+        done-eval (:done/eval check)
+        must-failed (set (:must-failed done-eval))
+        partial-text (some-> (contracts/result-out-of result)
+                             :text
+                             sanitize-model-text
+                             str/trim
+                             not-empty)
+        generated-result (when (and (map? last-generated)
+                                    (= attempt (:attempt last-generated)))
+                           (:result last-generated))]
+    (when (and (= :text/respond intent)
+               (< attempt max-attempts)
+               (contains? must-failed :no-truncated-ending)
+               (string? partial-text)
+               (map? generated-result))
+      {:partial-text partial-text
+       :generated-result generated-result})))
+
+(defn- continuation-candidate-state-from-result
+  [request result attempt max-attempts last-generated]
+  (let [intent (get-in request [:task :intent])
+        call-node {:intent intent
+                   :input (:input request)}
+        truncated? (and (= :text/respond intent)
+                        (not (no-truncated-ending? call-node {} result)))
+        check (if truncated?
+                {:done/eval {:must-failed [:no-truncated-ending]}}
+                {:done/eval {:must-failed []}})]
+    (continuation-candidate-state request
+                                  result
+                                  check
+                                  attempt
+                                  max-attempts
+                                  last-generated)))
+
+(defn- text-tail-preview
+  [text]
+  (let [s (some-> text str sanitize-model-text str/trim not-empty)]
+    (when s
+      (subs s (max 0 (- (count s) 200))))))
+
 (defn invoke-capability!
   "Invokes a model capability under protocol contract.
 
@@ -1175,6 +1381,13 @@
         top-p' (or (parse-double-safe top-p)
                    (parse-double-safe (or (:top-p request-budget)
                                           (:top_p request-budget))))
+        effective-max-attempts (or max-attempts
+                                   (intent-retry-max-attempts protocol intent)
+                                   (protocol-default protocol :retry/max-attempts 3)
+                                   3)
+        last-generated (atom nil)
+        continuation-state (atom nil)
+        attempt-diagnostics (atom [])
         _ (append-session-turn-safe! session-service session-id
                                      {:turn/role :user
                                       :turn/text prompt'
@@ -1182,62 +1395,100 @@
                                       :turn/intent intent
                                       :turn/cap-id cap-id})
         invoke-fn (fn [request* attempt-no]
-                    (let [result (ollama-generate! {:model (or model model-id)
-                                                    :runtime runtime
-                                                    :resolver resolver'
-                                                    :cap-id cap-id
-                                                    :intent intent
-                                                    :system system'
-                                                    :prompt prompt'
-                                                    :session-id session-id
-                                                    :temperature temperature
-                                                    :max-tokens max-tokens'
-                                                    :top-p top-p'
-                                                    :timeout-ms timeout-ms
-                                                    :mode mode})
+                    (let [continuation? (and (> attempt-no 1)
+                                             (map? @continuation-state))
+                          prompt* (if continuation?
+                                    (direct-continuation-prompt prompt'
+                                                                (:partial-text @continuation-state))
+                                    prompt')
+                          result0 (invoke-model-generate! {:model (or model model-id)
+                                                           :runtime runtime
+                                                           :resolver resolver'
+                                                           :cap-id cap-id
+                                                           :intent intent
+                                                           :system system'
+                                                           :prompt prompt*
+                                                           :session-id session-id
+                                                           :temperature temperature
+                                                           :max-tokens max-tokens'
+                                                           :top-p top-p'
+                                                           :timeout-ms timeout-ms
+                                                           :mode mode})
+                          result (if continuation?
+                                   (merged-continuation-result (:partial-text @continuation-state)
+                                                               (:generated-result @continuation-state)
+                                   result0)
+                                   result0)
+                          _ (swap! attempt-diagnostics conj {:attempt attempt-no
+                                                             :continuation? continuation?})
+                          _ (reset! last-generated {:attempt attempt-no
+                                                    :result result0})
                           text (:response result)
-                          text' (if (string? text) text "")]
-                      (cond
-                        ;; route/decide parser may synthesize canonical plan from request prompt
-                        ;; even when model returned empty output.
-                        (= :route/decide intent)
-                        (parser
-                         text'
-                         {:request request*
-                          :mode mode
-                          :attempt attempt-no
-                          :cap/id cap-id
-                          :raw result})
+                          text' (if (string? text) text "")
+                          parsed-result
+                          (cond
+                            ;; route/decide parser may synthesize canonical plan from request prompt
+                            ;; even when model returned empty output.
+                            (= :route/decide intent)
+                            (parser
+                             text'
+                             {:request request*
+                              :mode mode
+                              :attempt attempt-no
+                              :cap/id cap-id
+                              :raw result})
 
-                        (and (not (str/blank? text'))
-                             (tool-call-output? text'))
-                        ;; Tool-calling syntax is not part of canonical non-route contract.
-                        ;; Return invalid value payload to trigger retry/fallback under contract flow.
-                        {:trace  (:trace request*)
-                         :result {:type :value}}
+                            (and (not (str/blank? text'))
+                                 (tool-call-output? text'))
+                            ;; Tool-calling syntax is not part of canonical non-route contract.
+                            ;; Return invalid value payload to trigger retry/fallback under contract flow.
+                            {:trace  (:trace request*)
+                             :result {:type :value}}
 
-                        (not (str/blank? text'))
-                        (parser
-                         text'
-                         {:request request*
-                          :mode mode
-                          :attempt attempt-no
-                          :cap/id cap-id
-                          :raw result})
+                            (not (str/blank? text'))
+                            (parser
+                             text'
+                             {:request request*
+                              :mode mode
+                              :attempt attempt-no
+                              :cap/id cap-id
+                              :raw result})
 
-                        :else
-                        ;; Missing :out makes the result invalid and triggers retry.
-                        {:trace  (:trace request*)
-                         :result {:type :value}})))
+                            :else
+                            ;; Missing :out makes the result invalid and triggers retry.
+                            {:trace  (:trace request*)
+                             :result {:type :value}})
+                          _ (reset! continuation-state
+                                    (continuation-candidate-state-from-result request*
+                                                                            parsed-result
+                                                                            attempt-no
+                                                                            effective-max-attempts
+                                                                            @last-generated))]
+                      parsed-result))
         run (contracts/invoke-with-contract invoke-fn request
-                                            {:max-attempts (or max-attempts
-                                                               (intent-retry-max-attempts protocol intent)
-                                                               (protocol-default protocol :retry/max-attempts 3)
-                                                               3)
+                                            {:max-attempts effective-max-attempts
+                                             :result-check-fn (if (:workflow/managed? opts)
+                                                                (workflow-managed-truncation-check-fn opts)
+                                                                (let [quality-check-fn (direct-invoke-quality-check-fn
+                                                                                        runtime
+                                                                                        resolver'
+                                                                                        opts
+                                                                                        protocol)]
+                                                                  (fn [request* result attempt]
+                                                                    (let [check (quality-check-fn request* result attempt)]
+                                                                      (reset! continuation-state
+                                                                              (continuation-candidate-state request*
+                                                                                                            result
+                                                                                                            check
+                                                                                                            attempt
+                                                                                                            effective-max-attempts
+                                                                                                            @last-generated))
+                                                                      check))))
                                              :protocol protocol})]
     (if (:ok? run)
       (let [result (cond-> (:result run)
                      (map? invocation-meta) (assoc :invoke/meta invocation-meta))]
+        (apply-provider-cooldown! resolver' model-k result)
         (append-session-turn-safe! session-service session-id
                                    {:turn/role :assistant
                                     :turn/text (session-turn-text
@@ -1264,7 +1515,25 @@
                                     :turn/cap-id cap-id
                                     :turn/error (:error run)
                                     :turn/retries (:attempts run)})
-        (throw (ex-info "LLM invocation failed after retries" run))))))
+        (let [last-result (:last-result run)
+              last-out (contracts/result-out-of last-result)
+              continuation-attempts (->> @attempt-diagnostics
+                                         (filter :continuation?)
+                                         (keep :attempt)
+                                         vec)]
+          (throw (ex-info "LLM invocation failed after retries"
+                          (cond-> run
+                            (seq continuation-attempts)
+                            (assoc :retry/continuation-used? true
+                                   :retry/continuation-attempts continuation-attempts)
+
+                            (some? (contracts/provider-stop-reason-of last-result))
+                            (assoc :provider/stop-reason-last
+                                   (contracts/provider-stop-reason-of last-result))
+
+                            (some? (text-tail-preview (:text last-out)))
+                            (assoc :last-text-preview
+                                   (text-tail-preview (:text last-out)))))))))))
 
 (defn- invoke-plan-call!
   [runtime resolver protocol]
@@ -1305,6 +1574,7 @@
                            :protocol protocol
                            :auth/user (:auth/user env)
                            :roles (:roles/config env)
+                           :workflow/managed? true
                            :resolver resolver}))))
 
 (defn- judge-score-from-output
@@ -1362,6 +1632,91 @@
                 (number? score) (assoc :score score)))
             (catch Throwable _
               nil)))))))
+
+(defn- provider-cooldown-seconds
+  [result]
+  (let [out (contracts/result-out-of result)
+        rate-limit (when (map? out) (:provider/rate-limit out))
+        retry-after (or (when (map? rate-limit) (:retry-after rate-limit))
+                        (when (map? out) (:provider/retry-after out)))]
+    (when (number? retry-after)
+      (max 0.0 (double retry-after)))))
+
+(defn- apply-provider-cooldown!
+  [resolver model-k result]
+  (let [registry (when (map? resolver) (:gateway/model-health resolver))
+        cooldown-s (provider-cooldown-seconds result)]
+    (when (and (instance? clojure.lang.IAtom registry)
+               (keyword? model-k)
+               (number? cooldown-s)
+               (pos? cooldown-s))
+      (let [open-until (+ (System/currentTimeMillis)
+                          (long (* 1000.0 cooldown-s)))]
+        (swap! registry
+               update model-k
+               (fn [entry]
+                 (let [entry' (if (map? entry) entry {})]
+                   (-> entry'
+                       (assoc :updated-at-ms (System/currentTimeMillis)
+                              :breaker/open-until-ms (max open-until
+                                                          (long (or (:breaker/open-until-ms entry') 0))))
+                       (update :breaker/open-count (fnil inc 0))
+                       (assoc-in [:provider/cooldown :retry-after-seconds] cooldown-s)))))))))
+
+(defn- direct-invoke-quality-check-fn
+  [runtime resolver parent-opts protocol]
+  (let [check-fns (runtime-check-fns runtime)
+        judge-fn  (runtime-judge-fn runtime resolver parent-opts protocol)]
+    (fn [request result _attempt]
+      (let [call-node {:op       :call
+                       :intent   (get-in request [:task :intent])
+                       :cap/id   (:cap/id request)
+                       :input    (:input request)
+                       :context  (:context request)
+                       :done     (:done request)
+                       :budget   (:budget request)
+                       :effects  (:effects request)
+                       :requires (get-in request [:task :requires])}
+            done-eval (workflow/evaluate-call-done resolver
+                                                   protocol
+                                                   call-node
+                                                   {}
+                                                   result
+                                                   check-fns
+                                                   judge-fn)
+            failure-type (or (contracts/provider-stop-failure-type result done-eval)
+                             (:failure/type done-eval))]
+        (if (and (:ok? done-eval)
+                 (nil? failure-type))
+          {:ok? true}
+          {:ok? false
+           :error :invalid-result-quality
+           :failure/type failure-type
+           :retryable? (not (contains? #{:provider/refusal
+                                         :provider/context-window-exceeded}
+                                       failure-type))
+           :done/eval done-eval})))))
+
+(defn- workflow-managed-truncation-check-fn
+  [parent-opts]
+  (fn [request result _attempt]
+    (let [intent (some-> request :task :intent keywordish)
+          enabled? (true? (:retry/allow-truncation-continuation? parent-opts))]
+      (if (and enabled?
+               (= :text/respond intent)
+               (not (no-truncated-ending? {:intent intent
+                                           :input (:input request)}
+                                          {}
+                                          result)))
+        {:ok? false
+         :error :invalid-result-quality
+         :failure/type :eval/must-failed
+         :retryable? true
+         :done/eval {:ok? false
+                     :failure/type :eval/must-failed
+                     :must-failed [:no-truncated-ending]
+                     :should-failed []}}
+        {:ok? true}))))
 
 (defn- emitted->out
   [emitted]

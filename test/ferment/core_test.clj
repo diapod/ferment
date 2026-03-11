@@ -21,7 +21,7 @@
 (deftest solver-retries-when-model-response-is-empty
   (testing "solver! retries when first model response cannot produce valid :value result."
     (let [calls (atom 0)]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [_]
                       (let [n (swap! calls inc)]
                         (if (= n 1)
@@ -33,7 +33,7 @@
 (deftest voice-fails-after-max-retries-when-model-keeps-returning-empty
   (testing "voice! fails with ex-info when all retries return invalid content."
     (let [calls (atom 0)]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [_]
                       (swap! calls inc)
                       {:response ""})]
@@ -45,7 +45,7 @@
 (deftest invoke-capability-rejects-tool-call-output-outside-route-decide
   (testing "tool_call style output is rejected for non-route intents and retried under contract."
     (let [calls (atom 0)]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [_]
                       (swap! calls inc)
                       {:response "<tool_call>{\"name\":\"solve_question\",\"arguments\":{\"question\":\"X\"}}</tool_call>"})]
@@ -65,7 +65,7 @@
   (testing "solver! accepts runtime config map and uses :ferment.model/solver."
     (let [called-with (atom nil)
           runtime {:models {:ferment.model/solver {:id "solver-selected"}}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [m]
                       (reset! called-with m)
                       {:response "{\"intent\":\"ok\"}"})]
@@ -76,7 +76,7 @@
   (testing "solver! does not use coding model when :ferment.model/solver is missing."
     (let [called-with (atom nil)
           runtime {:models {:ferment.model/coding {:id "coding-from-model-branch"}}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [m]
                       (reset! called-with m)
                       {:response "{\"intent\":\"ok\"}"})]
@@ -87,7 +87,7 @@
   (testing "coder! uses :ferment.model/coding selector for code capability."
     (let [called-with (atom nil)
           runtime {:models {:ferment.model/coding {:id "coding-selected"}}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [m]
                       (reset! called-with m)
                       {:response "{\"intent\":\"ok\"}"})]
@@ -107,7 +107,7 @@
                       (reset! called {:command command :opts opts})
                       {:exit 0 :out "OK" :err ""})]
         (is (= "OK"
-               (:response (core/ollama-generate!
+               (:response (core/invoke-model-generate!
                            {:runtime runtime
                             :cap-id :llm/code
                             :intent :code/patch
@@ -137,7 +137,7 @@
                       (throw (ex-info "one-shot path should not be called"
                                       {:error :unexpected-one-shot-path})))]
         (is (= "RUNTIME-OK"
-               (:response (core/ollama-generate!
+               (:response (core/invoke-model-generate!
                            {:runtime {:models {}}
                             :cap-id :llm/solver
                             :intent :problem/solve
@@ -168,7 +168,7 @@
                                :error :invoke-failed
                                :details {:error :invoke-http-failed}})]
                 (try
-                  (core/ollama-generate!
+                  (core/invoke-model-generate!
                    {:runtime runtime
                     :resolver (:resolver runtime)
                     :cap-id :llm/solver
@@ -184,10 +184,323 @@
       (is (= :invoke-http-failed (:transport/error err)))
       (is (= :remote-http (get-in err [:transport/descriptor :transport/type]))))))
 
+(deftest model-generate-classifies-remote-http-status-failures
+  (testing "HTTP status failures are classified as remote-status when worker preserves upstream ex-data."
+    (let [runtime {:resolver {:caps/by-id {:llm/solver {:cap/id :llm/solver
+                                                        :dispatch/model-key :ferment.model/solver
+                                                        :transport/type :remote-http}}}
+                   :models {:ferment.model/solver {:id "solver-selected"
+                                                   :runtime {:invoke/http {:url "https://api.example.test/v1/messages"}}}}}
+          err (with-redefs [model/invoke-model!
+                            (fn [_runtime _model-k _payload _opts]
+                              {:ok? false
+                               :error :invoke-failed
+                               :details {:error :invoke-http-status
+                                         :status 401
+                                         :url "https://api.example.test/v1/messages"
+                                         :body "{\"error\":\"unauthorized\"}"}})]
+                (try
+                  (core/invoke-model-generate!
+                   {:runtime runtime
+                    :resolver (:resolver runtime)
+                    :cap-id :llm/solver
+                    :intent :problem/solve
+                    :prompt "hej"
+                    :mode :live})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e
+                    (ex-data e))))]
+      (is (= :runtime-invoke-failed (:error err)))
+      (is (= :remote-http (:transport/class err)))
+      (is (= :remote-status (:transport/failure-class err)))
+      (is (= :invoke-http-status (:transport/error err)))
+      (is (= :remote-http (get-in err [:transport/descriptor :transport/type]))))))
+
+(deftest default-result-parser-preserves-provider-metadata-in-value-out
+  (testing "Default public result parser preserves provider metadata from runtime invoke payload."
+    (let [result (#'ferment.core/default-result-parser
+                  "ACID example"
+                  {:request {:task {:intent :text/respond}
+                             :trace {:id "t-1"}}
+                   :mode :live
+                   :raw {:invoke-response {:ok? true
+                                           :result {:text "ACID example"
+                                                    :provider/stop-reason "max_tokens"
+                                                    :provider/model "claude-opus-4-6"
+                                                    :provider/usage {:input_tokens 10
+                                                                     :output_tokens 20}}}}})]
+      (is (= "ACID example" (get-in result [:result :out :text])))
+      (is (= "max_tokens" (get-in result [:result :out :provider/stop-reason])))
+      (is (= "claude-opus-4-6" (get-in result [:result :out :provider/model])))
+      (is (= {:input_tokens 10
+              :output_tokens 20}
+             (get-in result [:result :out :provider/usage]))))))
+
+(deftest invoke-capability-preserves-provider-metadata-from-runtime-invoke
+  (testing "invoke-capability! preserves provider metadata from runtime invoke payload in public :result/:out."
+    (with-redefs [core/getenv
+                  (fn
+                    ([k]
+                     (when (= "FERMENT_LLM_MODE" k)
+                       "live"))
+                    ([k default]
+                     (if (= "FERMENT_LLM_MODE" k)
+                       "live"
+                       default)))
+                  model/invoke-model!
+                  (fn [_runtime _model-k _payload _opts]
+                    {:ok? true
+                     :result {:text "ACID example"
+                              :provider/stop-reason "max_tokens"
+                              :provider/model "claude-opus-4-6"
+                              :provider/usage {:input_tokens 10
+                                               :output_tokens 20}
+                              :provider/text-block-count 2}})]
+      (let [result (core/invoke-capability!
+                    {:resolver {:caps/by-id {:llm/voice-remote
+                                             {:cap/id :llm/voice-remote
+                                              :dispatch/model-key :ferment.model/voice-api}}}
+                     :models {:ferment.model/voice-api
+                              {:id "claude-opus-4-6"}}}
+                    {:role :voice
+                     :intent :text/respond
+                     :cap-id :llm/voice-remote
+                     :input {:prompt "Wyjaśnij krótko ACID i podaj 1 przykład."}
+                     :max-attempts 1})]
+        (is (= "ACID example" (get-in result [:result :out :text])))
+        (is (= "max_tokens" (get-in result [:result :out :provider/stop-reason])))
+        (is (= "claude-opus-4-6" (get-in result [:result :out :provider/model])))
+        (is (= {:input_tokens 10
+                :output_tokens 20}
+               (get-in result [:result :out :provider/usage])))
+        (is (= 2
+               (get-in result [:result :out :provider/text-block-count])))))))
+
+(deftest invoke-capability-retries-direct-text-response-on-truncated-ending
+  (testing "Direct invoke uses continuation prompt on the final retry when provider-backed text/respond ends mid-sentence."
+    (let [calls (atom [])
+          runtime {:protocol {:intents {:text/respond {:in-schema :req/text}}
+                              :result/types [:value]
+                              :policy/checks {:no-truncated-ending :builtin/no-truncated-ending}
+                              :policy/default {:done {:must #{:schema-valid}
+                                                       :score-min 1.0}}
+                              :policy/intents {:text/respond {:checks/hard [:no-truncated-ending]}}}}]
+      (with-redefs [core/invoke-model-generate!
+                    (fn [opts]
+                      (let [attempt (inc (count @calls))]
+                        (swap! calls conj opts)
+                        (if (= 1 attempt)
+                          {:response "**ACID** to cztery właściwości transakcji.\n\n**Przykład:"
+                           :raw {:invoke-response {:ok? true
+                                                   :result {:text "**ACID** to cztery właściwości transakcji.\n\n**Przykład:"
+                                                            :provider/stop-reason "end_turn"
+                                                            :provider/model "claude-opus-4-6"
+                                                            :provider/usage {:input_tokens 10
+                                                                             :output_tokens 20}}}}}
+                          {:response "Przelew bankowy: środki są albo przelane w całości, albo wcale."
+                           :raw {:invoke-response {:ok? true
+                                                   :result {:text "Przelew bankowy: środki są albo przelane w całości, albo wcale."
+                                                            :provider/stop-reason "end_turn"
+                                                            :provider/model "claude-opus-4-6"
+                                                            :provider/usage {:input_tokens 3
+                                                                             :output_tokens 9}}}}})))]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice-remote
+                       :input {:prompt "Wyjaśnij krótko ACID i podaj 1 przykład."}
+                       :max-attempts 2})]
+          (is (= 2 (count @calls)))
+          (is (= "Wyjaśnij krótko ACID i podaj 1 przykład."
+                 (:prompt (first @calls))))
+          (is (str/includes? (:prompt (second @calls))
+                             "Continue the previous answer from the exact cutoff point"))
+          (is (str/includes? (:prompt (second @calls))
+                             "in the same language"))
+          (is (str/includes? (:prompt (second @calls))
+                             "Use plain prose only: no markdown headers, no lists, no tables"))
+          (is (str/includes? (:prompt (second @calls))
+                             "Last partial fragment:\n**ACID** to cztery właściwości transakcji.\n\n**Przykład:"))
+          (is (= "**ACID** to cztery właściwości transakcji.\n\n**Przykład: Przelew bankowy: środki są albo przelane w całości, albo wcale."
+                 (get-in result [:result :out :text])))
+          (is (= "end_turn"
+                 (get-in result [:result :out :provider/stop-reason])))
+          (is (= "claude-opus-4-6"
+                 (get-in result [:result :out :provider/model])))
+          (is (= {:input_tokens 13
+                  :output_tokens 29}
+                 (get-in result [:result :out :provider/usage]))))))))
+
+(deftest invoke-capability-retries-workflow-managed-text-response-on-truncated-ending
+  (testing "Workflow-managed invoke also uses continuation prompt when text/respond ends mid-sentence."
+    (let [calls (atom [])
+          runtime {:protocol {:intents {:text/respond {:in-schema :req/text}}
+                              :result/types [:value]
+                              :policy/checks {:no-truncated-ending :builtin/no-truncated-ending}
+                              :policy/default {:done {:must #{:schema-valid}
+                                                       :score-min 1.0}}
+                              :policy/intents {:text/respond {:checks/hard [:no-truncated-ending]}}}}]
+      (with-redefs [core/invoke-model-generate!
+                    (fn [opts]
+                      (let [attempt (inc (count @calls))]
+                        (swap! calls conj opts)
+                        (if (= 1 attempt)
+                          {:response "ACID to cztery właściwości transakcji. Przykład:"
+                           :raw {:invoke-response {:ok? true
+                                                   :result {:text "ACID to cztery właściwości transakcji. Przykład:"}}}}
+                          {:response "przelew bankowy, gdzie operacja wykonuje się w całości albo wcale."
+                           :raw {:invoke-response {:ok? true
+                                                   :result {:text "przelew bankowy, gdzie operacja wykonuje się w całości albo wcale."}}}})))]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice
+                       :input {:prompt "Wyjaśnij krótko ACID i podaj 1 przykład."}
+                       :max-attempts 2
+                       :retry/allow-truncation-continuation? true
+                       :workflow/managed? true})]
+          (is (= 2 (count @calls)))
+          (is (= "Wyjaśnij krótko ACID i podaj 1 przykład."
+                 (:prompt (first @calls))))
+          (is (str/includes? (:prompt (second @calls))
+                             "Continue the previous answer from the exact cutoff point"))
+          (is (str/includes? (:prompt (second @calls))
+                             "in the same language"))
+          (is (= "ACID to cztery właściwości transakcji. Przykład: przelew bankowy, gdzie operacja wykonuje się w całości albo wcale."
+                 (get-in result [:result :out :text]))))))))
+
+(deftest invoke-capability-retries-remote-voice-on-emoji-and-markdown-heading
+  (testing "Remote voice retries when output contains emoji or markdown heading style artifacts."
+    (let [calls (atom [])
+          runtime {:protocol {:intents {:text/respond {:in-schema :req/text}}
+                              :result/types [:value]
+                              :policy/checks {:no-markdown-heading :builtin/no-markdown-heading
+                                              :no-emoji :builtin/no-emoji}
+                              :policy/default {:done {:must #{:schema-valid}
+                                                       :score-min 1.0}}
+                              :policy/intents {:text/respond {:checks/hard [:no-markdown-heading :no-emoji]}}}}]
+      (with-redefs [core/invoke-model-generate!
+                    (fn [opts]
+                      (let [attempt (inc (count @calls))]
+                        (swap! calls conj opts)
+                        (if (= 1 attempt)
+                          {:response "# ACID 🎉.\nTo zasady transakcji."
+                           :raw {:invoke-response {:ok? true
+                                                   :result {:text "# ACID 🎉.\nTo zasady transakcji."
+                                                            :provider/model "claude-opus-4-6"}}}}
+                          {:response "ACID to zasady niezawodnych transakcji w bazie danych."
+                           :raw {:invoke-response {:ok? true
+                                                   :result {:text "ACID to zasady niezawodnych transakcji w bazie danych."
+                                                            :provider/model "claude-opus-4-6"}}}})))]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice-remote
+                       :input {:prompt "Wyjaśnij krótko ACID."}
+                       :max-attempts 2})]
+          (is (= 2 (count @calls)))
+          (is (= "Wyjaśnij krótko ACID." (:prompt (first @calls))))
+          (is (= "Wyjaśnij krótko ACID." (:prompt (second @calls))))
+          (is (= "ACID to zasady niezawodnych transakcji w bazie danych."
+                 (get-in result [:result :out :text]))))))))
+
+(deftest invoke-capability-strips-emoji-for-remote-voice-when-configured
+  (testing "Remote voice strips emoji in final text when constraints request style/emoji :strip."
+    (let [calls (atom 0)
+          runtime {:protocol {:intents {:text/respond {:in-schema :req/text
+                                                       :constraints {:style/emoji :strip}}}
+                              :result/types [:value]
+                              :policy/checks {:no-emoji :builtin/no-emoji}
+                              :policy/default {:done {:must #{:schema-valid}
+                                                       :score-min 1.0}}
+                              :policy/intents {:text/respond {:checks/hard [:no-emoji]}}}}]
+      (with-redefs [core/invoke-model-generate!
+                    (fn [_opts]
+                      (swap! calls inc)
+                      {:response "ACID to zasady transakcji🎉."
+                       :raw {:invoke-response {:ok? true
+                                               :result {:text "ACID to zasady transakcji🎉."
+                                                        :provider/model "claude-opus-4-6"}}}})]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice-remote
+                       :input {:prompt "Wyjaśnij krótko ACID."}
+                       :max-attempts 2})]
+          (is (= 1 @calls))
+          (is (= "ACID to zasady transakcji."
+                 (get-in result [:result :out :text])))
+          (is (= 1
+                 (get-in result [:result :out :provider/emoji-stripped-count]))))))))
+
+(deftest invoke-capability-local-voice-is-not-gated-by-remote-style-checks
+  (testing "Remote style checks do not block local voice responses."
+    (let [calls (atom 0)
+          runtime {:protocol {:intents {:text/respond {:in-schema :req/text}}
+                              :result/types [:value]
+                              :policy/checks {:no-markdown-heading :builtin/no-markdown-heading
+                                              :no-emoji :builtin/no-emoji}
+                              :policy/default {:done {:must #{:schema-valid}
+                                                       :score-min 1.0}}
+                              :policy/intents {:text/respond {:checks/hard [:no-markdown-heading :no-emoji]}}}}]
+      (with-redefs [core/invoke-model-generate!
+                    (fn [_opts]
+                      (swap! calls inc)
+                      {:response "# ACID 🎉.\nTo zasady transakcji."
+                       :raw {:invoke-response {:ok? true
+                                               :result {:text "# ACID 🎉.\nTo zasady transakcji."
+                                                        :provider/model "bielik"}}}})]
+        (let [result (core/invoke-capability!
+                      runtime
+                      {:role :voice
+                       :intent :text/respond
+                       :cap-id :llm/voice
+                       :input {:prompt "Wyjaśnij krótko ACID."}
+                       :max-attempts 1})]
+          (is (= 1 @calls))
+          (is (= "# ACID 🎉.\nTo zasady transakcji."
+                 (get-in result [:result :out :text]))))))))
+
+(deftest invoke-capability-does-not-retry-direct-provider-refusal
+  (testing "Direct invoke fails fast on provider refusal instead of burning retries on the same capability."
+    (let [calls (atom 0)
+          runtime {:protocol {:intents {:text/respond {:in-schema :req/text}}
+                              :result/types [:value]
+                              :policy/default {:done {:must #{:schema-valid}
+                                                       :score-min 1.0}}}}]
+      (with-redefs [core/invoke-model-generate!
+                    (fn [_opts]
+                      (swap! calls inc)
+                      {:response "Nie mogę w tym pomóc."
+                       :raw {:invoke-response {:ok? true
+                                               :result {:text "Nie mogę w tym pomóc."
+                                                        :provider/stop-reason "refusal"
+                                                        :provider/model "claude-opus-4-6"}}}})]
+        (let [ex (try
+                   (core/invoke-capability!
+                    runtime
+                    {:role :voice
+                     :intent :text/respond
+                     :cap-id :llm/voice-remote
+                     :input {:prompt "Napisz exploit."}
+                     :max-attempts 3})
+                   nil
+                   (catch clojure.lang.ExceptionInfo e
+                     e))
+              data (ex-data ex)]
+          (is (= 1 @calls))
+          (is (instance? clojure.lang.ExceptionInfo ex))
+          (is (= :invalid-result-after-retries (:error data)))
+          (is (= :provider/refusal (get-in data [:last-check :failure/type]))))))))
+
 (deftest invoke-capability-forwards-budget-generation-overrides
   (testing "invoke-capability! forwards budget :max-tokens/:top-p and timeout into runtime invoke payload."
     (let [seen (atom nil)]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [opts]
                       (reset! seen opts)
                       {:response "OK"})]
@@ -224,7 +537,7 @@
                       (throw (ex-info "one-shot path should not be called"
                                       {:error :unexpected-one-shot-path})))]
         (is (= "RUNTIME-OK"
-               (:response (core/ollama-generate!
+               (:response (core/invoke-model-generate!
                            {:runtime runtime
                             :cap-id :llm/custom
                             :intent :problem/solve
@@ -275,7 +588,7 @@
 
 (deftest invoke-capability-can-return-plan-with-injected-slots
   (testing "invoke-capability! supports plan results with model-provided bindings (HOF-like plan output)."
-    (with-redefs [core/ollama-generate! (fn [_] {:response "ignored"})]
+    (with-redefs [core/invoke-model-generate! (fn [_] {:response "ignored"})]
       (let [result (core/invoke-capability!
                     nil
                     {:role :router
@@ -301,7 +614,7 @@
 
 (deftest invoke-capability-strips-think-blocks-from-model-output
   (testing "invoke-capability! removes `<think>...</think>` content before returning text."
-    (with-redefs [core/ollama-generate!
+    (with-redefs [core/invoke-model-generate!
                   (fn [_]
                     {:response "<think>internal reasoning</think>\n\nFerment is a multi-model orchestrator."})]
       (let [result (core/invoke-capability!
@@ -319,7 +632,7 @@
 
 (deftest invoke-capability-parses-answer-status-from-structured-text-output
   (testing "For text/respond, structured JSON output may carry :answer/status for protocol-aware fallback."
-    (with-redefs [core/ollama-generate!
+    (with-redefs [core/invoke-model-generate!
                   (fn [_]
                     {:response "{\"text\":\"Nie wiem na pewno.\",\"answer/status\":\"needs-solver\"}"})]
       (let [result (core/invoke-capability!
@@ -335,7 +648,7 @@
 
 (deftest invoke-capability-falls-back-to-think-body-for-non-voice-intents
   (testing "For non-user-facing intents, parser keeps non-empty text when output is think-only."
-    (with-redefs [core/ollama-generate!
+    (with-redefs [core/invoke-model-generate!
                   (fn [_]
                     {:response "<think>ACID to atomowość, spójność, izolacja, trwałość.</think>"})]
       (let [result (core/invoke-capability!
@@ -353,7 +666,7 @@
 
 (deftest invoke-capability-non-voice-does-not-leak-unclosed-think
   (testing "For non-user-facing intents, unclosed think-only output falls back to prompt instead of leaking think content."
-    (with-redefs [core/ollama-generate!
+    (with-redefs [core/invoke-model-generate!
                   (fn [_]
                     {:response "<think>internal reasoning without closing tag"})]
       (let [result (core/invoke-capability!
@@ -370,7 +683,7 @@
 
 (deftest invoke-capability-voice-falls-back-to-request-prompt-when-think-only
   (testing "For text/respond, think-only output falls back to request prompt instead of empty text."
-    (with-redefs [core/ollama-generate!
+    (with-redefs [core/invoke-model-generate!
                   (fn [_]
                     {:response "<think>internal notes only</think>"})]
       (let [result (core/invoke-capability!
@@ -387,7 +700,7 @@
 
 (deftest invoke-capability-text-respond-enforces-max-chars
   (testing "text/respond output is truncated to :constraints/:max-chars."
-    (with-redefs [core/ollama-generate!
+    (with-redefs [core/invoke-model-generate!
                   (fn [_]
                     {:response "abcdefghijklmnop"})]
       (let [result (core/invoke-capability!
@@ -405,7 +718,7 @@
 
 (deftest invoke-capability-text-respond-truncation-cuts-to-sentence-boundary
   (testing "text/respond truncation prefers the last completed sentence in max-chars window."
-    (with-redefs [core/ollama-generate!
+    (with-redefs [core/invoke-model-generate!
                   (fn [_]
                     {:response "First sentence. Second sentence without end"})]
       (let [result (core/invoke-capability!
@@ -428,7 +741,7 @@
                                                        :out-schema :res/text
                                                        :system "SYS/VOICE"}}
                               :result/types [:value]}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [params]
                       (reset! seen params)
                       {:response "ok"})]
@@ -452,7 +765,7 @@
                               :intents {:text/respond {:in-schema :req/text
                                                        :out-schema :res/text}}
                               :result/types [:value]}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [params]
                       (reset! seen params)
                       {:response "ok"})]
@@ -478,7 +791,7 @@
                                                        :out-schema :res/text
                                                        :system/addendum '("SYS/ADD" "END")}}
                               :result/types [:value]}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [params]
                       (reset! seen params)
                       {:response "ok"})]
@@ -504,7 +817,7 @@
                                                        :out-schema :res/text
                                                        :system "SYS/OVERRIDE"}}
                               :result/types [:value]}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [params]
                       (reset! seen params)
                       {:response "ok"})]
@@ -521,7 +834,7 @@
 
 (deftest call-capability-evaluates-plan-in-runtime
   (testing "call-capability! evaluates returned plan and normalizes final value output."
-    (with-redefs [core/ollama-generate!
+    (with-redefs [core/invoke-model-generate!
                   (fn [{:keys [model prompt]}]
                     (if (= "mock/meta" model)
                       {:response "PLAN"}
@@ -981,7 +1294,7 @@
                                      :top-p 0.9}
                     :result/types [:value]}
           runtime {:protocol protocol}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [opts]
                       (reset! seen-call opts)
                       {:response "ok"})
@@ -1075,7 +1388,7 @@
   (testing "invoke-capability! can return canonical :stream result when response mode requests streaming."
     (let [runtime {:protocol {:intents {:text/respond {:in-schema :req/text}}
                               :result/types [:value :stream]}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [_]
                       {:response "chunk-1"})]
         (let [result (core/invoke-capability!
@@ -1117,7 +1430,7 @@
                     (fn [invoke-fn request opts]
                       (reset! captured {:request request :opts opts})
                       (invoke-fn request 1))
-                    core/ollama-generate!
+                    core/invoke-model-generate!
                     (fn [_]
                       (swap! model-calls inc)
                       {:response "ok"})]
@@ -1141,7 +1454,7 @@
                (get-in @captured [:request :constraints])))
         (is (= 1 (get-in @captured [:opts :max-attempts])))
         (is (= 1 @model-calls)))
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [_]
                       (swap! model-calls inc)
                       {:response "should-not-run"})]
@@ -1173,7 +1486,7 @@
                                          :manager manager})
           seen-request (atom nil)
           seen-ollama (atom nil)]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [params]
                       (reset! seen-ollama params)
                       {:response "OK"})]

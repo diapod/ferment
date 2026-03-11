@@ -439,7 +439,21 @@
                    :participants/max 0
                    :context/default-lookups 0
                    :context/default-hits 0
-                   :context/default-misses 0}
+                   :context/default-misses 0
+                   :provider/requests 0
+                   :provider/rate-limit-requests 0
+                   :provider/input-tokens 0
+                   :provider/output-tokens 0
+                   :provider/cache-creation-input-tokens 0
+                   :provider/cache-read-input-tokens 0
+                   :provider/emoji-stripped-events 0
+                   :provider/emoji-stripped-total 0
+                   :provider/retry-after-events 0
+                   :provider/retry-after-seconds-total 0
+                   :provider/rate-limit-zero-remaining {:requests 0
+                                                        :tokens 0
+                                                        :input-tokens 0
+                                                        :output-tokens 0}}
    :tenancy {:requests 0
              :errors 0
              :rejected 0
@@ -468,12 +482,64 @@
                             distinct
                             vec)
                        [])
-        n (count participants)]
+        n (count participants)
+        out (when (map? body) (get-in body [:result :out]))
+        usage (when (map? out) (:provider/usage out))
+        rate-limit (when (map? out) (:provider/rate-limit out))
+        emoji-stripped-count (let [n (when (map? out)
+                                       (parse-non-negative-long (:provider/emoji-stripped-count out)))]
+                               (long (or n 0)))
+        provider? (or (map? usage) (map? rate-limit))
+        retry-after (when (map? rate-limit) (:retry-after rate-limit))
+        requests-remaining (when (map? rate-limit) (:requests-remaining rate-limit))
+        tokens-remaining (when (map? rate-limit) (:tokens-remaining rate-limit))
+        input-tokens-remaining (when (map? rate-limit) (:input-tokens-remaining rate-limit))
+        output-tokens-remaining (when (map? rate-limit) (:output-tokens-remaining rate-limit))]
     (cond-> {}
       (pos? n)
       (assoc :participants/requests 1
              :participants/total n
-             :participants/max n))))
+             :participants/max n)
+
+      provider?
+      (assoc :provider/requests 1)
+
+      (map? rate-limit)
+      (assoc :provider/rate-limit-requests 1)
+
+      (number? (:input_tokens usage))
+      (assoc :provider/input-tokens (long (:input_tokens usage)))
+
+      (number? (:output_tokens usage))
+      (assoc :provider/output-tokens (long (:output_tokens usage)))
+
+      (number? (:cache_creation_input_tokens usage))
+      (assoc :provider/cache-creation-input-tokens
+             (long (:cache_creation_input_tokens usage)))
+
+      (number? (:cache_read_input_tokens usage))
+      (assoc :provider/cache-read-input-tokens
+             (long (:cache_read_input_tokens usage)))
+
+      (pos? emoji-stripped-count)
+      (assoc :provider/emoji-stripped-events 1
+             :provider/emoji-stripped-total emoji-stripped-count)
+
+      (number? retry-after)
+      (assoc :provider/retry-after-events 1
+             :provider/retry-after-seconds-total (long retry-after))
+
+      (zero? (long (or requests-remaining 1)))
+      (assoc-in [:provider/rate-limit-zero-remaining :requests] 1)
+
+      (zero? (long (or tokens-remaining 1)))
+      (assoc-in [:provider/rate-limit-zero-remaining :tokens] 1)
+
+      (zero? (long (or input-tokens-remaining 1)))
+      (assoc-in [:provider/rate-limit-zero-remaining :input-tokens] 1)
+
+      (zero? (long (or output-tokens-remaining 1)))
+      (assoc-in [:provider/rate-limit-zero-remaining :output-tokens] 1))))
 
 (defn- transport-failure-metrics-from-response
   [body]
@@ -638,6 +704,19 @@
         context-hits (counter-value (:context/default-hits orchestration))
         context-misses (counter-value (:context/default-misses orchestration))
         context-principal-blocked (counter-value (:context/principal-isolation-blocked orchestration))
+        provider-requests (counter-value (:provider/requests orchestration))
+        rate-limit-requests (counter-value (:provider/rate-limit-requests orchestration))
+        provider-input-tokens (counter-value (:provider/input-tokens orchestration))
+        provider-output-tokens (counter-value (:provider/output-tokens orchestration))
+        provider-cache-creation-input-tokens (counter-value (:provider/cache-creation-input-tokens orchestration))
+        provider-cache-read-input-tokens (counter-value (:provider/cache-read-input-tokens orchestration))
+        provider-emoji-stripped-events (counter-value (:provider/emoji-stripped-events orchestration))
+        provider-emoji-stripped-total (counter-value (:provider/emoji-stripped-total orchestration))
+        provider-retry-after-events (counter-value (:provider/retry-after-events orchestration))
+        provider-retry-after-seconds-total (counter-value (:provider/retry-after-seconds-total orchestration))
+        provider-zero-remaining (if (map? (:provider/rate-limit-zero-remaining orchestration))
+                                  (:provider/rate-limit-zero-remaining orchestration)
+                                  {})
         route-total (counter-value (:route/decide-hit routing))
         continue' (counter-value (:route/decide-continue routing))
         final' (counter-value (:route/decide-final routing))
@@ -681,6 +760,24 @@
                            :lookups context-lookups
                            :hits context-hits
                            :misses context-misses}
+     :provider/usage
+     {:requests provider-requests
+      :input-tokens provider-input-tokens
+      :output-tokens provider-output-tokens
+      :cache-creation-input-tokens provider-cache-creation-input-tokens
+      :cache-read-input-tokens provider-cache-read-input-tokens
+      :emoji-stripped-events provider-emoji-stripped-events
+      :emoji-stripped-total provider-emoji-stripped-total
+      :avg-emoji-stripped (safe-rate provider-emoji-stripped-total provider-emoji-stripped-events)
+      :avg-input-tokens (safe-rate provider-input-tokens provider-requests)
+      :avg-output-tokens (safe-rate provider-output-tokens provider-requests)}
+     :provider/rate-limit
+     {:requests-with-headers rate-limit-requests
+      :retry-after-events provider-retry-after-events
+      :retry-after-seconds-total provider-retry-after-seconds-total
+      :avg-retry-after-seconds (safe-rate provider-retry-after-seconds-total
+                                          provider-retry-after-events)
+      :zero-remaining (normalize-counter-map provider-zero-remaining)}
      :transport/failure-trend
      {:value (safe-rate transport-failures total-requests)
       :failures transport-failures
@@ -791,18 +888,14 @@
   [resolver request]
   (let [intent       (some-> (get-in request [:task :intent]) keywordish)
         explicit-cap (request-explicit-cap-id request)
-        routed-cap   (some-> resolver :routing :intent->cap (get intent) keywordish)
-        node         (cond-> {:intent intent
-                              :requires (get-in request [:task :requires])
-                              :effects (:effects request)}
-                       (or (keyword? explicit-cap) (keyword? routed-cap))
-                       (assoc :dispatch {:candidates (cond-> []
-                                                       (keyword? explicit-cap) (conj explicit-cap)
-                                                       (keyword? routed-cap) (conj routed-cap))}))
-        decision0    (workflow/resolve-capability-decision resolver node)]
-    (cond-> decision0
-      (keyword? explicit-cap) (assoc :requested-cap/id explicit-cap)
-      (keyword? routed-cap) (assoc :routed-cap/id routed-cap))))
+        routed-cap   (some-> resolver :routing :intent->cap (get intent) keywordish)]
+    (workflow/resolve-request-capability-decision
+     resolver
+     {:intent intent
+      :explicit-cap explicit-cap
+      :routed-cap routed-cap
+      :requires (get-in request [:task :requires])
+      :effects (:effects request)})))
 
 (defn- runtime-protocol-config
   [runtime]
@@ -3530,6 +3623,23 @@
      :post-route-check post-route-check
      :route-telemetry route-telemetry}))
 
+(defn- provider-error-details
+  [invoke-response]
+  (let [details0   (when (map? invoke-response) (:details invoke-response))
+        status     (when (map? details0) (:status details0))
+        response0  (when (map? details0) (:response details0))
+        error0     (when (map? response0) (:error response0))
+        request-id (or (when (map? response0) (trim-s (:request_id response0)))
+                       (when (map? response0) (trim-s (:request-id response0))))
+        error-type (or (when (map? error0) (trim-s (:type error0)))
+                       (when (map? response0) (trim-s (:type response0))))
+        message    (when (map? error0) (trim-s (:message error0)))]
+    (cond-> {}
+      (integer? status) (assoc :provider/status status)
+      (some? request-id) (assoc :provider/request-id request-id)
+      (some? error-type) (assoc :provider/error-type error-type)
+      (some? message) (assoc :provider/message message))))
+
 (defn- invoke-act-capability-error-response
   [request* ^clojure.lang.ExceptionInfo e]
   (let [data   (or (ex-data e) {})
@@ -3548,7 +3658,12 @@
        :body   (error-envelope request*
                                :schema/invalid
                                (.getMessage e)
-                               (select-keys data [:attempts :last-check])
+                               (select-keys data [:attempts
+                                                  :last-check
+                                                  :retry/continuation-used?
+                                                  :retry/continuation-attempts
+                                                  :provider/stop-reason-last
+                                                  :last-text-preview])
                                true)}
 
       :auth/forbidden-effect
@@ -3613,6 +3728,7 @@
                                                :transport/failure-class
                                                :transport/error
                                                :transport/descriptor])
+                            (provider-error-details invoke-response)
                             (when (map? invoke-response)
                               (select-keys invoke-response [:error :message :details])))]
         {:status 502
@@ -3622,8 +3738,82 @@
                                  (when (seq details')
                                    details'))}))))
 
+(defn- resolver-cap-transport-type
+  [resolver cap-id]
+  (or (some-> (get-in resolver [:caps/by-id cap-id]) :transport/type keywordish)
+      (some-> (get-in resolver [:caps/by-id cap-id]) :transport :type keywordish)))
+
+(defn- runtime-invoke-provider-status-failure?
+  [data]
+  (and (map? data)
+       (= :remote-http (keywordish (:transport/class data)))
+       (= :remote-status (keywordish (:transport/failure-class data)))))
+
+(defn- runtime-invoke-truncated-quality-failure?
+  [data current-transport]
+  (let [must-failed (->> (get-in data [:last-check :done/eval :must-failed])
+                         (keep keywordish)
+                         set)]
+    (and (map? data)
+         (= :remote-http (keywordish current-transport))
+         (= :invalid-result-after-retries (keywordish (:error data)))
+         (= :eval/must-failed (keywordish (get-in data [:last-check :failure/type])))
+         (contains? must-failed :no-truncated-ending))))
+
+(defn- runtime-invoke-low-score-style-failure?
+  [data current-transport]
+  (let [should-failed (->> (get-in data [:last-check :done/eval :should-failed])
+                           (keep keywordish)
+                           set)]
+    (and (map? data)
+         (= :remote-http (keywordish current-transport))
+         (= :invalid-result-after-retries (keywordish (:error data)))
+         (= :eval/low-score (keywordish (get-in data [:last-check :failure/type])))
+         (contains? should-failed :no-list-expansion))))
+
+(defn- invoke-act-fallback-cap-ids
+  [resolver cap-decision request* current-cap-id]
+  (let [decision'          (if (map? cap-decision) cap-decision {})
+        routed-cap         (some-> decision' :routed-cap/id keywordish)
+        intent             (some-> request* :task :intent keywordish)
+        route-cap          (some-> resolver :routing :intent->cap (get intent) keywordish)
+        decision-caps      (->> (:candidates decision')
+                                (keep keywordish)
+                                vec)
+        routing-candidates (->> (get-in resolver [:routing :intent->candidates intent])
+                                (keep keywordish)
+                                vec)
+        ordered            (->> (concat (when (keyword? routed-cap) [routed-cap])
+                                        (when (keyword? route-cap) [route-cap])
+                                        decision-caps
+                                        routing-candidates)
+                                (remove #(= current-cap-id %))
+                                distinct
+                                vec)
+        local              (filter #(= :local-runtime
+                                       (resolver-cap-transport-type resolver %))
+                                   ordered)
+        remote             (remove #(= :local-runtime
+                                       (resolver-cap-transport-type resolver %))
+                                   ordered)]
+    (vec (concat local remote))))
+
+(defn- attach-fallback-diagnostics
+  [response from-cap-id reason attempted-cap-ids]
+  (if (map? response)
+    (update response :body
+            (fn [body]
+              (if (map? body)
+                (merge body
+                       {:routing/fallback/from-cap-id from-cap-id
+                        :routing/fallback/reason reason
+                        :routing/fallback/attempted-cap-ids (vec attempted-cap-ids)
+                        :routing/fallback/exhausted? true})
+                body)))
+    response))
+
 (defn- invoke-act-runtime-response
-  [runtime resolver request* cap-id]
+  [runtime resolver request* cap-id cap-decision]
   (try
     {:status 200
      :body   (core/call-capability
@@ -3631,7 +3821,77 @@
               resolver
               (act-request->invoke-opts runtime resolver request* cap-id))}
     (catch clojure.lang.ExceptionInfo e
-      (invoke-act-capability-error-response request* e))
+      (let [data (ex-data e)
+            current-transport (resolver-cap-transport-type resolver cap-id)
+            fallback-reason (cond
+                              (runtime-invoke-provider-status-failure? data)
+                              :provider-status
+
+                              (runtime-invoke-truncated-quality-failure? data current-transport)
+                              :quality-truncated-ending
+
+                              (runtime-invoke-low-score-style-failure? data current-transport)
+                              :quality-low-score
+
+                              :else nil)
+            fallback-cap-ids (when (keyword? fallback-reason)
+                               (invoke-act-fallback-cap-ids resolver cap-decision request* cap-id))]
+        (if (seq fallback-cap-ids)
+          (loop [remaining fallback-cap-ids
+                 attempted []
+                 last-ex nil]
+            (if-let [fallback-cap-id (first remaining)]
+              (let [attempt-result (try
+                                     {:ok? true
+                                      :response {:status 200
+                 :body   (core/call-capability
+                          runtime
+                          resolver
+                          (assoc (act-request->invoke-opts runtime resolver request* fallback-cap-id)
+                                 :retry/allow-truncation-continuation? true))
+                 :fallback/from-cap-id cap-id
+                 :fallback/to-cap-id fallback-cap-id
+                 :fallback/reason fallback-reason
+                                                 :fallback/attempted-cap-ids (conj attempted fallback-cap-id)
+                                                 :fallback/error (select-keys data [:transport/class
+                                                                                    :transport/failure-class
+                                                                                    :transport/error
+                                                                                    :error
+                                                                                    :provider/stop-reason-last
+                                                                                    :retry/continuation-used?
+                                                                                    :retry/continuation-attempts])}}
+                                     (catch clojure.lang.ExceptionInfo fallback-e
+                                       {:ok? false
+                                        :error fallback-e})
+                                     (catch Throwable fallback-t
+                                       {:ok? false
+                                        :error fallback-t}))]
+                (if (:ok? attempt-result)
+                  (:response attempt-result)
+                  (recur (next remaining)
+                         (conj attempted fallback-cap-id)
+                         (:error attempt-result))))
+              (cond
+                (instance? clojure.lang.ExceptionInfo last-ex)
+                (attach-fallback-diagnostics
+                 (invoke-act-capability-error-response request* last-ex)
+                 cap-id
+                 fallback-reason
+                 attempted)
+
+                (instance? Throwable last-ex)
+                (attach-fallback-diagnostics
+                 {:status 500
+                  :body   (error-envelope request*
+                                          :runtime/internal
+                                          (.getMessage ^Throwable last-ex))}
+                 cap-id
+                 fallback-reason
+                 attempted)
+
+                :else
+                (invoke-act-capability-error-response request* e))))
+          (invoke-act-capability-error-response request* e))))
     (catch Throwable t
       {:status 500
        :body   (error-envelope request*
@@ -3726,7 +3986,7 @@
                                                              (:cap/decision phase)))}
       (if (and cache-hit? (map? (:response cache-lookup)))
         (:response cache-lookup)
-        (invoke-act-runtime-response runtime resolver request* cap-id))))))
+        (invoke-act-runtime-response runtime resolver request* cap-id (:cap/decision phase)))))))
 
 (defn- invoke-act-execute-phase
   [runtime phase]
@@ -3915,6 +4175,17 @@
   (let [route-decide-latency-ms (:route-decide-latency-ms phase)
         route-phase-latency-ms (:route-phase-latency-ms phase)
         route-decider-latency-ms (:route-decider-latency-ms phase)
+        fallback-from-cap-id (some-> response :fallback/from-cap-id keywordish)
+        fallback-to-cap-id (some-> response :fallback/to-cap-id keywordish)
+        fallback-reason (some-> response :fallback/reason keywordish)
+        fallback-attempted-cap-ids (if (sequential? (:fallback/attempted-cap-ids response))
+                                     (->> (:fallback/attempted-cap-ids response)
+                                          (keep keywordish)
+                                          vec)
+                                     [])
+        fallback-exhausted? (true? (:fallback/exhausted? response))
+        fallback-error (when (map? (:fallback/error response))
+                         (:fallback/error response))
         routing-shadow-enabled? (true? (:routing/shadow-enabled? phase))
         routing-shadow-attempted? (true? (:routing/shadow-attempted? phase))
         routing-shadow-match? (:routing/shadow-match? phase)
@@ -3950,9 +4221,27 @@
                         (number? route-phase-latency-ms)
                         (assoc-in [:body :routing/route-phase-latency-ms]
                                   (double route-phase-latency-ms))
-                        (number? route-decider-latency-ms)
-                        (assoc-in [:body :routing/route-decider-latency-ms]
+                      (number? route-decider-latency-ms)
+                      (assoc-in [:body :routing/route-decider-latency-ms]
                                   (double route-decider-latency-ms))
+                        (keyword? fallback-from-cap-id)
+                        (assoc-in [:body :routing/fallback/from-cap-id]
+                                  fallback-from-cap-id)
+                        (keyword? fallback-to-cap-id)
+                        (assoc-in [:body :routing/fallback/to-cap-id]
+                                  fallback-to-cap-id)
+                        (keyword? fallback-reason)
+                        (assoc-in [:body :routing/fallback/reason]
+                                  fallback-reason)
+                        (seq fallback-attempted-cap-ids)
+                        (assoc-in [:body :routing/fallback/attempted-cap-ids]
+                                  fallback-attempted-cap-ids)
+                        fallback-exhausted?
+                        (assoc-in [:body :routing/fallback/exhausted?]
+                                  true)
+                        (map? fallback-error)
+                        (assoc-in [:body :routing/fallback/error]
+                                  fallback-error)
                         (keyword? protocol-artifact-version)
                         (assoc-in [:body :protocol/artifact-version]
                                   protocol-artifact-version)

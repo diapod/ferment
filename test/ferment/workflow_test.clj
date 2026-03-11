@@ -509,6 +509,67 @@
       (is (= [:llm/voice-remote :llm/voice-local] (:candidates decision)))
       (is (empty? (:rejected-candidates decision))))))
 
+(deftest resolve-request-capability-decision-prefers-valid-explicit-capability
+  (testing "Request-level explicit capability remains the first choice when it satisfies the contract, even if gateway ordering would pick another candidate."
+    (let [resolver {:routing {:intent->cap {:text/respond :llm/voice}
+                              :gateway {:strategy :latency-first}}
+                    :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                             :cap/intents #{:text/respond}
+                                             :cap/can-produce #{:value}
+                                             :cap/effects-allowed #{:none}
+                                             :transport/type :local-runtime
+                                             :cap/cost {:latency-ms 300}}
+                                 :llm/voice-remote {:cap/id :llm/voice-remote
+                                                    :cap/intents #{:text/respond}
+                                                    :cap/can-produce #{:value}
+                                                    :cap/effects-allowed #{:none}
+                                                    :transport/type :remote-http
+                                                    :cap/cost {:latency-ms 900}}}}
+          decision (workflow/resolve-request-capability-decision
+                    resolver
+                    {:intent :text/respond
+                     :explicit-cap :llm/voice-remote
+                     :routed-cap :llm/voice})]
+      (is (= :llm/voice-remote (:cap/id decision)))
+      (is (= [:llm/voice-remote] (:candidates decision)))
+      (is (= :llm/voice-remote (:requested-cap/id decision)))
+      (is (= :llm/voice (:routed-cap/id decision)))
+      (is (empty? (:rejected-candidates decision))))))
+
+(deftest resolve-request-capability-decision-keeps-explicit-capability-ahead-of-fallbacks
+  (testing "Explicit capability stays first even when gateway ordering and fallback candidates would otherwise move it behind local runtimes."
+    (let [resolver {:routing {:intent->cap {:text/respond :llm/voice}
+                              :fallback [:llm/solver-text]
+                              :gateway {:strategy :latency-first}}
+                    :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                             :cap/intents #{:text/respond}
+                                             :cap/can-produce #{:value}
+                                             :cap/effects-allowed #{:none}
+                                             :transport/type :local-runtime
+                                             :cap/cost {:latency-ms 300}}
+                                 :llm/solver-text {:cap/id :llm/solver-text
+                                                   :cap/intents #{:text/respond}
+                                                   :cap/can-produce #{:value}
+                                                   :cap/effects-allowed #{:none}
+                                                   :transport/type :local-runtime
+                                                   :cap/cost {:latency-ms 450}}
+                                 :llm/voice-remote {:cap/id :llm/voice-remote
+                                                    :cap/intents #{:text/respond}
+                                                    :cap/can-produce #{:value}
+                                                    :cap/effects-allowed #{:none}
+                                                    :transport/type :remote-http
+                                                    :cap/cost {:latency-ms 900}}}}
+          decision (workflow/resolve-request-capability-decision
+                    resolver
+                    {:intent :text/respond
+                     :explicit-cap :llm/voice-remote
+                     :routed-cap :llm/voice})]
+      (is (= :llm/voice-remote (:cap/id decision)))
+      (is (= [:llm/voice-remote :llm/solver-text] (:candidates decision)))
+      (is (= :llm/voice-remote (:requested-cap/id decision)))
+      (is (= :llm/voice (:routed-cap/id decision)))
+      (is (empty? (:rejected-candidates decision))))))
+
 (deftest resolve-capability-decision-quarantines-open-circuit-candidate
   (testing "Gateway breaker filters out candidates in open-circuit state when alternatives exist."
     (let [future-ms (+ (System/currentTimeMillis) 60000)

@@ -11,6 +11,7 @@
 
   (:require [clojure.edn                     :as             edn]
             [clojure.java.io                 :as              io]
+            [clojure.string                  :as             str]
             [clojure.test                    :refer [deftest
                                                      is
                                                      testing]]
@@ -39,6 +40,11 @@
   [path]
   (edn/read-string {:readers {'ref identity 'refset identity}}
                    (slurp path)))
+
+(defn- assert-config-branch-contains
+  [cfg path]
+  (is (some? (get-in cfg path))
+      (str "Expected merged config to preserve " path)))
 
 (defn- free-port
   []
@@ -1564,7 +1570,7 @@
   (testing "Core service init returns functions operating on runtime from config."
     (let [called-with (atom nil)
           runtime {:models {:ferment.model/solver {:id "solver-mini"}}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [m]
                       (reset! called-with m)
                       {:response "{\"intent\":\"ok\"}"})]
@@ -1597,6 +1603,42 @@
       (is (contains? cfg :ferment.logging/unilog))
       (is (= :dev (get-in cfg [:ferment.app/properties :profile]))))))
 
+(deftest dev-config-preserves-critical-composite-branches
+  (testing "Dev overlay keeps prod router/protocol/runtime sub-branches that are not restated locally."
+    (let [cfg (system/read-configs nil
+                                   "config/common/prod"
+                                   "config/local/prod"
+                                   "config/common/dev"
+                                   "config/local/dev")]
+      (is (= true (get-in cfg [:ferment.protocol/default :policy/default :judge :enabled?])))
+      (assert-config-branch-contains cfg [:ferment.protocol/default :prompts :roles :voice])
+      (assert-config-branch-contains cfg [:ferment.protocol/default :intents :code/patch :system])
+      (assert-config-branch-contains cfg [:ferment.router/default :profiles :mixed-transport])
+      (assert-config-branch-contains cfg [:ferment.router/default :policy-profiles :balanced :limits])
+      (is (= true (get-in cfg [:ferment.router/default :defaults :meta?])))
+      (is (= true (get-in cfg [:ferment.router/default :defaults :strict?])))
+      (assert-config-branch-contains cfg [:ferment.runtime/default :queue :classes])
+      (assert-config-branch-contains cfg [:ferment.runtime/default :queue :default-class])
+      (assert-config-branch-contains cfg [:ferment.runtime/default :effects :process/run :allow-commands]))))
+
+(deftest dev-config-replaces-policy-collections-instead-of-appending
+  (testing "Dev protocol overlay replaces collection leaves under :policy/*."
+    (let [cfg (system/read-configs nil
+                                   "config/common/prod"
+                                   "config/local/prod"
+                                   "config/common/dev"
+                                   "config/local/dev")]
+      (is (= [:schema-valid :no-truncated-ending]
+             (get-in cfg [:ferment.protocol/default :policy/intents :text/respond :checks/hard])))
+      (is (= [:no-hallucinated-apis :no-list-expansion]
+             (get-in cfg [:ferment.protocol/default :policy/intents :text/respond :checks/soft])))
+      (is (= []
+             (get-in cfg [:ferment.protocol/default :policy/intents :route/decide :checks/soft])))
+      (is (= [:interactive :batch]
+             (get-in cfg [:ferment.runtime/default :queue :classes])))
+      (is (= [:interactive :batch]
+             (get-in cfg [:ferment.runtime/default :queue :priority-order]))))))
+
 (deftest test-config-overlays-prod-config
   (testing "Test config loads prod and overrides profile and database name."
     (let [cfg (system/read-configs nil
@@ -1609,6 +1651,35 @@
       (is (= "ferment_test" (:ferment.env/db.main.name cfg)))
       (is (= "mock" (:ferment.env/ferment.llm.mode cfg)))
       (is (false? (get-in cfg [:ferment.model.defaults/runtime :enabled?]))))))
+
+(deftest read-configs-loads-external-secrets-env-overlay
+  (testing "read-configs loads ~/.ferment/secrets-style ENV overlays after resource/local envs."
+    (let [tmp-dir-path (java.nio.file.Files/createTempDirectory
+                        "ferment-secrets-"
+                        (make-array java.nio.file.attribute.FileAttribute 0))
+          ^java.io.File tmp-dir (.toFile tmp-dir-path)
+          providers-env (io/file tmp-dir "providers.env")
+          extra-env (io/file tmp-dir "z-provider-extra.env")]
+      (spit providers-env (str "DB_MAIN_NAME=ferment_secret_db\n"
+                               "FERMENT_MODEL_VOICE_REMOTE_BASE_URL=https://secret-provider.local\n"))
+      (spit extra-env "FERMENT_MODEL_VOICE_REMOTE_ENDPOINT=/v1/messages\n")
+      (try
+        (let [cfg (system/read-configs
+                   {::system/config-sources
+                    {:local-file nil
+                     :resource-dirs ["config/common/prod"
+                                     "config/local/prod"
+                                     "config/common/test"
+                                     "config/local/test"]
+                     :secrets-dir (.getPath tmp-dir)}})]
+          (is (= "ferment_secret_db" (:ferment.env/db.main.name cfg)))
+          (is (= "https://secret-provider.local"
+                 (:ferment.env/ferment.model.voice.remote.base.url cfg)))
+          (is (= "/v1/messages"
+                 (:ferment.env/ferment.model.voice.remote.endpoint cfg))))
+        (finally
+          (doseq [f (reverse (file-seq tmp-dir))]
+            (io/delete-file f true)))))))
 
 (deftest test-live-config-uses-shared-meta-runtime-plus-bielik-voice
   (testing "Test-live config keeps shared meta runtime and separate Bielik voice runtime."
@@ -1631,6 +1702,67 @@
              (:key (get-in cfg [:ferment.model/coding :runtime]))))
       (is (= "speakleash/Bielik-1.5B-v3.0-Instruct-MLX-8bit"
              (get-in cfg [:ferment.model.id/voice :id/default]))))))
+
+(deftest test-live-config-preserves-critical-composite-branches
+  (testing "Test-live overlays keep required prod sub-branches under protocol, runtime, http, and model runtime."
+    (let [cfg (system/read-configs nil
+                                   "config/common/prod"
+                                   "config/local/prod"
+                                   "config/common/test-live"
+                                   "config/local/test-live")]
+      (assert-config-branch-contains cfg [:ferment.protocol/default :prompts :roles :voice])
+      (assert-config-branch-contains cfg [:ferment.protocol/default :policy/default :switch-on])
+      (is (= 220 (get-in cfg [:ferment.protocol/default :intents :text/respond :budget :max-tokens])))
+      (assert-config-branch-contains cfg [:ferment.runtime/default :queue :classes])
+      (assert-config-branch-contains cfg [:ferment.runtime/default :queue :default-class])
+      (assert-config-branch-contains cfg [:ferment.runtime/default :execution-graph :store/type])
+      (assert-config-branch-contains cfg [:ferment.http/default :auth :session-principal :operations])
+      (is (= true (get-in cfg [:ferment.http/default :training :enabled?])))
+      (assert-config-branch-contains cfg [:ferment.model.runtime/voice-api :invoke/http :headers/by-provider :anthropic-messages])
+      (assert-config-branch-contains cfg [:ferment.model.runtime/voice-api :invoke/http :response-fields/by-provider :anthropic-messages :provider/stop-reason])
+      (assert-config-branch-contains cfg [:ferment.model.runtime/voice-api :invoke/http :request-params/by-provider :anthropic-messages]))))
+
+(deftest test-live-config-replaces-training-and-policy-collections
+  (testing "Test-live overlays replace collection leaves under training and protocol policy instead of appending."
+    (let [cfg (system/read-configs nil
+                                   "config/common/prod"
+                                   "config/local/prod"
+                                   "config/common/test-live"
+                                   "config/local/test-live")]
+      (is (= [:schema-valid :no-truncated-ending :answer-known]
+             (get-in cfg [:ferment.protocol/default :policy/intents :text/respond :checks/hard])))
+      (is (= [:no-hallucinated-apis]
+             (get-in cfg [:ferment.protocol/default :policy/intents :text/respond :checks/soft])))
+      (is (= [:text/respond :code/patch]
+             (get-in cfg [:ferment.http/default :training :transcript/intents])))
+      (is (= [:no-internal-markers :non-empty-output-text :accepted-consistent]
+             (get-in cfg [:ferment.http/default :training :judge :rules])))
+      (is (= [:protocol-conformance :constitution-compliance :regression]
+             (get-in cfg [:ferment.http/default :training :eval :suites])))
+      (is (= [:protocol-conformance :constitution-compliance :regression]
+             (get-in cfg [:ferment.http/default :training :promotion :required-suites]))))))
+
+(deftest test-live-config-replaces-runtime-command-vectors
+  (testing "Test-live model runtime command vectors replace prod commands instead of appending."
+      (let [cfg (system/read-configs nil
+                                   "config/common/prod"
+                                   "config/local/prod"
+                                   "config/common/test-live"
+                                   "config/local/test-live")
+          voice-command (get-in cfg [:ferment.model.runtime/voice :command])
+          meta-command  (get-in cfg [:ferment.model.runtime/meta :command])]
+      (is (= 7 (count voice-command)))
+      (is (= ["--host" "--port" "--model"]
+             (->> voice-command
+                  (filter string?)
+                  (filter #(str/starts-with? % "--"))
+                  vec)))
+      (is (= 17 (count meta-command)))
+      (is (= ["--host" "--port" "--model" "--temp" "--top-p" "--top-k" "--min-p" "--chat-template-args"]
+             (->> meta-command
+                  (filter string?)
+                  (filter #(str/starts-with? % "--"))
+                  vec))))))
 
 (deftest dev-overlay-order-beats-local-prod
   (testing "Overlay order guarantees dev overrides prod (including local)."
@@ -1791,6 +1923,10 @@
                                                      :content "meta-http-live-ok"}}]})
                  response-bytes (.getBytes response-str "UTF-8")]
              (.set (.getResponseHeaders exchange) "Content-Type" "application/json")
+             (.set (.getResponseHeaders exchange) "Retry-After" "7")
+             (.set (.getResponseHeaders exchange) "anthropic-ratelimit-requests-limit" "100")
+             (.set (.getResponseHeaders exchange) "anthropic-ratelimit-requests-remaining" "0")
+             (.set (.getResponseHeaders exchange) "anthropic-ratelimit-tokens-remaining" "42")
              (.sendResponseHeaders exchange 200 (long (alength response-bytes)))
              (with-open [out (.getResponseBody exchange)]
                (.write out response-bytes))))))
@@ -1812,6 +1948,253 @@
           (is (= 0.66 (:top_p @request-body))))
         (finally
           (.stop server 0))))))
+
+(deftest model-runtime-http-invoke-supports-anthropic-provider-module
+  (testing "invoke-runtime-http! supports :anthropic-messages provider with request/response mapping."
+    (let [port (free-port)
+          request-body (atom nil)
+          server (com.sun.net.httpserver.HttpServer/create
+                  (java.net.InetSocketAddress. "127.0.0.1" (int port))
+                  0)]
+      (.createContext
+       server
+       "/v1/messages"
+       (reify com.sun.net.httpserver.HttpHandler
+         (handle [_ exchange]
+           (let [body-str (slurp (.getRequestBody exchange) :encoding "UTF-8")
+                 body-map (json/parse-string body-str true)
+                 _ (reset! request-body body-map)
+                 response-str (json/generate-string
+                               {:id "msg_1"
+                                :type "message"
+                                :role "assistant"
+                                :content [{:type "text"
+                                           :text "anthropic-ok"}]})
+                 response-bytes (.getBytes response-str "UTF-8")]
+             (.set (.getResponseHeaders exchange) "Content-Type" "application/json")
+             (.sendResponseHeaders exchange 200 (long (alength response-bytes)))
+             (with-open [out (.getResponseBody exchange)]
+               (.write out response-bytes))))))
+      (.setExecutor server nil)
+      (.start server)
+      (try
+        (let [result (model/invoke-runtime-http!
+                      {:prompt "Wyjaśnij ACID krótko."
+                       :system "Użyj jednego przykładu."
+                       :max-tokens 123
+                       :top-p 0.7}
+                      nil
+                      {:invoke/http {:url (str "http://127.0.0.1:" port "/v1/messages")
+                                     :provider/id :anthropic-messages
+                                     :model "claude-sonnet"
+                                     :request-params/by-provider {:anthropic-messages {:model "claude-haiku-3-0"
+                                                                                         :max_tokens 256
+                                                                                         :metadata {:tenant_id "provider-default"}
+                                                                                         :x_provider_only "provider-default"}}
+                                     :request-params {:model "claude-opus-4-6"
+                                                      :max_tokens 1024
+                                                      :messages [{:role "user"
+                                                                  :content "Cześć, Claude!"}]
+                                                      :metadata {:tenant_id "demo-1"}
+                                                      :x_custom "pass-through"}}})]
+          (is (= "anthropic-ok" (:text result)))
+          (is (= "claude-opus-4-6" (:model @request-body)))
+          (is (= 1024 (:max_tokens @request-body)))
+          (is (= "Użyj jednego przykładu." (:system @request-body)))
+          (is (= "Cześć, Claude!"
+                 (get-in @request-body [:messages 0 :content])))
+          (is (= "demo-1" (get-in @request-body [:metadata :tenant_id])))
+          (is (= "pass-through" (:x_custom @request-body)))
+          (is (= "provider-default" (:x_provider_only @request-body))))
+        (finally
+          (.stop server 0))))))
+
+(deftest model-runtime-http-invoke-concatenates-anthropic-text-blocks
+  (testing "Anthropic provider joins all text content blocks instead of taking only the first one."
+    (let [port (free-port)
+          server (com.sun.net.httpserver.HttpServer/create
+                  (java.net.InetSocketAddress. "127.0.0.1" (int port))
+                  0)]
+      (.createContext
+       server
+       "/v1/messages"
+       (reify com.sun.net.httpserver.HttpHandler
+         (handle [_ exchange]
+           (let [response-str (json/generate-string
+                               {:id "msg_2"
+                                :type "message"
+                                :role "assistant"
+                                :content [{:type "text"
+                                           :text "blok-1"}
+                                          {:type "text"
+                                           :text "blok-2"}
+                                          {:type "tool_use"
+                                           :name "ignored"}]})
+                 response-bytes (.getBytes response-str "UTF-8")]
+             (.set (.getResponseHeaders exchange) "Content-Type" "application/json")
+             (.sendResponseHeaders exchange 200 (long (alength response-bytes)))
+             (with-open [out (.getResponseBody exchange)]
+               (.write out response-bytes))))))
+      (.setExecutor server nil)
+      (.start server)
+      (try
+        (let [result (model/invoke-runtime-http!
+                      {:prompt "hej"}
+                      nil
+                      {:invoke/http {:url (str "http://127.0.0.1:" port "/v1/messages")
+                                     :provider/id :anthropic-messages
+                                     :request-params {:model "claude-opus-4-6"
+                                                      :max_tokens 64}}})]
+          (is (= "blok-1\n\nblok-2" (:text result))))
+        (finally
+          (.stop server 0))))))
+
+(deftest model-runtime-http-invoke-extracts-configured-response-fields
+  (testing "HTTP invoke may extract provider response metadata using data-first response field mapping."
+    (let [port (free-port)
+          server (com.sun.net.httpserver.HttpServer/create
+                  (java.net.InetSocketAddress. "127.0.0.1" (int port))
+                  0)]
+      (.createContext
+       server
+       "/v1/messages"
+       (reify com.sun.net.httpserver.HttpHandler
+         (handle [_ exchange]
+           (let [response-str (json/generate-string
+                               {:id "msg_3"
+                                :model "claude-opus-4-6"
+                                :stop_reason "max_tokens"
+                                :diagnostics {:flags ["alpha" "beta"]}
+                                :usage {:input_tokens 17
+                                        :output_tokens 33}
+                                :content [{:type "text"
+                                           :text "blok-1"}
+                                          {:type "text"
+                                           :text "blok-2"}
+                                          {:type "tool_use"
+                                           :name "ignored"}]})
+                 response-bytes (.getBytes response-str "UTF-8")]
+             (.set (.getResponseHeaders exchange) "Content-Type" "application/json")
+             (.set (.getResponseHeaders exchange) "Retry-After" "7")
+             (.set (.getResponseHeaders exchange) "anthropic-ratelimit-requests-limit" "100")
+             (.set (.getResponseHeaders exchange) "anthropic-ratelimit-requests-remaining" "0")
+             (.set (.getResponseHeaders exchange) "anthropic-ratelimit-tokens-remaining" "42")
+             (.sendResponseHeaders exchange 200 (long (alength response-bytes)))
+             (with-open [out (.getResponseBody exchange)]
+               (.write out response-bytes))))))
+      (.setExecutor server nil)
+      (.start server)
+      (try
+        (let [worker-config {:invoke/http {:url (str "http://127.0.0.1:" port "/v1/messages")
+                                           :provider/id :anthropic-messages
+                                           :request-params {:model "claude-opus-4-6"
+                                                            :max_tokens 64}
+                                           :response-fields/by-provider
+                                           {:anthropic-messages
+                                            {:text {:path [:content]
+                                                    :transform 'ferment.providers.http.anthropic/content-text}
+                                             :provider/message-id [:id]
+                                             :provider/model [:model]
+                                             :provider/stop-reason [:stop_reason]
+                                             :provider/usage [:usage]
+                                             :provider/content-types {:path [:content]
+                                                                      :transform 'ferment.providers.http.anthropic/content-types}
+                                             :provider/flags-joined {:path [:diagnostics :flags]
+                                                                     :transform '[clojure.string/join " | "]}}}
+                                           :response-header-fields/by-provider
+                                           {:anthropic-messages
+                                            {:provider/rate-limit {:transform 'ferment.providers.http.anthropic/response-rate-limit}}}}}
+              result (model/invoke-runtime-http!
+                      {:prompt "hej"}
+                      nil
+                      worker-config)]
+          (is (= "blok-1\n\nblok-2" (:text result)))
+          (is (= "msg_3" (:provider/message-id result)))
+          (is (= "claude-opus-4-6" (:provider/model result)))
+          (is (= "max_tokens" (:provider/stop-reason result)))
+          (is (= {:input_tokens 17
+                  :output_tokens 33}
+                 (:provider/usage result)))
+          (is (= ["text" "text" "tool_use"] (:provider/content-types result)))
+          (is (= "alpha | beta"
+                 (:provider/flags-joined result)))
+          (is (= {:retry-after 7
+                  :requests-limit 100
+                  :requests-remaining 0
+                  :tokens-remaining 42}
+                 (select-keys (:provider/rate-limit result)
+                              [:retry-after
+                               :requests-limit
+                               :requests-remaining
+                               :tokens-remaining]))))
+        (finally
+          (.stop server 0))))))
+
+(deftest model-runtime-http-invoke-uses-provider-headers-and-skips-blank-values
+  (testing "invoke-runtime-http! applies :headers/by-provider for active provider and removes blank values."
+    (let [port (free-port)
+          seen-auth (atom nil)
+          seen-api-key (atom nil)
+          seen-trace (atom nil)
+          server (com.sun.net.httpserver.HttpServer/create
+                  (java.net.InetSocketAddress. "127.0.0.1" (int port))
+                  0)]
+      (.createContext
+       server
+       "/v1/chat/completions"
+       (reify com.sun.net.httpserver.HttpHandler
+         (handle [_ exchange]
+           (let [headers (.getRequestHeaders exchange)
+                 auth (or (.getFirst headers "authorization")
+                          (.getFirst headers "Authorization"))
+                 api-key (or (.getFirst headers "x-api-key")
+                             (.getFirst headers "X-Api-Key"))
+                 trace (or (.getFirst headers "x-trace-id")
+                           (.getFirst headers "X-Trace-Id"))
+                 _ (reset! seen-auth auth)
+                 _ (reset! seen-api-key api-key)
+                 _ (reset! seen-trace trace)
+                 response-str (json/generate-string
+                               {:choices [{:index 0
+                                           :message {:role "assistant"
+                                                     :content "headers-ok"}}]})
+                 response-bytes (.getBytes response-str "UTF-8")]
+             (.set (.getResponseHeaders exchange) "Content-Type" "application/json")
+             (.sendResponseHeaders exchange 200 (long (alength response-bytes)))
+             (with-open [out (.getResponseBody exchange)]
+               (.write out response-bytes))))))
+      (.setExecutor server nil)
+      (.start server)
+      (try
+        (let [result (model/invoke-runtime-http!
+                      {:prompt "ping"}
+                      nil
+                      {:invoke/http {:url (str "http://127.0.0.1:" port "/v1/chat/completions")
+                                     :provider/id :openai-compatible
+                                     :headers {"x-trace-id" "trace-1"}
+                                     :headers/by-provider {:openai-compatible {"authorization" "   "}
+                                                           :anthropic-messages {"x-api-key" "anthropic-secret"}}}})]
+          (is (= "headers-ok" (:text result)))
+          (is (= "trace-1" @seen-trace))
+          (is (nil? @seen-auth))
+          (is (nil? @seen-api-key)))
+        (finally
+          (.stop server 0))))))
+
+(deftest model-runtime-http-invoke-fails-fast-on-unknown-provider
+  (testing "invoke-runtime-http! returns explicit error for unsupported provider id."
+    (let [ex (try
+               (model/invoke-runtime-http!
+                {:prompt "ping"}
+                nil
+                {:invoke/http {:url "http://127.0.0.1:9/v1/chat/completions"
+                               :provider/id :provider/unknown}})
+               nil
+               (catch clojure.lang.ExceptionInfo e
+                 e))]
+      (is (instance? clojure.lang.ExceptionInfo ex))
+      (is (= :invoke-http-provider-unsupported (:error (ex-data ex))))
+      (is (= :provider/unknown (:provider/id (ex-data ex)))))))
 
 (deftest model-runtime-request-quit-writes-command-to-process-stdin
   (testing "Command :quit writes :cmd/quit to process stdin with trailing newline."

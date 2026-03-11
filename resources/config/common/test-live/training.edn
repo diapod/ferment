@@ -1,20 +1,20 @@
 {
  :ferment.http/default
  {:training {:enabled? true
-             :transcript/intents [:text/respond :code/patch]
+             :transcript/intents ^:replace [:text/respond :code/patch]
              :judge {:mode :rules-only
                      :constitution/ref "training/constitution-v1"
-                     :rules [:no-internal-markers
-                             :non-empty-output-text
-                             :accepted-consistent]}
+                     :rules ^:replace [:no-internal-markers
+                                       :non-empty-output-text
+                                       :accepted-consistent]}
              :redaction {:enabled? true
                          :placeholder "[REDACTED]"
-                         :deny/keys [:password :secret :token :authorization :api-key :api/key :cookie :set-cookie :email :phone :phone-number]
-                         :deny/paths []
-                         :deny/patterns ["(?i)bearer\\s+[a-z0-9._\\-]+"
-                                         "(?i)api[_-]?key\\s*[:=]\\s*[^\\s,;]+"
-                                         "(?i)[a-z0-9._%+\\-]+@[a-z0-9.\\-]+\\.[a-z]{2,}"
-                                         "\\+?[0-9][0-9\\-\\s]{7,}[0-9]"]}
+                         :deny/keys ^:replace [:password :secret :token :authorization :api-key :api/key :cookie :set-cookie :email :phone :phone-number]
+                         :deny/paths ^:replace []
+                         :deny/patterns ^:replace ["(?i)bearer\\s+[a-z0-9._\\-]+"
+                                                   "(?i)api[_-]?key\\s*[:=]\\s*[^\\s,;]+"
+                                                   "(?i)[a-z0-9._%+\\-]+@[a-z0-9.\\-]+\\.[a-z]{2,}"
+                                                   "\\+?[0-9][0-9\\-\\s]{7,}[0-9]"]}
              :collector {:enabled? true
                          :store/type :fs-jsonl
                          :store/path "target/training/collector-test-live"
@@ -36,9 +36,9 @@
                       :sanity-check {:enabled? true
                                      :row/fn nil}}
              :eval {:enabled? true
-                    :suites [:protocol-conformance
-                             :constitution-compliance
-                             :regression]
+                    :suites ^:replace [:protocol-conformance
+                                       :constitution-compliance
+                                       :regression]
                     :report {:include-cases? true
                              :failed-only? false}
                     :thresholds {:overall/pass-rate-min 0.80
@@ -47,9 +47,9 @@
                                                        :regression 0.80}}}
              :promotion {:enabled? true
                          :blocking? true
-                         :required-suites [:protocol-conformance
-                                           :constitution-compliance
-                                           :regression]
+                         :required-suites ^:replace [:protocol-conformance
+                                                     :constitution-compliance
+                                                     :regression]
                          :thresholds {:overall/pass-rate-min 0.80
                                       :suite-pass-rate-min {:protocol-conformance 0.85
                                                             :constitution-compliance 0.85

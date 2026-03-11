@@ -335,6 +335,343 @@
         (is (= 0 (get-in snapshot [:act :routing :cap/resolve-miss])))
         (is (= 1 (get-in snapshot [:act :routing :cap/reject-reasons :intent/not-supported])))))))
 
+(deftest invoke-act-explicit-capability-overrides-gateway-order
+  (testing "When request sets explicit :cap/id, HTTP invoke keeps it as the primary choice and uses routed capability only as fallback."
+    (let [seen (atom nil)
+          telemetry (atom {})
+          runtime {:protocol {:policy/default {:fallback []}
+                              :policy/intents {:text/respond {:fallback []}}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice}
+                                        :gateway {:strategy :latency-first}}
+                              :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                       :cap/intents #{:text/respond}
+                                                       :cap/can-produce #{:value}
+                                                       :cap/effects-allowed #{:none}
+                                                       :transport/type :local-runtime
+                                                       :cap/cost {:latency-ms 300}}
+                                           :llm/voice-remote {:cap/id :llm/voice-remote
+                                                              :cap/intents #{:text/respond}
+                                                              :cap/can-produce #{:value}
+                                                              :cap/effects-allowed #{:none}
+                                                              :transport/type :remote-http
+                                                              :cap/cost {:latency-ms 900}}}}}
+          payload {:proto 1
+                   :trace {:id "t-cap-explicit-remote-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (let [response (with-redefs [core/call-capability
+                                   (fn [_runtime _resolver opts]
+                                     (reset! seen opts)
+                                     {:result {:type :value
+                                               :out {:text "ok"}}})]
+                       (http/invoke-act runtime payload telemetry nil))]
+        (is (= 200 (:status response)))
+        (is (= :llm/voice-remote (:cap-id @seen)))))))
+
+(deftest invoke-act-includes-normalized-provider-error-details
+  (testing "Remote HTTP failures expose normalized provider details for operator diagnostics."
+    (let [runtime {:protocol {:policy/default {:fallback []}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice-remote}}
+                              :caps/by-id {:llm/voice-remote {:cap/id :llm/voice-remote
+                                                              :cap/intents #{:text/respond}
+                                                              :cap/can-produce #{:value}
+                                                              :cap/effects-allowed #{:none}
+                                                              :transport/type :remote-http
+                                                              :dispatch/model-key :ferment.model/voice-api}}}
+                   :models {:ferment.model/voice-api {:id "claude-opus-4-6"}}}
+          payload {:proto 1
+                   :trace {:id "t-provider-details-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (let [response (with-redefs [core/call-capability
+                                   (fn [_runtime _resolver _opts]
+                                     (throw (ex-info
+                                             "runtime invoke failed"
+                                             {:error :runtime-invoke-failed
+                                              :cap-id :llm/voice-remote
+                                              :intent :text/respond
+                                              :model-key :ferment.model/voice-api
+                                              :transport/class :remote-http
+                                              :transport/failure-class :remote-status
+                                              :transport/error :invoke-http-status
+                                              :invoke-response {:error :invoke-failed
+                                                                :message "Failed to invoke runtime model over HTTP."
+                                                                :details {:error :invoke-http-status
+                                                                          :status 400
+                                                                          :url "https://api.anthropic.com/v1/messages"
+                                                                          :response {:type "error"
+                                                                                     :request_id "req_123"
+                                                                                     :error {:type "invalid_request_error"
+                                                                                             :message "low credits"}}}}})))]
+                       (http/invoke-act runtime payload (atom {}) nil))]
+        (is (= 502 (:status response)))
+        (is (= 400 (get-in response [:body :error :details :provider/status])))
+        (is (= "req_123" (get-in response [:body :error :details :provider/request-id])))
+        (is (= "invalid_request_error" (get-in response [:body :error :details :provider/error-type])))
+        (is (= "low credits" (get-in response [:body :error :details :provider/message])))))))
+
+(deftest invoke-act-falls-back-from-remote-provider-status-to-local-capability
+  (testing "When explicit remote capability fails with provider status, invoke-act falls back to local candidate instead of returning hard error."
+    (let [seen (atom [])
+          runtime {:protocol {:policy/default {:fallback []}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice}}
+                              :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                       :cap/intents #{:text/respond}
+                                                       :cap/can-produce #{:value}
+                                                       :cap/effects-allowed #{:none}
+                                                       :transport/type :local-runtime}
+                                           :llm/voice-remote {:cap/id :llm/voice-remote
+                                                              :cap/intents #{:text/respond}
+                                                              :cap/can-produce #{:value}
+                                                              :cap/effects-allowed #{:none}
+                                                              :transport/type :remote-http}}}}
+          payload {:proto 1
+                   :trace {:id "t-provider-fallback-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (let [response
+            (with-redefs [core/call-capability
+                          (fn [_runtime _resolver opts]
+                            (swap! seen conj (:cap-id opts))
+                            (if (= :llm/voice-remote (:cap-id opts))
+                              (throw (ex-info
+                                      "runtime invoke failed"
+                                      {:error :runtime-invoke-failed
+                                       :cap-id :llm/voice-remote
+                                       :intent :text/respond
+                                       :transport/class :remote-http
+                                       :transport/failure-class :remote-status
+                                       :transport/error :invoke-http-status
+                                       :invoke-response {:error :invoke-failed
+                                                         :details {:error :invoke-http-status
+                                                                   :status 400
+                                                                   :response {:type "error"
+                                                                              :error {:type "invalid_request_error"
+                                                                                      :message "low credits"}}}}}))
+                              {:result {:type :value
+                                        :out {:text "lokalny fallback"}}}))]
+              (http/invoke-act runtime payload (atom {}) nil))]
+        (is (= 200 (:status response)))
+        (is (= [:llm/voice-remote :llm/voice] @seen))
+        (is (= "lokalny fallback" (get-in response [:body :result :out :text])))
+        (is (= :llm/voice-remote (get-in response [:body :routing/fallback/from-cap-id])))
+        (is (= :llm/voice (get-in response [:body :routing/fallback/to-cap-id])))
+        (is (= :provider-status (get-in response [:body :routing/fallback/reason])))))))
+
+(deftest invoke-act-falls-back-from-remote-truncated-quality-to-local-capability
+  (testing "When explicit remote capability fails quality on truncated ending after retries, invoke-act falls back to local candidate."
+    (let [seen (atom [])
+          runtime {:protocol {:policy/default {:fallback []}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice}}
+                              :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                       :cap/intents #{:text/respond}
+                                                       :cap/can-produce #{:value}
+                                                       :cap/effects-allowed #{:none}
+                                                       :transport/type :local-runtime}
+                                           :llm/voice-remote {:cap/id :llm/voice-remote
+                                                              :cap/intents #{:text/respond}
+                                                              :cap/can-produce #{:value}
+                                                              :cap/effects-allowed #{:none}
+                                                              :transport/type :remote-http}}}}
+          payload {:proto 1
+                   :trace {:id "t-quality-fallback-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (let [response
+            (with-redefs [core/call-capability
+                          (fn [_runtime _resolver opts]
+                            (swap! seen conj (:cap-id opts))
+                            (if (= :llm/voice-remote (:cap-id opts))
+                              (throw (ex-info
+                                      "LLM invocation failed after retries"
+                                      {:error :invalid-result-after-retries
+                                       :attempts 3
+                                       :last-check {:ok? false
+                                                    :error :invalid-result-quality
+                                                    :failure/type :eval/must-failed
+                                                    :done/eval {:must-failed [:no-truncated-ending]}}
+                                       :retry/continuation-used? true
+                                       :retry/continuation-attempts [2 3]
+                                       :provider/stop-reason-last "end_turn"}))
+                              {:result {:type :value
+                                        :out {:text "lokalny fallback po urwaniu"}}}))]
+              (http/invoke-act runtime payload (atom {}) nil))]
+        (is (= 200 (:status response)))
+        (is (= [:llm/voice-remote :llm/voice] @seen))
+        (is (= "lokalny fallback po urwaniu" (get-in response [:body :result :out :text])))
+        (is (= :llm/voice-remote (get-in response [:body :routing/fallback/from-cap-id])))
+        (is (= :llm/voice (get-in response [:body :routing/fallback/to-cap-id])))
+        (is (= [:llm/voice] (get-in response [:body :routing/fallback/attempted-cap-ids])))
+        (is (= :quality-truncated-ending (get-in response [:body :routing/fallback/reason])))))))
+
+(deftest invoke-act-falls-back-from-remote-low-score-style-to-local-capability
+  (testing "When explicit remote capability fails low-score style gate after retries, invoke-act falls back to local candidate."
+    (let [seen (atom [])
+          runtime {:protocol {:policy/default {:fallback []}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice}}
+                              :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                       :cap/intents #{:text/respond}
+                                                       :cap/can-produce #{:value}
+                                                       :cap/effects-allowed #{:none}
+                                                       :transport/type :local-runtime}
+                                           :llm/voice-remote {:cap/id :llm/voice-remote
+                                                              :cap/intents #{:text/respond}
+                                                              :cap/can-produce #{:value}
+                                                              :cap/effects-allowed #{:none}
+                                                              :transport/type :remote-http}}}}
+          payload {:proto 1
+                   :trace {:id "t-quality-fallback-2"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (let [response
+            (with-redefs [core/call-capability
+                          (fn [_runtime _resolver opts]
+                            (swap! seen conj (:cap-id opts))
+                            (if (= :llm/voice-remote (:cap-id opts))
+                              (throw (ex-info
+                                      "LLM invocation failed after retries"
+                                      {:error :invalid-result-after-retries
+                                       :attempts 3
+                                       :last-check {:ok? false
+                                                    :error :invalid-result-quality
+                                                    :failure/type :eval/low-score
+                                                    :done/eval {:should-failed [:no-list-expansion]}}
+                                       :last-text-preview "1. A\n2. B"}))
+                              {:result {:type :value
+                                        :out {:text "lokalny fallback po low-score"}}}))]
+              (http/invoke-act runtime payload (atom {}) nil))]
+        (is (= 200 (:status response)))
+        (is (= [:llm/voice-remote :llm/voice] @seen))
+        (is (= "lokalny fallback po low-score" (get-in response [:body :result :out :text])))
+        (is (= :llm/voice-remote (get-in response [:body :routing/fallback/from-cap-id])))
+        (is (= :llm/voice (get-in response [:body :routing/fallback/to-cap-id])))
+        (is (= [:llm/voice] (get-in response [:body :routing/fallback/attempted-cap-ids])))
+        (is (= :quality-low-score (get-in response [:body :routing/fallback/reason])))))))
+
+(deftest invoke-act-fallback-tries-next-candidate-when-first-local-fails
+  (testing "When first fallback candidate fails, invoke-act tries next local candidate from routing order."
+    (let [seen (atom [])
+          runtime {:protocol {:policy/default {:fallback []}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice}
+                                        :intent->candidates {:text/respond [:llm/voice
+                                                                            :llm/voice-remote
+                                                                            :llm/solver-text]}}
+                              :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                       :cap/intents #{:text/respond}
+                                                       :cap/can-produce #{:value}
+                                                       :cap/effects-allowed #{:none}
+                                                       :transport/type :local-runtime}
+                                           :llm/solver-text {:cap/id :llm/solver-text
+                                                             :cap/intents #{:text/respond}
+                                                             :cap/can-produce #{:value}
+                                                             :cap/effects-allowed #{:none}
+                                                             :transport/type :local-runtime}
+                                           :llm/voice-remote {:cap/id :llm/voice-remote
+                                                              :cap/intents #{:text/respond}
+                                                              :cap/can-produce #{:value}
+                                                              :cap/effects-allowed #{:none}
+                                                              :transport/type :remote-http}}}}
+          payload {:proto 1
+                   :trace {:id "t-quality-fallback-3"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (let [response
+            (with-redefs [core/call-capability
+                          (fn [_runtime _resolver opts]
+                            (swap! seen conj (:cap-id opts))
+                            (cond
+                              (= :llm/voice-remote (:cap-id opts))
+                              (throw (ex-info
+                                      "LLM invocation failed after retries"
+                                      {:error :invalid-result-after-retries
+                                       :attempts 3
+                                       :last-check {:ok? false
+                                                    :error :invalid-result-quality
+                                                    :failure/type :eval/low-score
+                                                    :done/eval {:should-failed [:no-list-expansion]}}
+                                       :last-text-preview "1. A\n2. B"}))
+
+                              (= :llm/voice (:cap-id opts))
+                              (throw (ex-info
+                                      "LLM invocation failed after retries"
+                                      {:error :invalid-result-after-retries
+                                       :attempts 3
+                                       :last-check {:ok? false
+                                                    :error :invalid-result-quality
+                                                    :failure/type :eval/low-score
+                                                    :done/eval {:should-failed [:no-list-expansion]}}
+                                       :last-text-preview "1. A\n2. B"}))
+
+                              :else
+                              {:result {:type :value
+                                        :out {:text "fallback przeszedl na solver-text"}}}))]
+              (http/invoke-act runtime payload (atom {}) nil))]
+        (is (= 200 (:status response)))
+        (is (= [:llm/voice-remote :llm/voice :llm/solver-text] @seen))
+        (is (= "fallback przeszedl na solver-text" (get-in response [:body :result :out :text])))
+        (is (= :llm/voice-remote (get-in response [:body :routing/fallback/from-cap-id])))
+        (is (= :llm/solver-text (get-in response [:body :routing/fallback/to-cap-id])))
+        (is (= [:llm/voice :llm/solver-text]
+               (get-in response [:body :routing/fallback/attempted-cap-ids])))
+        (is (= :quality-low-score (get-in response [:body :routing/fallback/reason])))))))
+
+(deftest invoke-act-fallback-exposes-diagnostics-when-all-candidates-fail
+  (testing "When all fallback candidates fail, invoke-act returns canonical error with fallback diagnostics."
+    (let [seen (atom [])
+          runtime {:protocol {:policy/default {:fallback []}}
+                   :resolver {:routing {:intent->cap {:text/respond :llm/voice}
+                                        :intent->candidates {:text/respond [:llm/voice
+                                                                            :llm/voice-remote
+                                                                            :llm/solver-text]}}
+                              :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                       :cap/intents #{:text/respond}
+                                                       :cap/can-produce #{:value}
+                                                       :cap/effects-allowed #{:none}
+                                                       :transport/type :local-runtime}
+                                           :llm/solver-text {:cap/id :llm/solver-text
+                                                             :cap/intents #{:text/respond}
+                                                             :cap/can-produce #{:value}
+                                                             :cap/effects-allowed #{:none}
+                                                             :transport/type :local-runtime}
+                                           :llm/voice-remote {:cap/id :llm/voice-remote
+                                                              :cap/intents #{:text/respond}
+                                                              :cap/can-produce #{:value}
+                                                              :cap/effects-allowed #{:none}
+                                                              :transport/type :remote-http}}}}
+          payload {:proto 1
+                   :trace {:id "t-quality-fallback-4"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (let [response
+            (with-redefs [core/call-capability
+                          (fn [_runtime _resolver opts]
+                            (swap! seen conj (:cap-id opts))
+                            (throw (ex-info
+                                    "LLM invocation failed after retries"
+                                    {:error :invalid-result-after-retries
+                                     :attempts 3
+                                     :last-check {:ok? false
+                                                  :error :invalid-result-quality
+                                                  :failure/type :eval/low-score
+                                                  :done/eval {:should-failed [:no-list-expansion]}}
+                                     :last-text-preview "1. A\n2. B"})))]
+              (http/invoke-act runtime payload (atom {}) nil))]
+        (is (= 502 (:status response)))
+        (is (= [:llm/voice-remote :llm/voice :llm/solver-text] @seen))
+        (is (= :schema/invalid (get-in response [:body :error :type])))
+        (is (= :llm/voice-remote (get-in response [:body :routing/fallback/from-cap-id])))
+        (is (= :quality-low-score (get-in response [:body :routing/fallback/reason])))
+        (is (= [:llm/voice :llm/solver-text]
+               (get-in response [:body :routing/fallback/attempted-cap-ids])))
+        (is (true? (get-in response [:body :routing/fallback/exhausted?])))))))
+
 (deftest invoke-act-capability-resolution-emits-diagnostics-on-unsupported-intent
   (testing "unsupported/intent error includes rejected candidate diagnostics and resolution telemetry."
     (let [calls (atom 0)
@@ -1283,7 +1620,7 @@
                    :trace {:id "t-5b"}
                    :task {:intent :text/respond}
                    :input {:prompt "Kto stworzył Clojure?"}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent prompt]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1336,7 +1673,7 @@
                    :routing {:meta? true
                              :strict? true}
                    :input {:prompt "Czy ryby piją?"}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent prompt]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1376,7 +1713,7 @@
                    :routing {:meta? true
                              :strict? true}
                    :input {:prompt "Wyjaśnij ACID jednym zdaniem."}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent prompt]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1421,7 +1758,7 @@
                              :debug/plan? true
                              :debug-transcript? true}
                    :input {:prompt "Wyjaśnij ACID jednym zdaniem."}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent prompt]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1501,7 +1838,7 @@
                              :strict? true
                              :force? true}
                    :input {:prompt "Kim jest autor randomseed.pl?"}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1553,7 +1890,7 @@
                              :strict? true
                              :force? true}
                    :input {:prompt "Kim jest autor randomseed.pl?"}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1604,7 +1941,7 @@
                              :strict? true
                              :force? true}
                    :input {:prompt "Ile to jest 2+2?"}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1653,7 +1990,7 @@
                              :strict? true
                              :force? true}
                    :input {:prompt "Wyjaśnij ACID jednym zdaniem."}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1722,7 +2059,7 @@
                              :force? true
                              :debug/transcript? true}
                    :input {:prompt "Kim jest autor randomseed.pl?"}}
-          response (with-redefs [core/ollama-generate!
+          response (with-redefs [core/invoke-model-generate!
                                  (fn [{:keys [intent]}]
                                    (swap! calls conj intent)
                                    (case intent
@@ -1915,6 +2252,37 @@
       (is (= true (get-in details [:outcome :done/eval :judge/pass?])))
       (is (= :schema-valid (get-in details [:outcome :done/eval :checks 0 :check]))))))
 
+(deftest invoke-act-direct-retry-error-exposes-continuation-diagnostics
+  (testing "Direct invoke schema/invalid after retries exposes continuation and provider diagnostics."
+    (let [runtime {:resolver {:caps/by-id {:llm/voice-remote {:cap/id :llm/voice-remote}}}}
+          payload {:proto 1
+                   :trace {:id "t-direct-cont"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :routing {:meta? false}
+                   :input {:prompt "hej"}}
+          response (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver _opts]
+                                   (throw (ex-info
+                                           "LLM invocation failed after retries"
+                                           {:error :invalid-result-after-retries
+                                            :attempts 3
+                                            :last-check {:ok? false
+                                                         :error :invalid-result-quality}
+                                            :retry/continuation-used? true
+                                            :retry/continuation-attempts [2 3]
+                                            :provider/stop-reason-last "end_turn"
+                                            :last-text-preview "ACID to cztery właściwości.\n\nPrzykład:"})))]
+                     (http/invoke-act runtime payload nil nil))
+          details (get-in response [:body :error :details])]
+      (is (= 502 (:status response)))
+      (is (= :schema/invalid (get-in response [:body :error :type])))
+      (is (= 3 (:attempts details)))
+      (is (= true (:retry/continuation-used? details)))
+      (is (= [2 3] (:retry/continuation-attempts details)))
+      (is (= "end_turn" (:provider/stop-reason-last details)))
+      (is (= "ACID to cztery właściwości.\n\nPrzykład:" (:last-text-preview details))))))
+
 (deftest invoke-act-meta-routing-fails-closed-by-router-default-on-error
   (testing "router :defaults/:on-error :fail-closed enforces fail-closed even without request :routing/:strict?."
     (let [routing {:intent->cap {:route/decide :llm/meta
@@ -2019,7 +2387,7 @@
                    :trace {:id "t-7-retry-open"}
                    :task {:intent :text/respond}
                    :input {:prompt "hej"}}]
-      (with-redefs [core/ollama-generate!
+      (with-redefs [core/invoke-model-generate!
                     (fn [{:keys [intent]}]
                       (swap! calls conj intent)
                       (case intent
@@ -2254,6 +2622,48 @@
         (is (= 0 (get-in snapshot [:orchestration :context/hit-utility :misses])))
         (is (= 1.0 (get-in snapshot [:orchestration :context/hit-utility :value])))
         (is (nil? (get-in snapshot [:orchestration :route/decision-quality-trend :value])))))))
+
+(deftest telemetry-snapshot-exposes-provider-usage-and-rate-limit
+  (testing "Diagnostics snapshot aggregates provider usage and rate-limit hints from successful responses."
+    (let [telemetry (atom (#'ferment.http/default-telemetry))
+          runtime {:protocol {}
+                   :resolver {}}
+          payload {:proto 1
+                   :trace {:id "t-provider-telemetry-1"}
+                   :session/id "session/provider-telemetry-1"
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (with-redefs [core/call-capability
+                    (fn [_runtime _resolver _opts]
+                      {:invoke/meta {:role :voice
+                                     :intent :text/respond
+                                     :cap/id :llm/voice-remote
+                                     :model-key :ferment.model/voice-api
+                                     :model "claude-opus-4-6"}
+                       :result {:type :value
+                                :out {:text "ok"
+                                      :provider/emoji-stripped-count 2
+                                      :provider/usage {:input_tokens 120
+                                                       :output_tokens 45
+                                                       :cache_creation_input_tokens 0
+                                                       :cache_read_input_tokens 10}
+                                      :provider/rate-limit {:retry-after 9
+                                                            :requests-remaining 0
+                                                            :tokens-remaining 12}}}})]
+        (is (= 200 (:status (http/invoke-act runtime payload telemetry nil)))))
+      (let [snapshot (#'ferment.http/telemetry-snapshot telemetry)]
+        (is (= 1 (get-in snapshot [:orchestration :provider/usage :requests])))
+        (is (= 120 (get-in snapshot [:orchestration :provider/usage :input-tokens])))
+        (is (= 45 (get-in snapshot [:orchestration :provider/usage :output-tokens])))
+        (is (= 10 (get-in snapshot [:orchestration :provider/usage :cache-read-input-tokens])))
+        (is (= 1 (get-in snapshot [:orchestration :provider/usage :emoji-stripped-events])))
+        (is (= 2 (get-in snapshot [:orchestration :provider/usage :emoji-stripped-total])))
+        (is (= 2.0 (get-in snapshot [:orchestration :provider/usage :avg-emoji-stripped])))
+        (is (= 1 (get-in snapshot [:orchestration :provider/rate-limit :retry-after-events])))
+        (is (= 9 (get-in snapshot [:orchestration :provider/rate-limit :retry-after-seconds-total])))
+        (is (= 1 (get-in snapshot [:orchestration :provider/rate-limit :zero-remaining :requests])))
+        (is (nil? (get-in snapshot [:orchestration :provider/rate-limit :zero-remaining :tokens])))))))
 
 (deftest invoke-act-auto-writes-session-memory-summary
   (testing "Successful /v1/act auto-writes compacted context summary according to session memory policy."

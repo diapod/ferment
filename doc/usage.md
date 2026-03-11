@@ -155,6 +155,7 @@ curl -s http://127.0.0.1:12002/v1/act \
 
 Notes:
 - Optional routing flags in payload are canonical under `"routing"` as `"meta?"`, `"strict?"`, `"force?"`, and `"debug/plan?"`.
+- Optional `"task"."cap/id"` is a hard capability preference: when the requested capability satisfies the intent/contract, Ferment invokes it directly; resolver routing stays available as fallback only for explicit near-miss cases.
 - Optional protocol artifact override is available via `"routing"."artifact/version"` (for controlled prompt/policy canary or rollback per request).
 - Optional router artifact override is available via `"routing"."router/artifact-version"` (or `"routing"."router/version"` alias) for controlled routing-strategy canary/rollback per request.
 - Response envelope includes selected protocol artifact metadata under `"protocol/artifact-version"` and `"protocol/artifact-source"` when available.
@@ -488,6 +489,72 @@ Example call:
 curl -s http://127.0.0.1:12002/meta/responses \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Return one short sentence in Polish."}'
+```
+
+Remote HTTP provider module example (`:anthropic-messages`):
+
+```edn
+:ferment.model.id/voice-api
+{:profile     "default"
+ :type        :HTTP
+ :id/default  "claude-opus-4-6"
+ :id/mini     "claude-opus-4-6"
+ :id/fallback "claude-opus-4-6"}
+
+:ferment.model.runtime/voice-api
+{:defaults #ref :ferment.model.defaults/runtime
+:invoke/http {:base-url "https://api.anthropic.com"
+               :endpoint "/v1/messages"
+               :provider/id :anthropic-messages
+               :request-params/by-provider {:anthropic-messages {:model "claude-haiku-3-0"
+                                                                  :max_tokens 256}}
+               :request-params {:model "claude-opus-4-6"
+                                :max_tokens 1024}
+               :response-fields/by-provider {:anthropic-messages {:text {:path [:content]
+                                                                          :transform ferment.providers.http.anthropic/content-text}
+                                                                  :provider/stop-reason [:stop_reason]
+                                                                  :provider/usage [:usage]}}
+               :headers/by-provider {:anthropic-messages {"x-api-key" #ref :ferment.env/provider.anthropic.api.key
+                                                          "anthropic-version" #ref :ferment.env/provider.anthropic.version}
+                                     :openai-compatible {"authorization" #ref :ferment.env/provider.openai.authorization}}
+               :timeout-ms 12000
+               :max-tokens 384}}
+```
+
+The practical operator pattern is:
+- keep remote transport request payload under `:request-params*`,
+- keep visible runtime/model identity under `:ferment.model.id/*`,
+- so startup logs and `models/used` reflect the configured remote model instead of an unrelated placeholder.
+
+Merge precedence for request params:
+- provider defaults from `:request-params/by-provider`,
+- then global `:request-params` (global keys win on conflicts).
+
+Merge precedence for response field extraction:
+- provider defaults from `:response-fields/by-provider`,
+- then global `:response-fields` (global keys win on conflicts).
+
+Response field transforms are data-first:
+- `:transform some.ns/fn` => `(some.ns/fn value)`
+- `:transform [some.ns/fn arg1 arg2]` => `(some.ns/fn arg1 arg2 value)`
+
+Recommended secret storage for provider keys:
+
+```bash
+mkdir -p ~/.ferment/secrets
+cat > ~/.ferment/secrets/providers.env <<'EOF'
+PROVIDER_ANTHROPIC_API_KEY=replace-me
+PROVIDER_ANTHROPIC_VERSION=2023-06-01
+PROVIDER_OPENAI_AUTHORIZATION=Bearer replace-me
+EOF
+```
+
+Then reference derived env keys in EDN:
+
+```edn
+:headers/by-provider {:anthropic-messages {"x-api-key" #ref :ferment.env/provider.anthropic.api.key
+                                           "anthropic-version" #ref :ferment.env/provider.anthropic.version}
+                      :openai-compatible {"authorization" #ref :ferment.env/provider.openai.authorization}}
 ```
 
 ## 9) Testing profiles and runtime modes

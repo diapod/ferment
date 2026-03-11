@@ -8,6 +8,7 @@
     ferment.runtime-test
 
   (:require [clojure.test :refer [deftest is testing]]
+            [ferment.core :as core]
             [ferment.execution-graph :as execution-graph]
             [ferment.queue :as queue]
             [ferment.runtime :as runtime]
@@ -196,6 +197,39 @@
       (is (= :unsupported/intent (get-in result [:error :type])))
       (is (= :result-type/not-supported
              (get-in result [:error :details :rejected-candidates 0 :reason]))))))
+
+(deftest invoke-queued-request-prefers-explicit-capability-over-gateway-order
+  (testing "Queued invoke keeps explicit capability as the primary choice even when gateway ordering would prefer a different transport."
+    (let [seen (atom nil)
+          runtime-state {:protocol {:policy/default {:fallback []}}
+                         :resolver {:routing {:intent->cap {:text/respond :llm/voice}
+                                              :gateway {:strategy :latency-first}}
+                                    :caps/by-id {:llm/voice {:cap/id :llm/voice
+                                                             :cap/intents #{:text/respond}
+                                                             :cap/can-produce #{:value}
+                                                             :cap/effects-allowed #{:none}
+                                                             :transport/type :local-runtime
+                                                             :cap/cost {:latency-ms 300}}
+                                                 :llm/voice-remote {:cap/id :llm/voice-remote
+                                                                    :cap/intents #{:text/respond}
+                                                                    :cap/can-produce #{:value}
+                                                                    :cap/effects-allowed #{:none}
+                                                                    :transport/type :remote-http
+                                                                    :cap/cost {:latency-ms 900}}}}
+                         :router {:routing {:intent->cap {:text/respond :llm/voice}}}}
+          request {:proto 1
+                   :trace {:id "runtime-explicit-remote-1"}
+                   :task {:intent :text/respond
+                          :cap/id :llm/voice-remote}
+                   :input {:prompt "hej"}}]
+      (let [result (with-redefs [core/call-capability
+                                 (fn [_runtime _resolver opts]
+                                   (reset! seen opts)
+                                   {:result {:type :value
+                                             :out {:text "ok"}}})]
+                     (#'ferment.runtime/invoke-queued-request runtime-state request))]
+        (is (:ok? result))
+        (is (= :llm/voice-remote (:cap-id @seen)))))))
 
 (deftest init-runtime-restores-inflight-jobs-from-execution-graph
   (testing "Runtime restores queued/running jobs from durable execution graph on startup."

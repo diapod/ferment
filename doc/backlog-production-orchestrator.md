@@ -39,10 +39,12 @@ Reprioritized for router-first meta-goal (sync: 2026-03-09): keep the core small
      - [x] routing supports intent-level multi-candidate dispatch (`:intent->candidates`) and gateway transport preference (`:transport-order`, `:intent->transport-order`),
      - [x] transport-level failure taxonomy exported in `/diag/telemetry` (`:act/:transport`, orchestration transport trend),
      - [x] remote API adapter profile + end-to-end live policy pack (local+remote in one intent),
+     - [ ] modular provider adapter SPI for `:remote-http` (OpenAI-compatible first, provider modules next),
      - [ ] peer/swarm adapter contract.
    - Scope:
      - standard capability descriptor for local/API/peer model endpoints,
      - adapter seam in gateway/resolver (no provider coupling in core),
+     - provider module contract (`build-request`, `parse-response`, `classify-error`, `extract-usage`) behind one remote transport path,
      - health/auth/timeout/retry normalization per transport.
    - Done when:
      - one intent can route across at least two transport classes (local + remote API) by policy,
@@ -195,15 +197,28 @@ Reprioritized for router-first meta-goal (sync: 2026-03-09): keep the core small
     - [x] deterministic transport failure telemetry (`by-class`, `by-transport`, `by-error`),
     - [x] gateway transport-priority ordering and intent-level candidate list support,
     - [x] reference remote API profile and policy examples for mixed transport intent.
+    - [ ] modular provider adapter SPI + at least one reference provider module.
   - Delivery scope:
     - define canonical capability transport descriptor (`:transport/type`, auth mode, timeouts, retry limits),
     - add adapter implementations for local runtime and remote HTTP API under shared gateway contract,
+    - add provider plug-in seam for `:remote-http` (without provider branching in orchestration core),
      - normalize transport-level failures into deterministic taxonomy (separate from quality/schema failures),
      - preserve router-first core boundary (provider specifics only in adapters/modules).
-   - Done when:
-     - resolver/gateway can choose candidates across local + remote transports by policy,
-     - telemetry exposes transport class and failure class with stable counters,
-     - no provider-specific branching is added inside orchestration core flow.
+  - Done when:
+    - resolver/gateway can choose candidates across local + remote transports by policy,
+    - telemetry exposes transport class and failure class with stable counters,
+    - no provider-specific branching is added inside orchestration core flow.
+
+13. [ ] Modular provider adapters (`#13`)
+  - Add practical provider modules under one remote HTTP contract (OpenAI-compatible first).
+  - Delivery scope:
+    - define provider SPI (`build-request`, `parse-response`, `classify-error`, `extract-usage`),
+    - add provider registry and config mapping (`provider/id` + provider model),
+    - ship at least one reference module and contract tests for request/response/error normalization.
+  - Done when:
+    - switching provider does not require orchestration-core code changes,
+    - telemetry/cost/usage is normalized across provider modules,
+    - fallback across providers works through existing routing policy.
 
 ## Suggested Delivery Phases
 

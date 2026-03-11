@@ -42,6 +42,7 @@
                                "If you are uncertain or lack reliable facts,"
                                "you may return structured output with"
                                "answer/status set to needs-solver."
+                               "Do not use emoji."
                                "Do not expose reasoning"
                                "and do not use <think>."]
                       :coder  ["Role: CODER."
@@ -106,7 +107,8 @@
                                               :temperature    0.0}}
             :text/respond      {:in-schema   :req/text
                                 :out-schema  :res/text
-                                :constraints {:max-chars 900}
+                                :constraints {:max-chars 900
+                                              :style/emoji :strip}
                                 :budget      {:max-tokens     420
                                               :max-roundtrips 3
                                               :temperature    0.0}}
@@ -186,7 +188,9 @@
                   :answer-known         :builtin/answer-known
                   :fact-question-grounded :builtin/fact-question-grounded
                   :no-list-expansion    :builtin/no-list-expansion
-                  :no-truncated-ending  :builtin/no-truncated-ending}
+                  :no-truncated-ending  :builtin/no-truncated-ending
+                  :no-markdown-heading  :builtin/no-markdown-heading
+                  :no-emoji             :builtin/no-emoji}
 
   :policy/default {:done      {:must      #{:schema-valid}
                                :should    #{:no-hallucinated-apis}
@@ -203,7 +207,12 @@
                    :retry     {:max-attempts 3
                                :same-cap-max 1
                                :fallback-max 1}
-                   :switch-on #{:schema/invalid :format/drift :eval/low-score :eval/must-failed}
+                   :switch-on #{:schema/invalid
+                                :format/drift
+                                :eval/low-score
+                                :eval/must-failed
+                                :provider/max-tokens
+                                :provider/context-window-exceeded}
                    :fallback  []}
 
   :policy/intents {:route/decide      {:done      {:must      #{:schema-valid}
@@ -229,7 +238,7 @@
                    :text/respond      {:done     {:must      #{:schema-valid}
                                                   :should    #{:no-hallucinated-apis :no-list-expansion}
                                                   :score-min 0.85}
-                                       :checks/hard [:schema-valid :no-truncated-ending :answer-known]
+                                       :checks/hard [:schema-valid :no-truncated-ending :answer-known :no-markdown-heading :no-emoji]
                                        :checks/soft [:no-hallucinated-apis :no-list-expansion :sufficient-detail]
                                        :fallback [:llm/voice :llm/solver-text]
                                        :judge    {:enabled?     true

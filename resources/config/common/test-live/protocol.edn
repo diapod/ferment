@@ -4,7 +4,8 @@
  {:intents {:route/decide {:constraints {:max-chars 420}
                            :budget {:max-tokens 96
                                     :max-roundtrips 2}}
-            :text/respond {:constraints {:max-chars 480}
+            :text/respond {:constraints {:max-chars 480
+                                         :style/emoji :strip}
                            :budget {:max-tokens 220
                                     :max-roundtrips 2}}
             :problem/solve {:constraints {:max-chars 900}
@@ -13,13 +14,13 @@
   :policy/intents {:route/decide {:retry {:max-attempts 2
                                           :same-cap-max 1
                                           :fallback-max 0}
-                                  :checks/hard [:schema-valid]
-                                  :checks/soft []}
+                                  :checks/hard ^:replace [:schema-valid]
+                                  :checks/soft ^:replace []}
                    :text/respond {:done {:score-min 0.75}
-                                  :checks/hard [:schema-valid :no-truncated-ending :answer-known]
-                                  :checks/soft [:no-hallucinated-apis]}
+                                  :checks/hard ^:replace [:schema-valid :no-truncated-ending :answer-known :no-markdown-heading :no-emoji]
+                                  :checks/soft ^:replace [:no-hallucinated-apis]}
                    :problem/solve {:done {:score-min 0.78}
-                                   :checks/hard [:schema-valid :no-truncated-ending]
-                                   :checks/soft [:no-hallucinated-apis]}}}
+                                   :checks/hard ^:replace [:schema-valid :no-truncated-ending]
+                                   :checks/soft ^:replace [:no-hallucinated-apis]}}}
 
 }

@@ -354,15 +354,14 @@
   [resolver request]
   (let [intent       (some-> (get-in request [:task :intent]) keywordish)
         explicit-cap (request-explicit-cap-id request)
-        routed-cap   (some-> resolver :routing :intent->cap (get intent) keywordish)
-        node         (cond-> {:intent intent
-                              :requires (get-in request [:task :requires])
-                              :effects (:effects request)}
-                       (or (keyword? explicit-cap) (keyword? routed-cap))
-                       (assoc :dispatch {:candidates (cond-> []
-                                                       (keyword? explicit-cap) (conj explicit-cap)
-                                                       (keyword? routed-cap) (conj routed-cap))}))]
-    (workflow/resolve-capability-decision resolver node)))
+        routed-cap   (some-> resolver :routing :intent->cap (get intent) keywordish)]
+    (workflow/resolve-request-capability-decision
+     resolver
+     {:intent intent
+      :explicit-cap explicit-cap
+      :routed-cap routed-cap
+      :requires (get-in request [:task :requires])
+      :effects (:effects request)})))
 
 (defn- request->invoke-opts
   [runtime resolver request cap-id]

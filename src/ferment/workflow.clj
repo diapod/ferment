@@ -113,6 +113,10 @@
         done' (merge-done-overrides (:done base') (:done over'))
         checks' (into (keyword-set (:checks base'))
                       (keyword-set (:checks over')))
+        checks-hard' (into (keyword-set (:checks/hard base'))
+                           (keyword-set (:checks/hard over')))
+        checks-soft' (into (keyword-set (:checks/soft base'))
+                           (keyword-set (:checks/soft over')))
         switch-on' (into (keyword-set (:switch-on base'))
                          (keyword-set (:switch-on over')))
         fallback' (vec (distinct (concat (or (:fallback base') [])
@@ -124,6 +128,8 @@
     (cond-> {}
       (seq done') (assoc :done done')
       (seq checks') (assoc :checks checks')
+      (seq checks-hard') (assoc :checks/hard checks-hard')
+      (seq checks-soft') (assoc :checks/soft checks-soft')
       (seq switch-on') (assoc :switch-on switch-on')
       (seq fallback') (assoc :fallback fallback')
       (seq retry') (assoc :retry retry')
@@ -601,6 +607,42 @@
      :candidates (vec candidates0)
      :rejected-candidates (if (sequential? rejected) (vec rejected) [])}))
 
+(defn resolve-request-capability-decision
+  "Resolves capability for request-like data.
+
+  Explicit capability is treated as a hard first choice when it satisfies the
+  request contract. Routed capability remains a fallback for near-miss cases,
+  so diagnostics still include rejected explicit candidates."
+  [resolver {:keys [intent explicit-cap routed-cap requires effects]}]
+  (let [base-node {:intent intent
+                   :requires requires
+                   :effects effects}
+        explicit-decision (when (keyword? explicit-cap)
+                            (resolve-capability-decision resolver
+                                                         (assoc base-node :cap/id explicit-cap)))
+        fallback-decision (resolve-capability-decision
+                           resolver
+                           (cond-> base-node
+                             (or (keyword? explicit-cap) (keyword? routed-cap))
+                             (assoc :dispatch {:candidates (cond-> []
+                                                            (keyword? explicit-cap) (conj explicit-cap)
+                                                            (keyword? routed-cap) (conj routed-cap))})))
+        explicit-candidates (if (sequential? (:candidates explicit-decision))
+                              (vec (:candidates explicit-decision))
+                              [])
+        explicit-ok? (and (keyword? explicit-cap)
+                          (some #(= explicit-cap %) explicit-candidates))
+        decision0 (if explicit-ok?
+                    (assoc explicit-decision
+                           :cap/id explicit-cap
+                           :candidates (into [explicit-cap]
+                                             (remove #(= explicit-cap %))
+                                             explicit-candidates))
+                    fallback-decision)]
+    (cond-> decision0
+      (keyword? explicit-cap) (assoc :requested-cap/id explicit-cap)
+      (keyword? routed-cap) (assoc :routed-cap/id routed-cap))))
+
 (defn resolve-capability
   "Resolves capability id for a call node.
 
@@ -1002,6 +1044,14 @@
      :judge/pass? judge-pass?
      :score-min score-min}))
 
+(defn evaluate-call-done
+  "Evaluates workflow-style `:done` checks for a single call result.
+
+  Reuses the same policy resolution and builtin checks as call nodes executed
+  inside a plan, so direct invoke paths can share the same quality semantics."
+  [resolver protocol call-node env result check-fns judge-fn]
+  (evaluate-done resolver protocol call-node env result check-fns judge-fn))
+
 (defn- call-failure-type
   [protocol call-node result done-eval]
   (or (get-in result [:error :type])
@@ -1010,6 +1060,7 @@
                                                  result
                                                  (:requires call-node)))
         :schema/invalid)
+      (contracts/provider-stop-failure-type result done-eval)
       (:failure/type done-eval)))
 
 (defn- recoverable-failure?

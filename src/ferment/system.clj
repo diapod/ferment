@@ -335,6 +335,44 @@ producing the runtime value to be inserted into the system.")
   [p]
   (and p (str/ends-with? (str p) ".env")))
 
+(defn- configured-secrets-dir
+  "Returns secrets directory path used for extra ENV overlays.
+
+  Priority:
+  1. `:secrets-dir` in `::config-sources`,
+  2. JVM property `ferment.secrets.dir`,
+  3. ENV `FERMENT_SECRETS_DIR`,
+  4. default `~/.ferment/secrets`."
+  [config-sources]
+  (let [from-config (some-> (:secrets-dir config-sources) str str/trim not-empty)
+        from-prop   (some-> (System/getProperty "ferment.secrets.dir") str/trim not-empty)
+        from-env    (some-> (System/getenv "FERMENT_SECRETS_DIR") str/trim not-empty)
+        default-dir (some-> (System/getProperty "user.home")
+                            (io/file ".ferment" "secrets")
+                            .getPath)]
+    (or from-config from-prop from-env default-dir)))
+
+(defn- secret-env-files
+  "Discovers secret ENV files in `secrets-dir`.
+
+  File order is deterministic:
+  - `providers.env` first (if present),
+  - then other `*.env` files sorted by filename."
+  [secrets-dir]
+  (when-some [dir (some-> secrets-dir str str/trim not-empty)]
+    (let [^java.io.File root (io/file dir)]
+      (when (.isDirectory root)
+        (let [files (->> (or (seq (.listFiles root)) '())
+                         (filter #(.isFile ^java.io.File %))
+                         (filter #(env-path? (.getName ^java.io.File %)))
+                         (sort-by #(.getName ^java.io.File %))
+                         vec)
+              providers (filter #(= "providers.env" (.getName ^java.io.File %)) files)
+              others    (remove #(= "providers.env" (.getName ^java.io.File %)) files)]
+          (some->> (concat providers others)
+                   (map #(.getPath ^java.io.File %))
+                   seq))))))
+
 (defn- file->resource-name
   "Converts discovered file path to classpath resource name under root directory `d`."
   [d ^java.io.File root ^java.io.File f]
@@ -427,9 +465,13 @@ producing the runtime value to be inserted into the system.")
            resource-files   (seq (filter identity (:resource-files config-sources)))
            resource-files   (or resource-files
                                 (apply conf-dirs->resource-names resource-dirs))
+           secrets-dir      (configured-secrets-dir config-sources)
+           secret-env-files (secret-env-files secrets-dir)
            config-sources   (assoc config-sources
                                    :resource-dirs resource-dirs
-                                   :resource-files resource-files)
+                                   :resource-files resource-files
+                                   :secrets-dir secrets-dir
+                                   :secret-env-files secret-env-files)
            edn-resources    (seq (filter edn-path? resource-files))
            env-resources    (seq (filter env-path? resource-files))
            edn-file         (when (edn-path? local-file) local-file)
@@ -438,7 +480,7 @@ producing the runtime value to be inserted into the system.")
            edn-file-confs   (some-> edn-file not-empty conf-file (cons '()))
            env-file-confs   (some-> env-file not-empty (cons '()))
            edn-configs      (concat edn-res-confs edn-file-confs)
-           env-configs      (concat env-resources env-file-confs)
+           env-configs      (concat env-resources env-file-confs secret-env-files)
            edn-config-data  (some->> edn-configs seq
                                      (apply conf/build-config)
                                      load-with-namespaces)

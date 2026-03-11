@@ -633,6 +633,10 @@
         done* (merge-done (:done default-policy) (:done intent-policy*))
         checks* (set/union (keyword-set (:checks default-policy))
                            (keyword-set (:checks intent-policy*)))
+        checks-hard* (set/union (keyword-set (:checks/hard default-policy))
+                                (keyword-set (:checks/hard intent-policy*)))
+        checks-soft* (set/union (keyword-set (:checks/soft default-policy))
+                                (keyword-set (:checks/soft intent-policy*)))
         switch-on* (set/union (keyword-set (:switch-on default-policy))
                               (keyword-set (:switch-on intent-policy*)))
         fallback* (vec (distinct (concat (or (:fallback default-policy) [])
@@ -644,6 +648,8 @@
     (cond-> {}
       (seq done*) (assoc :done done*)
       (seq checks*) (assoc :checks checks*)
+      (seq checks-hard*) (assoc :checks/hard checks-hard*)
+      (seq checks-soft*) (assoc :checks/soft checks-soft*)
       (seq switch-on*) (assoc :switch-on switch-on*)
       (seq fallback*) (assoc :fallback fallback*)
       (seq retry*) (assoc :retry retry*)
@@ -758,6 +764,27 @@
   "Returns normalized `:out` map from result."
   [result]
   (get-in result [:result :out]))
+
+(defn provider-stop-reason-of
+  "Returns normalized provider stop reason keyword from result/out payload, if present."
+  [result]
+  (let [out (result-out-of result)
+        raw (when (map? out)
+              (or (:provider/stop-reason out)
+                  (get out "provider/stop-reason")))]
+    (keywordish raw)))
+
+(defn provider-stop-failure-type
+  "Returns canonical provider-derived failure type for a call result, if any."
+  [result done-eval]
+  (let [stop-reason (provider-stop-reason-of result)
+        must-failed (set (or (:must-failed done-eval) #{}))]
+    (case stop-reason
+      :refusal :provider/refusal
+      :model_context_window_exceeded :provider/context-window-exceeded
+      :max_tokens (when (contains? must-failed :no-truncated-ending)
+                    :provider/max-tokens)
+      nil)))
 
 (defn result-plan-of
   "Returns normalized plan value from result."
@@ -1265,7 +1292,7 @@
   - `{:ok? false :error ... :attempts n ...}`."
   ([invoke-fn request]
    (invoke-with-contract invoke-fn request {}))
-  ([invoke-fn request {:keys [max-attempts protocol]
+  ([invoke-fn request {:keys [max-attempts protocol result-check-fn]
                        :or   {max-attempts 3}}]
    (let [request-check (validate-request protocol request)
          max-attempts  (long (max 1 max-attempts))
@@ -1274,13 +1301,19 @@
      (if-not (:ok? request-check)
        request-check
        (loop [attempt 1]
-         (let [result (invoke-fn request attempt)
-               check  (validate-result protocol intent result requires)]
+         (let [result       (invoke-fn request attempt)
+               schema-check (validate-result protocol intent result requires)
+               check        (if (and (:ok? schema-check)
+                                     (fn? result-check-fn))
+                              (or (result-check-fn request result attempt)
+                                  {:ok? true})
+                              schema-check)]
            (if (:ok? check)
              {:ok? true
               :attempt attempt
               :result result}
-             (if (< attempt max-attempts)
+             (if (and (< attempt max-attempts)
+                      (not= false (:retryable? check)))
                (recur (inc attempt))
                {:ok? false
                 :error :invalid-result-after-retries

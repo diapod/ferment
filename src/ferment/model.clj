@@ -11,6 +11,9 @@
             [clojure.java.shell :as shell]
             [cheshire.core :as json]
             [hato.client :as hato]
+            [ferment.providers.http :as providers.http]
+            [ferment.providers.http.params :as providers.http.params]
+            [ferment.providers.http.response :as providers.http.response]
             [ferment.session :as fsession]
             [ferment.system :as system]
             [ferment.telemetry :as telemetry]
@@ -445,9 +448,32 @@
           (when base
             (str (str/replace base #"/+$" "") "/v1/models"))))))
 
+(defn- invoke-http-headers
+  [worker-config]
+  (let [cfg           (invoke-http-config worker-config)
+        provider-id   (providers.http/normalize-provider-id (:provider/id cfg))
+        base-headers  (if (map? (:headers cfg)) (:headers cfg) {})
+        by-provider   (if (map? (:headers/by-provider cfg)) (:headers/by-provider cfg) {})
+        provider-hdrs (if (map? (get by-provider provider-id))
+                        (get by-provider provider-id)
+                        {})]
+    (merge base-headers provider-hdrs)))
+
 (defn- invoke-http-body
   [payload worker-config]
   (let [cfg     (invoke-http-config worker-config)
+        provider-id (providers.http/normalize-provider-id (:provider/id cfg))
+        request-params (if (map? (:request-params cfg))
+                         (:request-params cfg)
+                         {})
+        request-by-provider (if (map? (:request-params/by-provider cfg))
+                              (:request-params/by-provider cfg)
+                              {})
+        provider-request-params (if (map? (get request-by-provider provider-id))
+                                  (get request-by-provider provider-id)
+                                  {})
+        ;; Global request params intentionally override provider-scoped defaults.
+        request-params' (merge provider-request-params request-params)
         format' (or (:request/format cfg)
                     :openai-chat)
         prompt  (invoke-user-prompt payload)
@@ -480,35 +506,16 @@
         top-p   (or payload-top-p
                     (when (number? (:top-p cfg))
                       (double (:top-p cfg))))]
-    (case format'
-      :prompt-json
-      (cond-> {:prompt prompt}
-        system (assoc :system system)
-        model-id (assoc :model model-id)
-        (number? temp) (assoc :temperature temp)
-        (number? max-toks) (assoc :max_tokens max-toks)
-        (number? top-p) (assoc :top_p top-p))
-
-      :openai-completions
-      (cond-> {:prompt prompt
-               :stream false}
-        model-id (assoc :model model-id)
-        (number? temp) (assoc :temperature temp)
-        (number? max-toks) (assoc :max_tokens max-toks)
-        (number? top-p) (assoc :top_p top-p))
-
-      ;; default: chat/completions payload
-      (let [messages (cond-> []
-                       system (conj {:role "system"
-                                     :content system})
-                       true   (conj {:role "user"
-                                     :content prompt}))]
-        (cond-> {:messages messages
-                 :stream false}
-          model-id (assoc :model model-id)
-          (number? temp) (assoc :temperature temp)
-          (number? max-toks) (assoc :max_tokens max-toks)
-          (number? top-p) (assoc :top_p top-p))))))
+    (providers.http/invoke-http-body
+     {:provider/id (:provider/id cfg)
+      :request/format format'
+      :request-params request-params'
+      :prompt prompt
+      :system system
+      :model-id model-id
+      :temperature temp
+      :max-tokens max-toks
+      :top-p top-p})))
 
 (defn- maybe-json-response
   [body]
@@ -516,22 +523,96 @@
     (json/parse-string (or body "") true)
     (catch Throwable _ nil)))
 
+(defn- normalize-response-headers
+  [headers]
+  (let [headers' (cond
+                   (instance? java.net.http.HttpHeaders headers)
+                   (.map ^java.net.http.HttpHeaders headers)
+
+                   (map? headers)
+                   headers
+
+                   (sequential? headers)
+                   (into {}
+                         (keep (fn [entry]
+                                 (cond
+                                   (instance? java.util.Map$Entry entry)
+                                   [(.getKey ^java.util.Map$Entry entry)
+                                    (.getValue ^java.util.Map$Entry entry)]
+
+                                   (and (vector? entry) (= 2 (count entry)))
+                                   [(first entry) (second entry)]
+
+                                   :else nil)))
+                         headers)
+
+                   :else nil)]
+    (if (map? headers')
+      (reduce-kv (fn [acc k v]
+                   (let [k' (some-> k str str/lower-case str/trim not-empty)
+                         v' (cond
+                              (string? v) (some-> v str/trim not-empty)
+                              (sequential? v) (some-> (first v) str str/trim not-empty)
+                              (some? v) (some-> v str str/trim not-empty)
+                              :else nil)]
+                     (if (and k' v')
+                       (assoc acc k' v')
+                       acc)))
+                 {}
+                 headers')
+      {})))
+
 (defn- pick-response-text
   [response-map worker-config]
   (let [cfg (invoke-http-config worker-config)
-        path (:response/path cfg)
-        from-path (when (and (vector? path) (seq path))
-                    (get-in response-map path))
-        candidates [(when (string? from-path) from-path)
-                    (get-in response-map [:choices 0 :message :content])
-                    (get-in response-map [:choices 0 :text])
-                    (:text response-map)
-                    (:response response-map)]]
-    (some->> candidates
-             (filter string?)
-             (map #(some-> % str/trim not-empty))
-             (filter some?)
-             first)))
+        path (:response/path cfg)]
+    (providers.http/pick-response-text
+     {:provider/id (:provider/id cfg)
+      :response-map response-map
+      :response/path path})))
+
+(defn- invoke-http-response-fields
+  [worker-config]
+  (let [cfg                 (invoke-http-config worker-config)
+        provider-id         (providers.http/normalize-provider-id (:provider/id cfg))
+        response-fields     (if (map? (:response-fields cfg))
+                              (:response-fields cfg)
+                              {})
+        response-by-provider (if (map? (:response-fields/by-provider cfg))
+                               (:response-fields/by-provider cfg)
+                               {})
+        provider-fields     (if (map? (get response-by-provider provider-id))
+                              (get response-by-provider provider-id)
+                              {})]
+    (merge provider-fields response-fields)))
+
+(defn- invoke-http-response-header-fields
+  [worker-config]
+  (let [cfg                  (invoke-http-config worker-config)
+        provider-id          (providers.http/normalize-provider-id (:provider/id cfg))
+        response-fields      (if (map? (:response-header-fields cfg))
+                               (:response-header-fields cfg)
+                               {})
+        response-by-provider (if (map? (:response-header-fields/by-provider cfg))
+                               (:response-header-fields/by-provider cfg)
+                               {})
+        provider-fields      (if (map? (get response-by-provider provider-id))
+                               (get response-by-provider provider-id)
+                               {})]
+    (merge provider-fields response-fields)))
+
+(defn- pick-response-out
+  [response-map response-headers worker-config]
+  (let [field-mapping        (invoke-http-response-fields worker-config)
+        header-field-mapping (invoke-http-response-header-fields worker-config)
+        mapped-body          (providers.http.response/extract-response-fields response-map field-mapping)
+        mapped-headers       (providers.http.response/extract-response-fields (normalize-response-headers response-headers)
+                                                                             header-field-mapping)
+        mapped               (merge mapped-headers mapped-body)
+        text          (or (:text mapped)
+                          (pick-response-text response-map worker-config))]
+    (cond-> mapped
+      (string? text) (assoc :text text))))
 
 (defn- send-http-json!
   [url body-map worker-config payload]
@@ -544,8 +625,8 @@
         request-timeout-ms  (or payload-timeout-ms
                                 (parse-positive-long (:timeout-ms cfg) 120000))
         method              (-> (or (:method cfg) :post) name str/lower-case)
-        headers             (if (map? (:headers cfg)) (:headers cfg) {})
-        request-body        (json/generate-string body-map)
+        headers             (invoke-http-headers worker-config)
+        request-body        (json/generate-string (providers.http.params/stringify-keys body-map))
         req-map             (cond-> {:method :post
                                      :url url
                                      :headers (merge {"content-type" "application/json; charset=utf-8"
@@ -554,10 +635,10 @@
                                                            (comp
                                                             (filter (fn [[k v]]
                                                                       (and (some? k)
-                                                                           (some? v))))
+                                                                           (some-> v str str/trim not-empty))))
                                                             (map (fn [[k v]]
                                                                    [(-> k str str/lower-case)
-                                                                    (str v)])))
+                                                                    (-> v str str/trim)])))
                                                            headers))
                                      :timeout request-timeout-ms
                                      :http-client {:connect-timeout connect-timeout-ms}
@@ -573,10 +654,12 @@
                       {:error :invoke-http-status
                        :status status
                        :url url
+                       :headers (:headers resp)
                        :response parsed
                        :body (some-> resp-body (subs 0 (min 4000 (count resp-body))))})))
     {:status status
      :body resp-body
+     :headers (:headers resp)
      :response parsed}))
 
 (defn- retryable-http-error?
@@ -609,17 +692,20 @@
     (loop [attempt 1]
       (let [outcome (try
                       {:ok? true
-                       :value (let [{:keys [status response body]} (send-http-json! url body-map worker-config payload)
-                                    text (or (when (map? response)
-                                               (pick-response-text response worker-config))
+                       :value (let [{:keys [status response body headers]} (send-http-json! url body-map worker-config payload)
+                                    out  (or (when (map? response)
+                                               (pick-response-out response headers worker-config))
+                                             {})
+                                    text (or (:text out)
                                              (some-> body str str/trim not-empty)
                                              "")]
-                                {:text text
-                                 :status status
-                                 :url url
-                                 :attempt attempt
-                                 :transport :http
-                                 :response response})}
+                                (assoc out
+                                       :text text
+                                       :status status
+                                       :url url
+                                       :attempt attempt
+                                       :transport :http
+                                       :response response))}
                       (catch Throwable t
                         {:ok? false
                          :error t}))]
@@ -636,14 +722,30 @@
                     (catch Throwable _ nil)))
                 (Thread/sleep (long retry-ms))
                 (recur (inc attempt)))
-              (throw (ex-info "Failed to invoke runtime model over HTTP."
-                              {:error :invoke-http-failed
-                               :url url
-                               :ready-url ready-url
-                               :attempt attempt
-                               :startup-timeout-ms startup-timeout-ms
-                               :retry-ms retry-ms}
-                              t)))))))))
+              (let [^Throwable t t
+                    data (when (instance? clojure.lang.ExceptionInfo t)
+                           (ex-data t))]
+                (throw (ex-info "Failed to invoke runtime model over HTTP."
+                                (cond-> {:error (or (:error data) :invoke-http-failed)
+                                         :url url
+                                         :ready-url ready-url
+                                         :attempt attempt
+                                         :startup-timeout-ms startup-timeout-ms
+                                         :retry-ms retry-ms
+                                         :cause/class (some-> t class .getName)
+                                         :cause/message (.getMessage t)}
+                                  (integer? (:status data))
+                                  (assoc :status (:status data))
+
+                                  (contains? data :body)
+                                  (assoc :body (:body data))
+
+                                  (contains? data :headers)
+                                  (assoc :headers (normalize-response-headers (:headers data)))
+
+                                  (contains? data :response)
+                                  (assoc :response (:response data)))
+                                t))))))))))
 
 (defn invoke-command!
   "Invokes model command in one-shot mode for bot `:invoke` request."
@@ -1149,16 +1251,25 @@
                         {:ok? false
                          :error :invoke-failed
                          :message (.getMessage t)
-                         :details (when (instance? clojure.lang.ExceptionInfo t)
-                                    (select-keys (ex-data t)
-                                                 [:error
-                                                  :exit
-                                                  :command
-                                                  :stderr
-                                                  :stdout
-                                                  :timeout-ms
-                                                  :stdout/truncated?
-                                                  :stderr/truncated?]))})))
+                         :details (merge
+                                   {:cause/class (some-> t class .getName)
+                                    :cause/message (.getMessage t)}
+                                   (when (instance? clojure.lang.ExceptionInfo t)
+                                     (select-keys (ex-data t)
+                                                  [:error
+                                                   :status
+                                                   :url
+                                                   :body
+                                                   :response
+                                                   :exit
+                                                   :command
+                                                   :stderr
+                                                   :stdout
+                                                   :timeout-ms
+                                                   :stdout/truncated?
+                                                   :stderr/truncated?
+                                                   :cause/class
+                                                   :cause/message])))})))
                   {:ok? false
                    :error :invoke-not-configured}))
       {:ok? false
